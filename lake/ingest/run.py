@@ -45,6 +45,13 @@ def phase1(entries: list[dict], workers: int = 8) -> int:
     written = leaked = dropped = 0
     failed: list[tuple[str, str]] = []
     STAGING.parent.mkdir(parents=True, exist_ok=True)
+    # Phase 1 rewrites lines of the sources it touches, so every line number after
+    # them moves and a cursor left over from an earlier phase 2 points at the wrong
+    # row. Dropping it costs nothing: on the replay, link step [0] skips everything
+    # already stored without a single LLM call (§4.5, §4.8).
+    if STAGING_CURSOR.exists():
+        STAGING_CURSOR.unlink()
+        print(f"phase1: dropped {STAGING_CURSOR.name}, phase 2 will replay from the top")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_one_source, entry, fetch, parse, generalize): entry
                    for entry in entries}
@@ -73,7 +80,11 @@ def _one_source(entry: dict, fetch, parse, generalize) -> tuple[int, int, int]:
     from .. import embed
 
     src, sections = fetch.fetch_source(entry)
-    drafts, report = parse.parse_document(sections, fetch.find_abstract(sections),
+    # The abstract rides in the section list as reference material for every call
+    # (fetch.py), and the bibliography holds no technique — parsing either one
+    # spends a call per source to mine theses out of a title list.
+    body = [s for s in sections if s.kind not in ("abstract", "bibliography")]
+    drafts, report = parse.parse_document(body, fetch.find_abstract(sections),
                                           fetch.find_limitations(sections))
     # `parse_document` counts per section and then cuts to 30 (§4.3 p.6), so the
     # counts expanded in section order line up one-to-one with the theses it kept.
@@ -106,9 +117,28 @@ def _one_source(entry: dict, fetch, parse, generalize) -> tuple[int, int, int]:
     # linear cursor, and per-line appends from 8 threads would scatter a source
     # across the file.
     with _staging_lock:
+        _drop_source(src.id)
         with STAGING.open("a", encoding="utf-8") as fh:
             fh.write("".join(line + "\n" for line in lines))
     return len(lines), leaks, report["dropped"]
+
+
+def _drop_source(source_id: str) -> None:
+    """Remove any earlier lines of this source. Caller holds `_staging_lock`.
+
+    §4.7 expects "fix the parse prompt, re-run phase 1" to be routine. A plain
+    append kept both generations in the file, and phase 2 would then write the
+    new theses as extra leaves next to the old ones — same source, different
+    wording, so `(source_id, text_hash)` does not stop it. Re-running a source
+    replaces it.
+    """
+    if not STAGING.exists():
+        return
+    kept = [ln for ln in STAGING.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and json.loads(ln)["source"]["id"] != source_id]
+    tmp = STAGING.with_suffix(".jsonl.tmp")
+    tmp.write_text("".join(ln + "\n" for ln in kept), encoding="utf-8")
+    tmp.replace(STAGING)
 
 
 # ------------------------------------------------------------------------ phase 2
@@ -127,6 +157,14 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
     llm.assert_grammar_works(llm.QWEN_9B)       # rederive
     llm.assert_grammar_works(llm.QWEN_35B)      # link arbiter
     from . import generalize, link, rederive
+
+    # Before a single arbiter call: an index that is empty while the store is not
+    # makes step [1] return zero candidates for every thesis, and zero candidates
+    # reads as "no duplicate" — so a stale index would quietly re-create every idea
+    # in the lake, with no LLM call and no pending_link line to show for it.
+    repaired = _reconcile_index()
+    if repaired:
+        print(f"phase2: index was missing {repaired} leaf/leaves, re-indexed before linking")
 
     cursor_path = _cursor_path(staging_path)
     rows = _read_staging(staging_path)
@@ -166,7 +204,13 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
             index.index_theses(theses)
             written += len(theses)
 
-        for idea_id in by_idea:
+        _reconcile_index()
+
+        # Every idea that is over the trigger, not only the ones this batch touched
+        # (§4.6). An idea whose third leaf landed in a source whose loop then died
+        # is never in `by_idea` again — the restart skips its theses at link step
+        # [0] — so a batch-scoped sweep would leave it un-re-derived forever.
+        for idea_id in _rederive_due():
             try:
                 if rederive.maybe_rederive(idea_id):
                     rederived += 1
@@ -241,6 +285,33 @@ def _group_by_source(rows: list[tuple[int, dict]], done: set[int]) -> list[list]
         if lineno not in done:
             groups.setdefault(row["source"]["id"], []).append((lineno, row))
     return list(groups.values())
+
+
+def _reconcile_index() -> int:
+    """Re-index whatever the store has and the index does not. Returns the count.
+
+    `index_theses` runs after `create_idea_with_theses` has already committed, so
+    an index write that fails leaves leaves in the graph that the index will never
+    see: the restart skips them at link step [0] as already stored. One pass per
+    source closes that window, and it is the §6.19 reconciliation path
+    (`index.index_rows` over `graph_client.all_theses()`), not a second mechanism.
+    """
+    missing = [row for row in graph_client.all_theses() if not index.has(row["id"])]
+    if missing:
+        index.index_rows(missing)
+    return len(missing)
+
+
+def _rederive_due(threshold: int = 3) -> list[str]:
+    """Ideas with `len(leaves) - rederived_at_leaf_count >= threshold` (§4.6)."""
+    counts: dict[str, int] = {}
+    for row in graph_client.all_theses():
+        counts[row["idea_id"]] = counts.get(row["idea_id"], 0) + 1
+    due = []
+    for idea in graph_client.get_ideas(sorted(counts)):
+        if counts[idea["id"]] - idea["rederived_at_leaf_count"] >= threshold:
+            due.append(idea["id"])
+    return due
 
 
 def _cursor_path(staging_path) -> Path:
@@ -328,19 +399,23 @@ def selfcheck() -> None:
     real_staging = STAGING
     real_index_theses, real_complete, real_canary = (index.index_theses, llm.complete,
                                                      llm.assert_grammar_works)
+    real_has, real_index_rows = index.has, index.index_rows
     trace.set_run_id("selfcheck-" + uuid.uuid4().hex[:6])
     root = __package__.split(".")[0]
 
-    installed: list[str] = []
+    installed: list[tuple] = []
 
     def install(full_name: str, **members):
         """Put a fake module where the lazy imports of phase 1/2 will find it."""
         module = types.ModuleType(full_name)
         module.__dict__.update(members)
-        sys.modules[full_name] = module
         parent, _, leaf = full_name.rpartition(".")
+        # Record what was there: tearing down with an unconditional delattr wiped
+        # a real module that the caller had already imported.
+        installed.append((full_name, sys.modules.get(full_name),
+                          getattr(sys.modules[parent], leaf, None)))
+        sys.modules[full_name] = module
         setattr(sys.modules[parent], leaf, module)
-        installed.append(full_name)
         return module
 
     # --- fakes -------------------------------------------------------------
@@ -450,6 +525,10 @@ def selfcheck() -> None:
             idx = Path(tmp) / "index.db"
             stub_store._db_path = Path(tmp) / "lake.db"
             index.index_theses = functools.partial(real_index_theses, db=idx)
+            # `_reconcile_index` uses these two, also without a db argument; unbound
+            # they wrote fixture rows straight into the real data/index.db.
+            index.has = functools.partial(real_has, db=idx)
+            index.index_rows = functools.partial(real_index_rows, db=idx)
 
             assert _cursor_path(real_staging) == STAGING_CURSOR, _cursor_path(real_staging)
 
@@ -568,11 +647,18 @@ def selfcheck() -> None:
     finally:
         STAGING = real_staging
         index.index_theses, llm.complete = real_index_theses, real_complete
+        index.has, index.index_rows = real_has, real_index_rows
         llm.assert_grammar_works = real_canary
-        for full_name in installed:             # a fake left behind is a silent trap
-            parent, _, leaf = full_name.rpartition(".")
-            sys.modules.pop(full_name, None)
-            delattr(sys.modules[parent], leaf)
+        for full_name, prev_mod, prev_attr in reversed(installed):
+            parent, _, leaf = full_name.rpartition(".")   # a fake left behind is a trap
+            if prev_mod is None:
+                sys.modules.pop(full_name, None)
+            else:
+                sys.modules[full_name] = prev_mod
+            if prev_attr is None:
+                delattr(sys.modules[parent], leaf)
+            else:
+                setattr(sys.modules[parent], leaf, prev_attr)
         (TRACES_DIR / f"{trace.current_run_id()}.jsonl").unlink(missing_ok=True)
 
     print("run self-check OK")

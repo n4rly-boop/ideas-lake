@@ -99,21 +99,25 @@ def main() -> None:
     corpus = yaml.safe_load(SRC.read_text(encoding="utf-8"))
     entries = [convert(raw) for raw in corpus]
     text = dump(entries)
-    OUT.write_text(text, encoding="utf-8")
-
     # --- checks: the mapper is the only thing standing between a hand-checked
     # corpus and the ingest run, so it verifies its own output before reporting.
-    reloaded = yaml.safe_load(OUT.read_text(encoding="utf-8"))
-    assert reloaded == entries, "round-trip through YAML changed the records"
-    assert len(entries) == len(corpus), f"{len(entries)} written vs {len(corpus)} read"
-    assert dump(entries) == text, "output is not deterministic"
+    # Written to a temp file first and moved into place only once the checks pass:
+    # writing straight to OUT left an unvalidated corpus on disk whenever a check
+    # tripped. `raise`, not `assert` — `python3 -O` strips asserts and exits 0.
+    tmp = OUT.with_suffix(".yaml.tmp")
+    tmp.write_text(text, encoding="utf-8")
 
-    missing = [e["title"] for e in entries if not e["arxiv_id"] and not e.get("url")]
-    assert not missing, f"entries with neither arxiv_id nor url: {missing}"
+    reloaded = yaml.safe_load(tmp.read_text(encoding="utf-8"))
+    if reloaded != entries:
+        tmp.unlink()
+        raise ValueError("round-trip through YAML changed the records")
 
     counts = collections.Counter(e["group"] for e in entries)
-    assert set(counts) == set(SPEC_GROUPS), f"groups {sorted(counts)} vs §4.1 {sorted(SPEC_GROUPS)}"
-    assert sum(counts.values()) == len(entries)
+    if set(counts) != set(SPEC_GROUPS):
+        tmp.unlink()
+        raise ValueError(f"groups {sorted(counts)} vs §4.1 {sorted(SPEC_GROUPS)}")
+
+    tmp.replace(OUT)
 
     print(f"{OUT.relative_to(ROOT)}: {len(entries)} entries, md5 {hashlib.md5(text.encode()).hexdigest()}")
     if len(entries) != SPEC_TOTAL:

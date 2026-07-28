@@ -50,12 +50,20 @@ def parse_document(sections: list[Section], abstract: str, limitations: str, *,
     """
     theses: list[DraftThesis] = []
     per_section: dict[str, int] = {}
+    skipped: list[str] = []
     for section in sections:
+        if len(theses) >= MAX_PER_DOCUMENT:
+            # Stop calling once the ceiling is reached instead of parsing the whole
+            # document and slicing at the end: the discarded sections cost a full
+            # prompt each, ~2500 max_tokens, on every source that runs long.
+            skipped.append(section.id)
+            continue
         extracted = parse_section(section, abstract, limitations, cache_dir=cache_dir)
         per_section[section.id] = len(extracted)
         theses.extend(extracted)
     kept = theses[:MAX_PER_DOCUMENT]
-    return kept, {"per_section": per_section, "dropped": len(theses) - len(kept)}
+    return kept, {"per_section": per_section, "dropped": len(theses) - len(kept),
+                  "sections_not_parsed": skipped}
 
 
 def _user_message(section: Section, abstract: str, limitations: str) -> str:

@@ -223,6 +223,12 @@ def _phase2(tmp: Path, rows: list[dict], answers: list, *, limit: int | None = N
         stack.enter_context(_swap(llm, "assert_grammar_works", lambda model: None))
         stack.enter_context(_swap(index, "index_theses",
                                   functools.partial(index.index_theses, db=idx)))
+        # `run._reconcile_index` reaches for these two, also without a db argument.
+        # Leaving them unbound wrote fixture rows into the real data/index.db and
+        # only surfaced later, as a 503 from the divergence guard in rank.
+        stack.enter_context(_swap(index, "has", functools.partial(index.has, db=idx)))
+        stack.enter_context(_swap(index, "index_rows",
+                                  functools.partial(index.index_rows, db=idx)))
         stack.enter_context(_swap(link, "link_batch",
                                   functools.partial(link.link_batch, index_db=idx,
                                                     pending_path=tmp / "pending_link.jsonl")))
@@ -752,6 +758,19 @@ def check_19(tmp: Path) -> str:
 
 # ------------------------------------------------------------------- the runner
 
+def _fingerprint_real_data() -> dict[str, str]:
+    """sha1 of every real artefact the suite must not touch (missing files count too)."""
+    import hashlib
+    from .models import DATA
+    out = {}
+    for path in (DATA / "lake.db", DATA / "index.db", DATA / "staging.jsonl",
+                 DATA / "staging.cursor", DATA / "pending_link.jsonl",
+                 DATA / "logs" / "retrieve.jsonl"):
+        out[path.name] = (hashlib.sha1(path.read_bytes()).hexdigest()
+                          if path.exists() else "absent")
+    return out
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m lake.selfcheck",
@@ -764,6 +783,11 @@ def main(argv=None) -> int:
     trace.set_run_id("selfcheck-" + uuid.uuid4().hex[:6])
     failed: list[int] = []
     skipped: list[int] = []
+    # The suite claims in its own docstring that it never writes to data/. Claiming
+    # is not checking: a helper reaching for a module default instead of the bound
+    # temp path wrote fixture rows into the real index and stayed invisible until a
+    # live query answered 503. Fingerprint before, compare after.
+    guarded = _fingerprint_real_data()
     with tempfile.TemporaryDirectory(prefix="lake-selfcheck-") as root:
         # Traces of the check itself do not belong in data/traces with the real runs.
         with _swap(trace, "TRACES_DIR", Path(root) / "traces"), _fake_embed():
@@ -789,6 +813,12 @@ def main(argv=None) -> int:
                     print(f"ok  6.{number}  {what}" + (f"\n      {note}" if note else ""))
                 finally:
                     _cleanup()
+
+    touched = [name for name, digest in _fingerprint_real_data().items()
+               if guarded.get(name) != digest]
+    if touched:
+        failed.append(0)
+        print(f"FAIL 6.0  the suite wrote to real data/: {', '.join(sorted(touched))}")
 
     total = len(CHECKS)
     summary = f"{total - len(failed) - len(skipped)}/{total} ok"

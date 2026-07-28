@@ -23,6 +23,7 @@ import hashlib
 import http.client
 import importlib.util
 import json
+import os
 import re
 import ssl
 import threading
@@ -368,7 +369,12 @@ def fetch_source(entry: dict) -> tuple[Source, list[Section]]:
     else:
         raw = _fetch_arxiv(arxiv_id) if arxiv_id else _fetch_doc(url, entry)
         RAW_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        # Temp file then replace, like the parse cache: a crash or a kill halfway
+        # through the write would otherwise leave truncated JSON at the cache key,
+        # and every later run would read it back as a hard parse error.
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
 
     sections = [Section(**s) for s in raw["sections"] if s["text"].strip()]
     if not sections:

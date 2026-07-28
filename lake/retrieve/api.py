@@ -178,47 +178,59 @@ def retrieve(query: str, k: int = K_DEFAULT, *, budget: int | None = None,
              do_rewrite: bool = True, run_id: str | None = None) -> tuple[int, dict]:
     """One /retrieve call: (http status, body). Always leaves one log line (§5.5)."""
     log_id = "log_" + uuid.uuid4().hex[:12]
-    # ponytail: trace.py keeps run/log id per process, so concurrent requests can
-    # cross-tag each other's trace rows. Fine at demo load; needs a ContextVar in
-    # trace.py if /retrieve ever gets real concurrency.
-    trace.set_run_id(run_id or trace.current_run_id(), log_id=log_id)
     started = time.perf_counter()
-    before = trace.totals()
     # One dict shared by the response and the log line, filled in the `finally`:
     # the two must never disagree about what the request cost.
     cost = {"tokens_in": 0, "tokens_out": 0, "wall_ms": 0.0}
     record = {"log_id": log_id, "ts": _now(), "query_raw": query, "query_rewritten": query,
               "rewrite_failed": False, "k": k, "returned": [], "cut_off": [], "cost": cost}
-    try:
-        if do_rewrite:
-            record["query_rewritten"], record["rewrite_failed"] = rewrite.rewrite(query, budget)
+    # Per-request ids and per-request token counter (trace.request). Diffing the
+    # process-global totals made concurrent requests claim each other's tokens,
+    # and the global run/log id cross-tagged trace rows even sequentially.
+    with trace.request(run_id or trace.current_run_id(), log_id=log_id) as own:
         try:
-            # Imported here, not at module level: `rank` pulls in the embedding
-            # model (§3.2), and --mock must reach neither it nor the graph. Inside
-            # the guard, so an unimportable ranker is a logged 503, not a dropped
-            # connection.
-            from . import rank
-            ideas, payload = rank.rank(record["query_rewritten"], k=k)
-            record["returned"], record["cut_off"] = payload["returned"], payload["cut_off"]
-        except Exception as exc:
-            # §5.4 — the store raised, or ranking could not produce an answer at
-            # all. That is "the lake is broken", not "the lake is empty": 503, and
-            # the reason lands in the log next to `returned: []`.
-            record["error"] = f"{type(exc).__name__}: {exc}"
-            return 503, {"error": record["error"], "log_id": log_id}
-        # An empty `ideas` here is a live graph with nothing to say — 200, and it
-        # is data for the A/B (§5.4).
-        return 200, {"ideas": ideas, "log_id": log_id, "cost": cost}
-    finally:
-        after = trace.totals()
-        cost["tokens_in"] = after["tokens_in"] - before["tokens_in"]
-        cost["tokens_out"] = after["tokens_out"] - before["tokens_out"]
-        cost["wall_ms"] = round((time.perf_counter() - started) * 1000, 1)
-        _write_log(record)
+            if do_rewrite:
+                try:
+                    record["query_rewritten"], record["rewrite_failed"] = \
+                        rewrite.rewrite(query, budget)
+                except Exception as exc:
+                    # §5.1 — rewriting is an improvement, never a condition of
+                    # correctness. `rewrite` catches LLMError/TimeoutError itself;
+                    # anything else used to escape `retrieve` entirely and drop the
+                    # connection with no status and no log line. Degrade to the raw
+                    # query and say so, so the ablation is not counted on dirty data.
+                    record["rewrite_failed"] = True
+                    record["rewrite_error"] = f"{type(exc).__name__}: {exc}"
+            try:
+                # Imported here, not at module level: `rank` pulls in the embedding
+                # model (§3.2), and --mock must reach neither it nor the graph. Inside
+                # the guard, so an unimportable ranker is a logged 503, not a dropped
+                # connection.
+                from . import rank
+                ideas, payload = rank.rank(record["query_rewritten"], k=k)
+                record["returned"], record["cut_off"] = payload["returned"], payload["cut_off"]
+            except Exception as exc:
+                # §5.4 — the store raised, or ranking could not produce an answer at
+                # all. That is "the lake is broken", not "the lake is empty": 503, and
+                # the reason lands in the log next to `returned: []`.
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                return 503, {"error": record["error"], "log_id": log_id}
+            # An empty `ideas` here is a live graph with nothing to say — 200, and it
+            # is data for the A/B (§5.4).
+            return 200, {"ideas": ideas, "log_id": log_id, "cost": cost}
+        finally:
+            cost["tokens_in"] = own["tokens_in"]
+            cost["tokens_out"] = own["tokens_out"]
+            cost["wall_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            _write_log(record)
 
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "IdeasLake/0.1"
+    # A client that connects and then stalls would otherwise pin one thread and
+    # one descriptor forever — the read blocks with no deadline. 30 s is well past
+    # the p95 budget of 5 s (§8), so it can only fire on a stuck peer.
+    timeout = 30
 
     def do_POST(self) -> None:
         if self.path.split("?")[0] != "/retrieve":
@@ -261,15 +273,18 @@ class _Handler(BaseHTTPRequestHandler):
 
 def serve(port: int = 8077, mock: bool = False) -> None:
     """Blocking. `mock=True` answers MOCK_RESPONSE and touches nothing else."""
-    server = ThreadingHTTPServer(("", port), _Handler)
-    server.mock = mock
     if not mock:
         # §8: the budget is p95 <= 5 s, and the first embedding call loads the
         # model (seconds, once per process). Pay it here so no request does.
+        # Before the socket is bound, not after: a listening port during the load
+        # accepts connections the server cannot answer yet, and the first client
+        # pays the load anyway — which is the whole point of warming up.
         # No try/except: a server that cannot embed cannot answer, and finding
         # that out at start beats finding it out per request as a 503.
         from .. import embed
         embed.embed_query("warm up")
+    server = ThreadingHTTPServer(("", port), _Handler)
+    server.mock = mock
     print(f"/retrieve on port {port}{' (MOCK)' if mock else ''}, log -> {RETRIEVE_LOG}",
           flush=True)
     server.serve_forever()

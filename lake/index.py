@@ -31,7 +31,7 @@ DDL = (
 # threaded but read-only at ~2000 rows; per-db locks only if writes ever contend.
 _LOCK = threading.RLock()
 _CONNS: dict[str, sqlite3.Connection] = {}
-_MATS: dict[str, tuple[list[int], np.ndarray]] = {}
+_MATS: dict[str, tuple[int, list[int], np.ndarray]] = {}   # db -> (data_version, rowids, matrix)
 
 
 def _con(db) -> sqlite3.Connection:
@@ -51,9 +51,20 @@ def _con(db) -> sqlite3.Connection:
 
 
 def _matrix(db, con: sqlite3.Connection) -> tuple[list[int], np.ndarray]:
-    """(rowids, (n, EMBED_DIM) matrix) kept in memory, ~3 MB at 2000 theses (§3.5)."""
+    """(rowids, (n, EMBED_DIM) matrix) kept in memory, ~3 MB at 2000 theses (§3.5).
+
+    Keyed on `PRAGMA data_version`, which SQLite bumps when ANOTHER connection
+    commits. Invalidating only on our own writes was silent staleness across
+    processes: a long-running /retrieve server kept the matrix it built at
+    startup while phase 2 wrote new theses, so the cosine arm ranked over a
+    frozen corpus and only the BM25 arm ever saw the new rows — no error, no
+    log line, just quietly worse recall.
+    """
     key = str(db)
+    version = con.execute("PRAGMA data_version").fetchone()[0]
     cached = _MATS.get(key)
+    if cached is not None and cached[0] != version:
+        cached = None
     if cached is None:
         rows = con.execute("SELECT rowid, vec FROM idx_thesis ORDER BY rowid").fetchall()
         if rows:
@@ -61,9 +72,9 @@ def _matrix(db, con: sqlite3.Connection) -> tuple[list[int], np.ndarray]:
             mat = mat.reshape(len(rows), EMBED_DIM)
         else:
             mat = np.zeros((0, EMBED_DIM), dtype=np.float32)
-        cached = ([r[0] for r in rows], mat)
+        cached = (version, [r[0] for r in rows], mat)
         _MATS[key] = cached
-    return cached
+    return cached[1], cached[2]
 
 
 # ------------------------------------------------------------------ search arms
@@ -186,6 +197,12 @@ def search_theses(query: str, k: int, query_vec=None, db=INDEX_DB) -> list[dict]
         return out
 
 
+def has(thesis_id: str, db=INDEX_DB) -> bool:
+    with _LOCK:
+        return _con(db).execute(
+            "SELECT 1 FROM idx_thesis WHERE thesis_id = ?", (thesis_id,)).fetchone() is not None
+
+
 def reset(db=INDEX_DB) -> None:
     """Drop and recreate. The reconciliation path of §6.19 is `reset()` followed by
     `index_rows(graph_client.all_theses())`: the store is what carries `idea_id`,
@@ -218,7 +235,8 @@ def rebuild_from(path: str, db=INDEX_DB) -> int:
         # leave the index it was asked to repair intact. Emptying it first turns a
         # loud refusal into a destructive one — the caller reaches for this exactly
         # when the index is already suspect (§6.19).
-        rows = []
+        rows: list[tuple[str, str, str, list]] = []
+        seen: set[str] = set()
         with open(path, encoding="utf-8") as fh:
             for lineno, line in enumerate(fh, 1):
                 if not line.strip():
@@ -233,6 +251,16 @@ def rebuild_from(path: str, db=INDEX_DB) -> int:
                         f"{path}:{lineno}: thesis {thesis.get('id')!r} has no idea_id — "
                         "phase 2 must write the linked idea_id back into staging"
                     )
+                vec = np.asarray(rec["vector"], dtype=np.float32)
+                if vec.shape != (EMBED_DIM,):
+                    raise ValueError(f"{path}:{lineno}: vector shape {vec.shape}, "
+                                     f"expected ({EMBED_DIM},)")
+                norm = float(np.linalg.norm(vec))
+                if abs(norm - 1.0) > 1e-3:
+                    raise ValueError(f"{path}:{lineno}: vector not L2-normalized, norm={norm:.4f}")
+                if thesis["id"] in seen:
+                    raise ValueError(f"{path}:{lineno}: thesis {thesis['id']!r} appears twice")
+                seen.add(thesis["id"])
                 rows.append((thesis["id"], thesis["idea_id"], thesis["text"], rec["vector"]))
 
         con = _con(db)

@@ -5,6 +5,8 @@ One JSONL line per LLM call and per graph call, appended under a module lock:
 `finish_reason`, `max_tokens`, `build_info` are the three extra fields — half of
 the llama.cpp bugs are tied to the build number (probe-results.md:52).
 """
+import contextlib
+import contextvars
 import functools
 import json
 import threading
@@ -19,6 +21,15 @@ _run_id = uuid.uuid4().hex[:12]
 _extra: dict[str, str] = {}          # task_id / log_id, optional in C5 (07:114)
 _totals = {"tokens_in": 0, "tokens_out": 0, "wall_ms": 0.0}
 
+# Per-request identity and cost. /retrieve runs under ThreadingHTTPServer, and
+# process-global counters made every concurrent request report the sum of all
+# overlapping ones — four parallel calls each claiming 4x their own tokens, in
+# the response body AND in the log line. Cost is the project's own metric (D),
+# so a wrong number here is worse than a missing one. A ContextVar is per-thread
+# and per-task without any caller doing bookkeeping.
+_ctx_ids: contextvars.ContextVar[dict] = contextvars.ContextVar("lake_trace_ids")
+_ctx_totals: contextvars.ContextVar[dict] = contextvars.ContextVar("lake_trace_totals")
+
 
 def set_run_id(run_id: str, *, task_id: str | None = None, log_id: str | None = None) -> None:
     """Overwrite the process run id (default: generated once at import)."""
@@ -30,27 +41,52 @@ def set_run_id(run_id: str, *, task_id: str | None = None, log_id: str | None = 
         _extra["log_id"] = log_id
 
 
+@contextlib.contextmanager
+def request(run_id: str | None = None, *, log_id: str | None = None):
+    """Scope one /retrieve request: its own ids and its own cost counter.
+
+    Yields the counter dict; it holds exactly the calls made inside this block,
+    on this thread. Process-wide `totals()` keeps accumulating in parallel — the
+    ingest report wants the whole run, a request wants only itself.
+    """
+    ids = {k: v for k, v in (("run_id", run_id), ("log_id", log_id)) if v is not None}
+    own = {"tokens_in": 0, "tokens_out": 0, "wall_ms": 0.0}
+    id_token = _ctx_ids.set(ids)
+    tot_token = _ctx_totals.set(own)
+    try:
+        yield own
+    finally:
+        _ctx_ids.reset(id_token)
+        _ctx_totals.reset(tot_token)
+
+
 def current_run_id() -> str:
-    return _run_id
+    return _ctx_ids.get({}).get("run_id") or _run_id
 
 
 def totals() -> dict:
-    """Accumulated cost of this process: the `cost` field of /retrieve (§5.4)."""
+    """Accumulated cost of this process — the ingest run report (§4.7).
+
+    NOT the `cost` of one /retrieve: use `request()` for that, or concurrent
+    requests report each other's tokens.
+    """
     with _lock:
         return dict(_totals)
 
 
 def _write(record: dict) -> None:
     record = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-              "run_id": _run_id, **_extra, **record}
+              "run_id": _run_id, **_extra, **_ctx_ids.get({}), **record}
     line = json.dumps(record, ensure_ascii=False)
+    own = _ctx_totals.get(None)
     with _lock:
         TRACES_DIR.mkdir(parents=True, exist_ok=True)
         with (TRACES_DIR / f"{record['run_id']}.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
-        _totals["tokens_in"] += record["tokens_in"]
-        _totals["tokens_out"] += record["tokens_out"]
-        _totals["wall_ms"] += record["wall_ms"]
+        for field in ("tokens_in", "tokens_out", "wall_ms"):
+            _totals[field] += record[field]
+            if own is not None:
+                own[field] += record[field]
 
 
 def trace(component: str, op: str):
