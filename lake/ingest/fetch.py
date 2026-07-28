@@ -31,7 +31,6 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET   # no DTD/entity expansion in ElementTree; defusedxml is not installed
-from dataclasses import asdict
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
@@ -313,7 +312,7 @@ def _fetch_arxiv(arxiv_id: str) -> dict:
             # the PDF path has no ltx_abstract; the API summary is the same abstract
             "abstract": got["abstract"] or meta["summary"],
             "path": got["path"],
-            "sections": [asdict(s) for s in got["sections"]]}
+            "sections": [s.model_dump() for s in got["sections"]]}
 
 
 def _doc_body(html: str) -> str:
@@ -341,7 +340,7 @@ def _fetch_doc(url: str, entry: dict) -> dict:
             # a doc has no abstract; its lead-in is what parse gets as reference (§4.3)
             "abstract": text[:1200],
             "path": "doc",
-            "sections": [asdict(s) for s in _split(text)]}
+            "sections": [s.model_dump() for s in _split(text)]}
 
 
 def fetch_source(entry: dict) -> tuple[Source, list[Section]]:

@@ -37,7 +37,7 @@ from . import graph_client, index, llm, stub_store, trace
 from .ingest import link, parse, rederive, run
 from .models import (CACHE_DIR, EMBED_DIM, GENERALIZE_SCHEMA, PARSE_SCHEMA,
                      SCHEMA_BINDINGS, DraftThesis, Idea, Section, Source, Thesis,
-                     dataclass_fields, new_idea_id, new_thesis_id, schema_properties,
+                     model_field_names, new_idea_id, new_thesis_id, schema_properties,
                      source_id as make_source_id, text_hash)
 from .retrieve import api, rank, rewrite, search
 
@@ -339,7 +339,7 @@ def check_02(tmp: Path) -> str:
     with _swap(llm, "complete", no_llm):
         drafts = parse.parse_section(section, "abstract", "limits", cache_dir=cache)
     assert drafts and all(isinstance(d, DraftThesis) for d in drafts), drafts
-    assert schema_properties(PARSE_SCHEMA, ["theses", "items"]) <= dataclass_fields(DraftThesis)
+    assert schema_properties(PARSE_SCHEMA, ["theses", "items"]) <= model_field_names(DraftThesis)
     return (f"{len(cached)} cached section(s) validated, "
             f"{sum(len(o['theses']) for _, o in cached)} theses; fixture from {origin}")
 
@@ -539,12 +539,12 @@ def check_10(tmp: Path) -> None:
     assert sum(graph_client.leaf_count(i) for i in idea_ids) == len(leaves)
 
 
-@check(11, "schema property names are a subset of the dataclass fields (drift guard)")
+@check(11, "schema property names are a subset of the model fields (drift guard)")
 def check_11(tmp: Path) -> None:
-    assert SCHEMA_BINDINGS, "no schema is bound to a dataclass"
+    assert SCHEMA_BINDINGS, "no schema is bound to a model"
     for schema, cls, path in SCHEMA_BINDINGS:
         properties = schema_properties(schema, path)
-        fields = dataclass_fields(cls)
+        fields = model_field_names(cls)
         assert properties, (cls.__name__, path)
         assert properties <= fields, \
             f"{cls.__name__}: schema fills {sorted(properties - fields)}, which has nowhere to go"

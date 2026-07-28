@@ -12,7 +12,6 @@ Storage notes:
   distinct sources under the idea (`06:226`, candidate of the first version). B
   replaces the value; the formula is smeared nowhere else.
 """
-import dataclasses
 import json
 import math
 import sqlite3
@@ -75,8 +74,8 @@ def _encode(name: str, value):
 
 
 def _insert(conn: sqlite3.Connection, table: str, obj, replace: bool = False, **override) -> None:
-    row = {_column(f.name): _encode(f.name, override.get(f.name, getattr(obj, f.name)))
-           for f in dataclasses.fields(obj)}
+    row = {_column(name): _encode(name, override.get(name, getattr(obj, name)))
+           for name in type(obj).model_fields}
     verb = "INSERT OR REPLACE" if replace else "INSERT"
     cols = ",".join(row)
     conn.execute(f"{verb} INTO {table} ({cols}) VALUES ({','.join(':' + c for c in row)})", row)
@@ -153,7 +152,7 @@ def create_idea_with_theses(idea: Idea | None, source_id: str, theses: list[Thes
 # absence of the method (§3.4). Do not add one.
 
 
-_IDEA_FIELDS = {f.name for f in dataclasses.fields(Idea)} - {"id"}
+_IDEA_FIELDS = set(Idea.model_fields) - {"id"}
 
 
 def update_idea(idea_id: str, fields: dict) -> None:

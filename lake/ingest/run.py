@@ -16,7 +16,6 @@ CLI:
 `--limit` is what makes an end-to-end run on 2-3 papers possible instead of 84.
 """
 import argparse
-import dataclasses
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -97,7 +96,7 @@ def _one_source(entry: dict, fetch, parse, generalize) -> tuple[int, int, int]:
     # One embedding call per source. The vector is over `thesis.text`, the
     # pre-generalization text: candidates are gathered thesis-to-thesis (§4.5).
     vectors = embed.embed_docs([draft.text for draft in drafts])
-    source = dataclasses.asdict(src)
+    source = src.model_dump()
     lines, leaks = [], 0
     for section_id, draft, fields, vector in zip(section_ids, drafts, ideas, vectors):
         leaks += bool(generalize.leakage(draft, fields))
@@ -109,7 +108,7 @@ def _one_source(entry: dict, fetch, parse, generalize) -> tuple[int, int, int]:
             "draft": {"draft_text": draft.draft_text,
                       "draft_applicability": draft.draft_applicability,
                       "draft_limitations": draft.draft_limitations},
-            "idea_fields": dataclasses.asdict(fields),
+            "idea_fields": fields.model_dump(),
             "vector": [float(x) for x in vector],
         }, ensure_ascii=False))
 

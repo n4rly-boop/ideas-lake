@@ -3,8 +3,15 @@
 Реализация спеки `knowledge/10-implementation-spec.md` (локальная, в репозиторий не идёт).
 Источник → тезис → идея на записи; запрос → выдача на чтении. Граф — блок B, эволюция — C, стоимость — D.
 
-Зависимости: stdlib + `numpy`, `sentence-transformers`, `PyYAML`. HTTP — `urllib.request`.
+Зависимости: `fastapi`, `uvicorn`, `pydantic`, `numpy`, `sentence-transformers`, `PyYAML` + stdlib.
+Исходящий HTTP (arXiv, llama.cpp) — `urllib.request` из stdlib.
 Python 3.12. Платных API нет: LLM — серверы школы (llama.cpp), эмбеддинги — локально на CPU.
+
+**Отклонение от спеки, названное явно:** §5.4 выбрала `http.server` ради нуля зависимостей
+(`09:290`). Взяли FastAPI ради типизированных моделей запроса/ответа и OpenAPI-схемы для C.
+Весь стек уже стоял в окружении. `pydantic` — доменные модели тоже на нём;
+**схемы для LLM остаются литеральными dict'ами** и из моделей не генерируются:
+`model_json_schema()` даёт `$ref`, на котором грамматика llama.cpp молча не собирается (`09:67`).
 
 ---
 
@@ -15,7 +22,9 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 | `python3 -m lake.ingest.run phase1 [--limit N] [--sources path]` | fetch → parse → generalize → `data/staging.jsonl`. 8 потоков. **В граф не пишет ничего** |
 | `python3 -m lake.ingest.run phase2 [--limit N]` | staging → линковка → граф + индекс → пере-вывод. Последовательно, курсор |
 | `python3 -m lake.ingest.run selfcheck` | офлайн end-to-end на фикстурах, временные БД |
-| `python3 -m lake.retrieve.api [--port 8077] [--mock]` | HTTP-сервер `POST /retrieve` |
+| `python3 -m lake.retrieve.app [--port 8077] [--host H] [--mock]` | FastAPI-сервер под uvicorn |
+| `uvicorn lake.retrieve.app:app --port 8077` | то же штатным способом |
+| `python3 -m lake.retrieve.app --selfcheck` | офлайн-проверка HTTP-слоя |
 | `python3 -m lake.selfcheck [--offline]` | 19 проверок §6. `--offline` пропускает канарейку (единственный сетевой пункт) |
 | `python3 tools/gen_sources.py` | `09-raw/a11-sources.yaml` → `lake/sources.yaml` (84 записи) |
 
@@ -32,7 +41,7 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 
 ```
 lake/
-  models.py         # Source / Thesis / Idea + JSON-схемы для LLM + пути + хеши
+  models.py         # Source / Thesis / Idea (pydantic) + JSON-схемы для LLM + пути + хеши
   llm.py            # клиент llama.cpp: схема, канарейка, fail-closed
   embed.py          # snowflake-arctic-embed-s, 384d, на CPU
   trace.py          # C5: JSONL-трейс каждого вызова
@@ -42,7 +51,7 @@ lake/
   selfcheck.py      # 19 assert-проверок, один запуск
   sources.yaml      # сгенерирован маппером
   ingest/  fetch parse generalize link rederive run
-  retrieve/ rewrite search rank api
+  retrieve/ rewrite search rank api app
   prompts/{parse,generalize,link,rederive,rewrite}/system.txt
   data/             # gitignored: raw/ cache/ traces/ logs/ staging.jsonl index.db lake.db
 ```
@@ -112,6 +121,9 @@ POST /retrieve
 
 ### 5.1 HTTP — контракт C3, единственная зависимость соседей от блока A
 
+`GET /docs` — Swagger, `GET /openapi.json` — машинная схема (422 из неё убран: мы его не отдаём).
+`GET /healthz` — состояние плюс инвариант «индекс == хранилище» (§6.19), который тухнет молча.
+
 ```
 POST /retrieve
   { query, k=5, run_id?, budget?, rewrite=true, allow_web=false }
@@ -122,8 +134,15 @@ POST /retrieve
     log_id, cost: { tokens_in, tokens_out, wall_ms } }
 ```
 
-400 — битый JSON, нет `query`, `k <= 0`, `allow_web=true` (стадия III в MVP не входит).
-503 — граф недоступен. `--mock` отдаёт ту же форму с захардкоженными данными и не трогает ни граф, ни LLM.
+400 — битый JSON, нет `query`, `k <= 0`, `budget <= 0`, `allow_web=true`, неизвестное поле
+(`extra="forbid"`: опечатка в имени поля обязана падать, а не игнорироваться). Не 422:
+C интегрировался на 400, тело осталось `{"error": ...}`.
+503 — граф недоступен. `--mock` отдаёт ту же форму с захардкоженными данными и не трогает ни граф,
+ни LLM, и **не пишет строку в лог выдачи** — мок в метриках это загрязнение.
+
+Ручка объявлена обычным `def`, не `async def`: ранжирование блокирующее (sqlite, numpy, один вызов
+LLM на переписывание), поэтому Starlette уводит её в свой threadpool и не занимает event loop.
+`contextvars` туда копируются — на этом держится по-запросный `cost` (см. `trace.request`).
 
 ### 5.2 Python — публичные функции
 
@@ -168,7 +187,8 @@ ingest.run.phase1(entries, workers=8) -> int ; ingest.run.phase2(staging_path, l
 retrieve.rewrite.rewrite(query, budget=None) -> (query, failed)
 retrieve.search.search(query, query_vec, top_k=50, fuse="rrf"|"minmax") -> list[dict]
 retrieve.rank.rank(query, k=5, query_vec=None) -> (ideas, log_payload)
-retrieve.api.retrieve(query, k=5, ...) -> dict ; retrieve.api.serve(port=8077, mock=False)
+retrieve.api.retrieve(query, k=5, ...) -> (status, body)   # транспорт-независимое ядро
+retrieve.app.create_app(mock=False) -> FastAPI ; retrieve.app.app                # HTTP-слой
 ```
 
 Границы, которые держатся кодом, а не аккуратностью:

@@ -152,9 +152,22 @@ if __name__ == "__main__":
         theses, report = parse_document(sections, "abstract text", "limitations text",
                                         cache_dir=cache)
         assert len(theses) == MAX_PER_DOCUMENT, len(theses)
-        assert report["dropped"] == 36 - MAX_PER_DOCUMENT, report
-        assert report["per_section"]["S7"] == 0, report      # zero is a count, not an error
+        # 5 sections x 6 theses hits the ceiling exactly, so the last two sections are
+        # never sent to the model at all — that is the point of stopping early, and it
+        # has to be visible: not-parsed is a different fact from parsed-then-dropped.
+        assert report["sections_not_parsed"] == ["S5", "S7"], report
+        assert report["dropped"] == 0, report
+        assert "S5" not in report["per_section"], report
         assert sum(report["per_section"].values()) == len(theses) + report["dropped"]
+
+        # A single section overshooting the ceiling is the other half: parsed, then cut.
+        theses2, report2 = parse_document(sections[:5] + [Section(id="S9", kind="section",
+                                                                 title="Extra", text="body 9")],
+                                          "abstract text", "limitations text", cache_dir=cache)
+        assert len(theses2) == MAX_PER_DOCUMENT and report2["sections_not_parsed"] == ["S9"]
+
+        empty_doc, report3 = parse_document([empty], "abstract text", "", cache_dir=cache)
+        assert empty_doc == [] and report3["per_section"]["S7"] == 0, report3   # zero is a count
 
     (TRACES_DIR / f"{trace_mod.current_run_id()}.jsonl").unlink(missing_ok=True)
     print(f"ok: parse -> DraftThesis, cache hit costs 0 calls ({calls['n']} total), "

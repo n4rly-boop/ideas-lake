@@ -1,14 +1,23 @@
 """Data models (spec 10 §1) and the literal JSON schemas handed to llama.cpp (§3.1).
 
-Schemas are flat literal dicts on purpose: `pydantic.model_json_schema()` emits
-`$ref`, llama.cpp resolves those only after PR #21699 and then hits
-MAX_REPETITION_THRESHOLD, after which the grammar silently fails to build (09:67).
+The records are pydantic models: a row coming back from the store, a line of
+`staging.jsonl` or a batch handed to the graph is validated at the boundary
+instead of being trusted. `extra="forbid"` on every one of them — a field that
+drifted out of the store schema must fail loudly, not arrive as a silent None.
+
+**The LLM schemas below stay literal dicts and are NOT generated from these
+models.** `pydantic.model_json_schema()` emits `$ref`, llama.cpp resolves those
+only after PR #21699 and then hits MAX_REPETITION_THRESHOLD, after which the
+grammar silently fails to build (09:67) — the server answers 200 with prose and
+nothing in the response says the schema was ignored. The two representations are
+held together by an assert instead (§6.11, `SCHEMA_BINDINGS`).
 """
 import hashlib
 import re
 import uuid
-from dataclasses import dataclass, field, fields
 from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict, Field
 
 DATA = Path(__file__).resolve().parent / "data"
 PROMPTS = Path(__file__).resolve().parent / "prompts"
@@ -52,8 +61,12 @@ def new_idea_id() -> str:
 
 # ----------------------------------------------------------------------- records
 
-@dataclass
-class Source:
+class Record(BaseModel):
+    """Shared config: unknown fields are an error, not something to ignore."""
+    model_config = ConfigDict(extra="forbid")
+
+
+class Source(Record):
     id: str
     url: str
     title: str
@@ -64,8 +77,7 @@ class Source:
     run_meta: dict | None = None
 
 
-@dataclass
-class Thesis:
+class Thesis(Record):
     id: str
     source_id: str
     idea_id: str
@@ -74,12 +86,11 @@ class Thesis:
     effect: str
     locator: str
     text_hash: str
-    vector: list[float]
+    vector: list[float] = Field(..., min_length=EMBED_DIM, max_length=EMBED_DIM)
     created_at: str
 
 
-@dataclass
-class Idea:
+class Idea(Record):
     id: str
     text: str
     applicability_conditions: str
@@ -87,7 +98,7 @@ class Idea:
     failure_modes: list[str]
     effect_claimed: str
     effect_observed: str
-    vector: list[float]
+    vector: list[float] = Field(..., min_length=EMBED_DIM, max_length=EMBED_DIM)
     differentiation: str | None = None
     trust_score: float = 0.0          # written by B
     dirty: bool = False               # written by B
@@ -96,16 +107,14 @@ class Idea:
     updated_at: str = ""
 
 
-@dataclass
-class Section:
+class Section(Record):
     id: str
     kind: str            # section | bibliography | appendix | chunk
     title: str
     text: str
 
 
-@dataclass
-class DraftThesis:
+class DraftThesis(Record):
     """Output of 1c (§4.3). `draft_*` fields are derived, not stated by the source."""
     text: str
     context: str
@@ -116,13 +125,12 @@ class DraftThesis:
     draft_limitations: str
 
 
-@dataclass
-class IdeaFields:
+class IdeaFields(Record):
     """Output of 1d (§4.4)."""
     text: str
     applicability_conditions: str
     limitations: str
-    failure_modes: list[str] = field(default_factory=list)
+    failure_modes: list[str] = Field(default_factory=list)
 
 
 # ----------------------------------------------------------------------- schemas
@@ -222,8 +230,10 @@ REWRITE_SCHEMA = {
     "additionalProperties": False,
 }
 
-# (schema, dataclass, path to the object whose properties must match its fields).
-# Checked by selfcheck §6.11: schema property names ⊆ dataclass fields.
+# (schema, model, path to the object whose properties must match its fields).
+# Checked by selfcheck §6.11: schema property names ⊆ model fields. This is what
+# keeps the literal schemas above and the models here from drifting apart, since
+# one is not generated from the other.
 SCHEMA_BINDINGS = [
     (PARSE_SCHEMA, DraftThesis, ["theses", "items"]),
     (GENERALIZE_SCHEMA, IdeaFields, []),
@@ -239,5 +249,5 @@ def schema_properties(schema: dict, path: list[str]) -> set[str]:
     return set(node["properties"])
 
 
-def dataclass_fields(cls) -> set[str]:
-    return {f.name for f in fields(cls)}
+def model_field_names(cls) -> set[str]:
+    return set(cls.model_fields)
