@@ -50,6 +50,7 @@ lake/
   stub_store.py     # SQLite-бэкенд того же интерфейса — ВРЕМЕННЫЙ
   selfcheck.py      # 19 assert-проверок, один запуск
   sources.yaml      # сгенерирован маппером
+  ops.py            # составные операции: то же, что ручки, но вызываемо импортом
   ingest/  fetch parse generalize link rederive run
   retrieve/ rewrite search rank api        # api.py — ядро чтения, без транспорта
   api/     app routes schemas jobs selfcheck   # HTTP-слой на всё, единственный сервер
@@ -234,6 +235,13 @@ retrieve.rewrite.rewrite(query, budget=None) -> (query, failed)
 retrieve.search.search(query, query_vec, top_k=50, fuse="rrf"|"minmax") -> list[dict]
 retrieve.rank.rank(query, k=5, query_vec=None) -> (ideas, log_payload)
 retrieve.api.retrieve(query, k=5, ...) -> (status, body)   # транспорт-независимое ядро
+
+# составные операции — то же самое, что делают ручки, но без единого знания про HTTP
+ops.upsert_source(url, title, type, version="v1", ...) -> dict   # Conflict, если едет title/type
+ops.patch_idea(idea_id, fields) -> dict                          # text тянет за собой вектор
+ops.reindex() -> dict ; ops.stats() -> dict ; ops.health() -> dict
+ops.staging_state() -> dict ; ops.pending_link(limit=50) -> list  # Broken на битых файлах
+# исключения: OpsError -> NotFound (404) | Conflict (409) | Broken (503)
 
 # HTTP-слой
 api.app.create_app(mock=False, warmup=True) -> FastAPI ; api.app.app

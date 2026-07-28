@@ -23,12 +23,12 @@ from pathlib import Path
 import numpy as np
 from fastapi.testclient import TestClient
 
-from .. import graph_client, index, stub_store, trace
+from .. import graph_client, index, ops, stub_store, trace
 from ..ingest import run as run_mod
 from ..models import (DATA, EMBED_DIM, Idea, Source, Thesis, new_idea_id, new_thesis_id,
                       source_id as make_source_id, text_hash)
 from ..retrieve import api as retrieve_api, rank as rank_mod, search as search_mod
-from . import jobs, routes, schemas
+from . import jobs, schemas
 from .app import create_app
 from .schemas import MAX_K, MAX_PAGE, MAX_QUERY_CHARS, IdeaOut, ThesisOut
 
@@ -101,9 +101,9 @@ def main() -> None:
     # path reading the real `data/index.db` — which is how this check first ran, with
     # 22 live ideas answering a fixture query.
     bind(rank_mod, "search", functools.partial(search_mod.search, db=idx))
-    bind(routes, "STAGING", tmp / "staging.jsonl")
-    bind(routes, "STAGING_CURSOR", tmp / "staging.cursor")
-    bind(routes, "PENDING_LINK", tmp / "pending_link.jsonl")
+    bind(ops, "STAGING", tmp / "staging.jsonl")
+    bind(ops, "STAGING_CURSOR", tmp / "staging.cursor")
+    bind(ops, "PENDING_LINK", tmp / "pending_link.jsonl")
     bind(retrieve_api, "RETRIEVE_LOG", tmp / "retrieve.jsonl")
     # Every graph call is @trace'd, and trace appends to TRACES_DIR/<run_id>.jsonl.
     bind(trace, "TRACES_DIR", tmp / "traces")
@@ -322,6 +322,32 @@ def _run(tmp: Path, idx: Path) -> None:
             raise AssertionError("stub_store.update_idea wrote NULL into a non-nullable field")
         assert client.patch("/ideas/nope", json={"text": "x"}).status_code == 404
 
+        # --- the same two guards without HTTP ------------------------------
+        # Both used to exist only inside a route, so `import graph_client` walked
+        # past them and nothing said so. They live in `lake.ops` now; called as
+        # functions, they must refuse and re-embed exactly as the routes do.
+        for stolen in ({"type": "paper"}, {"title": "RETITLED"}):
+            try:
+                ops.upsert_source(**{**run_body, **stolen})
+            except ops.Conflict as exc:
+                assert list(stolen)[0] in str(exc), (stolen, exc)
+            else:
+                raise AssertionError(f"ops.upsert_source moved {list(stolen)[0]} of a source "
+                                     f"whose leaves carry it as provenance")
+        assert client.get(f"/sources/{first['id']}").json()["title"] == run_body["title"], \
+            "the refused upsert wrote anyway"
+        moved = "pay the cheap score first"
+        assert ops.patch_idea(idea_b, {"text": moved})["text"] == moved
+        assert np.allclose(client.get(f"/ideas/{idea_b}", params={"include_vector": True})
+                           .json()["vector"], _vec(moved), atol=1e-6), \
+            "ops.patch_idea wrote the text and left the vector behind"
+        try:
+            ops.patch_idea("nope", {"text": "x"})
+        except ops.NotFound:
+            pass
+        else:
+            raise AssertionError("ops.patch_idea invented an idea that does not exist")
+
         # --- theses -------------------------------------------------------
         page = client.get("/theses").json()
         assert page["total"] == 3 and len(page["items"]) == 3
@@ -392,7 +418,8 @@ def _run(tmp: Path, idx: Path) -> None:
         finally:
             graph_client.counts = real_counts
         print("ok: graph — pages with a true total, 404 where [] would lie, patch re-embeds, "
-              "503 != empty, 500 still says what broke")
+              "503 != empty, 500 still says what broke; both guards hold when lake.ops is "
+              "imported, not served")
 
         # --- §6.19 repair --------------------------------------------------
         index.reset()
@@ -492,8 +519,8 @@ def _run(tmp: Path, idx: Path) -> None:
         # --- what sits between the phases ----------------------------------
         rows = [{"source": {"id": "s1", "title": "One"}}, {"source": {"id": "s1", "title": "One"}},
                 {"source": {"id": "s2", "title": "Two"}}]
-        routes.STAGING.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-        routes.STAGING_CURSOR.write_text("2\n", encoding="utf-8")
+        ops.STAGING.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        ops.STAGING_CURSOR.write_text("2\n", encoding="utf-8")
         staging = client.get("/ingest/staging").json()
         assert staging["lines"] == 3 and staging["cursor"] == 2 and staging["pending_lines"] == 1
         assert staging["sources"] == [{"id": "s1", "title": "One", "lines": 2, "ingested": 2},
@@ -502,15 +529,15 @@ def _run(tmp: Path, idx: Path) -> None:
 
         # The three states this endpoint used to answer 200 or 500 for, all of them
         # corruption an operator opens it precisely to see.
-        routes.STAGING_CURSOR.write_text("99\n", encoding="utf-8")
+        ops.STAGING_CURSOR.write_text("99\n", encoding="utf-8")
         past_end = client.get("/ingest/staging")
         assert past_end.status_code == 503 and "past the 3 lines" in past_end.json()["error"], \
             past_end.text
-        routes.STAGING_CURSOR.write_text("garbage\n", encoding="utf-8")
+        ops.STAGING_CURSOR.write_text("garbage\n", encoding="utf-8")
         for answer in (client.get("/ingest/staging"), client.get("/stats")):
             assert answer.status_code == 503 and "garbage" in answer.json()["error"], answer.text
-        routes.STAGING_CURSOR.write_text("2\n", encoding="utf-8")
-        routes.STAGING.write_text(routes.STAGING.read_text(encoding="utf-8") + '{"trunc',
+        ops.STAGING_CURSOR.write_text("2\n", encoding="utf-8")
+        ops.STAGING.write_text(ops.STAGING.read_text(encoding="utf-8") + '{"trunc',
                                   encoding="utf-8")
         torn = client.get("/ingest/staging")
         assert torn.status_code == 503 and "staging.jsonl:4" in torn.json()["error"], torn.text
@@ -520,7 +547,7 @@ def _run(tmp: Path, idx: Path) -> None:
                     "candidates": [{"idea_id": "a"}, {"idea_id": "b"}][:n],
                     "staging_line": {"source": {"id": "s1"},
                                      "thesis": {"text": f"statement {n}"}}} for n in (1, 2)]
-        routes.PENDING_LINK.write_text("".join(json.dumps(e) + "\n" for e in entries),
+        ops.PENDING_LINK.write_text("".join(json.dumps(e) + "\n" for e in entries),
                                        encoding="utf-8")
         pending = client.get("/ingest/pending-link").json()
         assert pending[-1] == {"ts": "2026-07-28T10:02:00+00:00", "run_id": "r2",

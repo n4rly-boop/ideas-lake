@@ -13,8 +13,16 @@ Three rules this layer must not soften:
 
 1. **503 is not `[]`.** A store that raised means the lake is broken; an empty
    answer from a live store is data for the A/B (§5.4). `retrieve.api` decides
-   which happened for /retrieve, and the sqlite handler below does it for the
-   rest — a store error is never a 200 with a short list.
+   which happened for /retrieve, and for the rest the handler registered over
+   `graph_client.STORE_ERRORS` does — a store error is never a 200 with a short
+   list. Which exception classes those are is the store's knowledge, not this
+   layer's (§3.4).
+
+The composed operations behind the routes live in `lake.ops`, which knows no
+HTTP: the guards they carry — a source's provenance is not re-postable, an
+idea's text drags its vector — have to hold for a caller that imports the
+module, not only for one that sends a request. The routes here are the thin
+half: they map `ops` refusals to statuses and nothing else.
 2. **Every /retrieve leaves exactly one log line**, 503 included. The log lives
    in `retrieve.api`, so no HTTP path can skip it. The mock is the one deliberate
    exception: frozen rows in the metrics log are contamination.
@@ -35,8 +43,16 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .. import graph_client
+from .. import graph_client, ops
 from .routes import ROUTERS
+
+# `lake.ops` refusals -> statuses, declared once. The composed operations live in a
+# module with no HTTP in it (see `ops.py`), so the mapping has to live somewhere;
+# repeating it per route is how one route ends up answering 500 for a refusal the
+# caller could have acted on. A bare `OpsError` is not mapped on purpose: an
+# unclassified refusal is a bug here, and 500 says so.
+OPS_STATUS: tuple[tuple[type[ops.OpsError], int], ...] = (
+    (ops.NotFound, 404), (ops.Conflict, 409), (ops.Broken, 503))
 
 DESCRIPTION = """\
 Долговременная память между прогонами эволюции (проект 28, блок A).
@@ -96,6 +112,17 @@ def create_app(mock: bool = False, warmup: bool = True) -> FastAPI:
         """
         return JSONResponse(status_code=exc.status_code, content={"error": str(exc.detail)},
                             headers=getattr(exc, "headers", None))
+
+    async def _ops_error(request: Request, exc: Exception) -> JSONResponse:
+        """A domain refusal from `lake.ops`, on the status `OPS_STATUS` gives it.
+
+        Registered on the base class: Starlette walks the MRO, so every subclass is
+        covered and a new one cannot silently start answering 200.
+        """
+        status = next((code for cls, code in OPS_STATUS if isinstance(exc, cls)), 500)
+        return JSONResponse(status_code=status, content={"error": str(exc)})
+
+    app.add_exception_handler(ops.OpsError, _ops_error)
 
     async def _store_down(request: Request, exc: Exception) -> JSONResponse:
         """The store raised: 503, and it says so. A 500 with an empty body would let

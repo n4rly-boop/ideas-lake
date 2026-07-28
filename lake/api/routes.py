@@ -18,16 +18,18 @@ Two rules run through all of them, both §5.4 in origin and both about not lying
 No route writes a Thesis and none deletes anything. Theses are immutable (§1.2)
 and are created only by phase 2, which assigns `idea_id` through the arbiter; a
 hand-written leaf would skip linking and land in the store attached to nothing.
+
+Anything composed — a guard, a recomputation, a number built out of several store
+calls — lives in `lake.ops` and not here, so that importing the modules reaches
+the same behaviour as calling the port. The routes below shape the wire and
+nothing else; `lake.ops` exceptions become statuses in ONE place, `app.py`.
 """
-import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from .. import graph_client, index
-from ..models import PENDING_LINK, STAGING, STAGING_CURSOR, Source, source_id as make_source_id
+from .. import graph_client, index, ops
 from ..retrieve import api as retrieve_api
 from . import jobs
 from .schemas import (MAX_K, MAX_PAGE, EdgeOut, ErrorResponse, Health, IdeaOut, IdeaPatch,
@@ -55,10 +57,6 @@ _BUSY = {409: {"model": ErrorResponse, "description":
 _GRAPH_ERRORS = {**_BAD, **_STORE_DOWN}
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 def _page(total: int, limit: int, offset: int, items: list) -> dict:
     return {"total": total, "limit": limit, "offset": offset, "items": items}
 
@@ -69,38 +67,6 @@ def _idea(body: dict, include_vector: bool) -> dict:
     if not include_vector:
         out.pop("vector", None)
     return out
-
-
-def _lines(path: Path) -> list[str]:
-    if not Path(path).exists():
-        return []
-    return [ln for ln in Path(path).read_text(encoding="utf-8").splitlines() if ln.strip()]
-
-
-def _cursor(lines: int | None = None) -> int:
-    """Phase 2's watermark. Absent file means nothing ingested yet, which is 0 —
-    the one case where a default is the truth and not a guess.
-
-    Anything else is refused with the reason. These two endpoints are what an
-    operator opens when the ingest is already in a bad state, so a bare 500 is
-    the least useful answer they could give; and a cursor past the end of the
-    file is corruption, not "everything ingested" — clamping it to zero pending
-    lines would report a finished ingest for a file the cursor no longer fits.
-    """
-    path = Path(STAGING_CURSOR)
-    if not path.exists():
-        return 0
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        return 0
-    if not raw.isdigit():
-        raise HTTPException(503, f"{path.name} holds {raw!r}, not a line number")
-    cursor = int(raw)
-    if lines is not None and cursor > lines:
-        raise HTTPException(503, f"{path.name} is at {cursor}, past the {lines} lines of "
-                                 f"{Path(STAGING).name} — the two disagree; drop the cursor "
-                                 f"to replay (phase 2 skips what is already stored)")
-    return cursor
 
 
 # --------------------------------------------------------------------------- graph
@@ -129,32 +95,10 @@ def get_source(source_id: str):
                    "provenance of leaves already written; they are not re-postable."}},
     summary="Создать или заменить источник (сюда блок C пишет исход прогона)")
 def upsert_source(body: SourceIn):
-    """The id is derived from (url, version), so re-posting the same run replaces the
-    row instead of duplicating it — that is what makes this safe to call after every
-    evolution run (§1.1).
-
-    What a re-post may change is the run outcome (`run_success`, `run_meta`,
-    `retrieved_at`) and nothing else. `title` and `type` are read back through the
-    JOIN as `source_title` / `source_type` of every leaf of that source, and
-    `source_type` is what the linker uses to keep `effect_claimed` apart from
-    `effect_observed` (§4.6). Letting a re-post move them would rewrite the
-    provenance of theses that are supposed to be frozen (§1.2) — through a route
-    that never touches the thesis table.
-    """
-    existing = graph_client.get_source(make_source_id(body.url, body.version))
-    if existing is not None:
-        changed = [name for name in ("title", "type")
-                   if getattr(body, name) != existing[name]]
-        if changed:
-            raise HTTPException(409, f"source {existing['id']} already exists with a different "
-                                     f"{' and '.join(changed)}; those are provenance of its "
-                                     f"leaves. Re-post only run_success/run_meta.")
-    src = Source(id=make_source_id(body.url, body.version), url=body.url, title=body.title,
-                 type=body.type, version=body.version,
-                 retrieved_at=body.retrieved_at or _now(),
-                 run_success=body.run_success, run_meta=body.run_meta)
-    graph_client.write_source(src)
-    return graph_client.get_source(src.id)
+    """The id-from-(url, version) rule and the 409 that keeps `title`/`type` frozen
+    both live in `ops.upsert_source` — a guard only this route enforced would be a
+    guard every importer of `graph_client.write_source` walks past."""
+    return ops.upsert_source(**body.model_dump())
 
 
 @graph.get("/ideas", response_model=Page[IdeaOut], responses=_GRAPH_ERRORS, summary="Идеи с листьями, постранично")
@@ -178,19 +122,9 @@ def get_idea(idea_id: str, include_vector: bool = False):
              responses={**_GRAPH_ERRORS, **_NOT_FOUND},
              summary="Изменить поля идеи (id и листья не трогаются)")
 def patch_idea(idea_id: str, body: IdeaPatch):
-    """`text` drags the vector with it: the idea vector is derived from the text
-    (§1.3), and writing one without the other drifts the idea's neighbourhood away
-    from what the idea now says — the same rule `rederive` follows (§4.6)."""
-    fields = body.model_dump(exclude_unset=True)
-    if "text" in fields:
-        from .. import embed          # local: loading sentence-transformers costs seconds
-        fields["vector"] = embed.embed_docs([fields["text"]])[0].tolist()
-    fields["updated_at"] = _now()
-    try:
-        graph_client.update_idea(idea_id, fields)
-    except KeyError:
-        raise HTTPException(404, f"idea {idea_id} not found")
-    return _idea(graph_client.get_ideas([idea_id])[0], False)
+    """`IdeaPatch` decides what may be written at all; `ops.patch_idea` is what makes
+    `text` drag the vector with it (§1.3), for this route and for every importer."""
+    return _idea(ops.patch_idea(idea_id, body.model_dump(exclude_unset=True)), False)
 
 
 @graph.get("/ideas/{idea_id}/theses", response_model=list[ThesisOut],
@@ -334,113 +268,43 @@ def get_job(job_id: str):
                    "the body names the line or the value."}},
     summary="Что лежит между фазами — точка приёмки глазами")
 def staging_state():
-    # ponytail: parses the whole file to group by source. Fine at 84 sources x 30
-    # lines; if staging ever grows past that, keep a sidecar index instead.
-    lines = _lines(STAGING)
-    cursor = _cursor(len(lines))
-    per_source: dict[str, dict] = {}
-    total = 0
-    for lineno, line in enumerate(lines, 1):
-        try:
-            src = json.loads(line)["source"]
-            key, title = src["id"], src["title"]
-        except (ValueError, KeyError, TypeError) as exc:
-            # A phase 1 killed mid-write leaves a truncated last line. Name the line
-            # instead of dying with a traceback: this endpoint is the one an operator
-            # opens precisely because something went wrong.
-            raise HTTPException(503, f"{Path(STAGING).name}:{lineno} is not a staging line "
-                                     f"({type(exc).__name__}: {exc})")
-        entry = per_source.setdefault(key, {"id": key, "title": title,
-                                            "lines": 0, "ingested": 0})
-        entry["lines"] += 1
-        entry["ingested"] += lineno <= cursor
-        total += 1
-    return {"lines": total, "cursor": cursor, "pending_lines": max(0, total - cursor),
-            "sources": list(per_source.values())}
+    return ops.staging_state()
 
 
 @ingest.get("/pending-link", response_model=list[PendingLinkOut], responses=_BAD,
             summary="Очередь отказов арбитра линковки (§4.5) — свежие снизу")
 def pending_link(limit: int = Query(50, gt=0, le=MAX_PAGE)):
-    """This queue existing at all is the fail-closed behaviour: an arbiter that failed
-    writes here instead of guessing `add` or `new`. Non-empty means theses were parsed
-    and never attached — work waiting, not work lost. The full lines (staging row and
-    all candidates) stay in `data/pending_link.jsonl`."""
-    out = []
-    for line in _lines(PENDING_LINK)[-limit:]:
-        rec = json.loads(line)
-        row = rec.get("staging_line") or {}
-        out.append({"ts": rec.get("ts", ""), "run_id": rec.get("run_id"),
-                    "error": rec.get("error", ""),
-                    "thesis_text": (row.get("thesis") or {}).get("text", ""),
-                    "source_id": (row.get("source") or {}).get("id", ""),
-                    "candidates": len(rec.get("candidates") or [])})
-    return out
+    return ops.pending_link(limit)
 
 
 # ----------------------------------------------------------------------------- ops
+# `ops_router`, not `ops`: the module of the same name is what these three call.
 
-ops = APIRouter(tags=["ops"])
+ops_router = APIRouter(tags=["ops"])
 
 
-@ops.get("/healthz", response_model=Health,
-         summary="Живость плюс единственный инвариант, который гниёт молча")
+@ops_router.get("/healthz", response_model=Health,
+                summary="Живость плюс единственный инвариант, который гниёт молча")
 def healthz(request: Request):
     if request.app.state.mock:
         return {"status": "ok", "mock": True, "detail": "mock mode, no store touched"}
-    try:
-        leaves = graph_client.counts()["theses"]
-        indexed = index.count()
-    except Exception as exc:
-        # `degraded` with the reason, not a 500: a health check that dies tells the
-        # caller less than one that says what is wrong.
-        return {"status": "degraded", "mock": False, "detail": f"{type(exc).__name__}: {exc}"}
-    ok = indexed == leaves
-    return {"status": "ok" if ok else "degraded", "mock": False, "theses_indexed": indexed,
-            "leaves_in_store": leaves, "in_sync": ok,
-            "detail": None if ok else "index and store disagree — POST /admin/reindex (§6.19)"}
+    # `mock` is app state, so it stays here; `ops.health()` never raises — it answers
+    # `degraded` with the reason, because a health check that dies tells the caller
+    # less than one that says what is wrong.
+    return {**ops.health(), "mock": False}
 
 
-@ops.get("/stats", response_model=Stats, responses=_STORE_DOWN,
-         summary="Числа отчёта §4.7 по всему озеру")
+@ops_router.get("/stats", response_model=Stats, responses=_STORE_DOWN,
+                summary="Числа отчёта §4.7 по всему озеру")
 def stats():
-    counts = graph_client.counts()
-    indexed = index.count()
-    running = jobs.running()
-    return {**counts, "theses_indexed": indexed,
-            "in_sync": indexed == counts["theses"],
-            "ideas_without_leaves": graph_client.ideas_without_leaves(),
-            "trust_scale": graph_client.trust_scale(),
-            "staging_lines": len(_lines(STAGING)),
-            "staging_cursor": _cursor(),
-            "pending_link": len(_lines(PENDING_LINK)),
-            "job_running": running["id"] if running else None}
+    return ops.stats()
 
 
-@ops.post("/admin/reindex", response_model=ReindexResult,
-          responses={**_BUSY, **_STORE_DOWN},
-          summary="Пересобрать индекс тезисов из хранилища (§6.19)")
+@ops_router.post("/admin/reindex", response_model=ReindexResult,
+                 responses={**_BUSY, **_STORE_DOWN},
+                 summary="Пересобрать индекс тезисов из хранилища (§6.19)")
 def reindex():
-    """The repair path of §6.19, and the only supported answer to a `degraded` health
-    check: the store carries `idea_id`, which phase 2 assigns and `staging.jsonl`
-    therefore never holds.
-
-    It takes the ingest slot for the duration — a rebuild racing a phase 2 would index
-    a moving target — and every vector is validated before the old index is dropped,
-    so a refusal leaves the suspect index in place instead of emptying it.
-    """
-    try:
-        with jobs.exclusive("reindex") as job:
-            before = index.count()
-            rows = graph_client.all_theses()
-            index.reconcile(rows)
-            after = index.count()
-            job["report"] = {"indexed_before": before, "leaves_in_store": len(rows),
-                             "indexed_after": after}
-            return {"indexed_before": before, "leaves_in_store": len(rows),
-                    "indexed_after": after, "in_sync": after == len(rows)}
-    except jobs.Busy as busy:
-        raise HTTPException(409, str(busy))
+    return ops.reindex()
 
 
-ROUTERS = (retrieve, graph, search, ingest, ops)
+ROUTERS = (retrieve, graph, search, ingest, ops_router)
