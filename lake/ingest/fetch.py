@@ -448,8 +448,9 @@ if __name__ == "__main__":
         else:
             raise AssertionError("missing PyMuPDF must raise, not fall through to the network")
 
-    fakes = [Section("abstract", "abstract", "Abstract", "A"),
-             Section("S4", "section", "Discussion and Limitations", "L")]
+    # Keyword arguments: `Section` is a pydantic model and takes no positional ones.
+    fakes = [Section(id="abstract", kind="abstract", title="Abstract", text="A"),
+             Section(id="S4", kind="section", title="Discussion and Limitations", text="L")]
     assert find_limitations(fakes) == "L" and find_abstract(fakes) == "A"
     assert find_limitations(fakes[:1]) == ""
 
