@@ -29,13 +29,13 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from .. import graph_client, index, ops
+from .. import graph_client, index, ops, vault
 from ..retrieve import api as retrieve_api
 from . import jobs
 from .schemas import (MAX_K, MAX_PAGE, EdgeOut, ErrorResponse, Health, IdeaOut, IdeaPatch,
                       JobOut, Page, PendingLinkOut, Phase1Request, Phase2Request,
                       ReindexResult, RetrieveRequest, RetrieveResponse, SearchHit, SourceIn,
-                      SourceOut, StagingOut, Stats, ThesisOut)
+                      SourceOut, StagingOut, Stats, ThesisOut, VaultExportResult)
 
 SOURCES_YAML = Path(__file__).resolve().parents[1] / "sources.yaml"
 
@@ -49,6 +49,14 @@ _NOT_FOUND = {404: {"model": ErrorResponse, "description": "No such row."}}
 _BUSY = {409: {"model": ErrorResponse, "description":
                "Another ingest or repair holds the single slot. Ingest is sequential by "
                "design (§4.5); this is a refusal, not a queue."}}
+# One status, two refusals, so one entry: the slot is taken, or the destination is not
+# ours to rewrite. Splitting them would need two 409 keys, which OpenAPI has no room for.
+_VAULT_REFUSED = {409: {"model": ErrorResponse, "description":
+                        "A refusal the caller can act on, and the message says which: the "
+                        "single slot is held by another ingest or repair (§4.5); the "
+                        "destination holds notes this export did not write, so it will not "
+                        "be cleared (§11.3.4); the destination is a file; the lake holds no "
+                        "nodes; or a node id is not a safe file name (§11.3.3)."}}
 # Declared per route and never on the router: 400 and 503 come from app-wide
 # handlers, but a route with nothing to validate cannot produce a 400, and
 # documenting one there is the same defect `_drop_422` exists to prevent —
@@ -305,6 +313,23 @@ def stats():
                  summary="Пересобрать индекс тезисов из хранилища (§6.19)")
 def reindex():
     return ops.reindex()
+
+
+@ops_router.post("/vault/export", response_model=VaultExportResult,
+                 responses={**_VAULT_REFUSED, **_STORE_DOWN},
+                 summary="Выгрузить озеро в Obsidian-vault (спека 11)")
+def vault_export():
+    """Deliberately takes no `dest`: over HTTP that is a write-anywhere primitive, and
+    the server listens on 0.0.0.0 by default. `--dest` stays on the CLI, where the
+    caller already owns the filesystem. The operation is the same either way (§11.4).
+
+    The job slot, not because the export is slow, but because an export racing phase 2
+    reads a torn lake: the ideas of a batch without its theses. The read-vs-`counts()`
+    guard would catch it as a 503, which is a true answer to the wrong question.
+    """
+    with jobs.exclusive("vault-export") as job:
+        job["report"] = vault.export()
+        return job["report"]
 
 
 ROUTERS = (retrieve, graph, search, ingest, ops_router)

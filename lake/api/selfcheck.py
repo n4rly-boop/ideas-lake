@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 from fastapi.testclient import TestClient
 
-from .. import graph_client, index, ops, stub_store, trace
+from .. import graph_client, index, ops, stub_store, trace, vault as vault_mod
 from ..ingest import run as run_mod
 from ..models import (DATA, EMBED_DIM, Idea, Source, Thesis, new_idea_id, new_thesis_id,
                       source_id as make_source_id, text_hash)
@@ -105,8 +105,14 @@ def main() -> None:
     bind(ops, "STAGING_CURSOR", tmp / "staging.cursor")
     bind(ops, "PENDING_LINK", tmp / "pending_link.jsonl")
     bind(retrieve_api, "RETRIEVE_LOG", tmp / "retrieve.jsonl")
+    # `export(dest=DATA / "vault")` binds the real folder as a DEFAULT ARGUMENT at def
+    # time — the same trap as `search.search` above, and here the blast radius is a
+    # directory this check would rewrite while an operator has it open in Obsidian.
+    bind(vault_mod, "export", functools.partial(vault_mod.export, dest=tmp / "vault"))
     # Every graph call is @trace'd, and trace appends to TRACES_DIR/<run_id>.jsonl.
     bind(trace, "TRACES_DIR", tmp / "traces")
+    if stub_store._conn is not None:      # a live handle on the real lake: closed, not dropped
+        stub_store._conn.close()
     real_db, stub_store._db_path, stub_store._conn = stub_store._db_path, tmp / "lake.db", None
 
     fake_embed = types.ModuleType("lake.embed")
@@ -560,6 +566,35 @@ def _run(tmp: Path, idx: Path) -> None:
         print("ok: ingest — one slot, 409 on the second, a dead job says failed, "
               "a corrupt cursor or staging line is named, not swallowed")
 
+        # --- vault export (spec 11) ----------------------------------------
+        stats = client.get("/stats").json()
+        exported = client.post("/vault/export")
+        assert exported.status_code == 200, exported.text
+        body = exported.json()
+        schemas.VaultExportResult.model_validate(body)
+        assert (body["ideas"], body["theses"], body["sources"]) == \
+            (stats["ideas"], stats["theses"], stats["sources"]), (body, stats)
+        assert body["files"] == body["ideas"] + body["theses"] + body["sources"] + 1, body
+        assert body["orphans"] == 0, body
+        # `export(dest=DATA / "vault")` is a def-time default, rebound in `main`. If that
+        # binding ever slips, this check rewrites the folder an operator has open in
+        # Obsidian — the fingerprint would catch it afterwards, this catches it here.
+        assert not Path(body["dest"]).is_relative_to(DATA), body
+        with jobs.exclusive("vault-export"):
+            busy = client.post("/vault/export")
+        assert busy.status_code == 409, (busy.status_code, busy.text)
+        assert "error" in busy.json(), busy.text
+        # A `kind` the schema does not list is claimed and served without complaint and
+        # kills the LISTING later, on response validation. Asserted after every kind this
+        # check can produce has been through the slot, refusals included: a refused export
+        # leaves a record too, so 409 is enough to poison the view.
+        listed = client.get("/ingest/jobs")
+        assert listed.status_code == 200, listed.text
+        assert {job["kind"] for job in listed.json()} <= set(
+            schemas.JobOut.model_fields["kind"].annotation.__args__), listed.text
+        print("ok: vault — the export answers the same numbers as /stats, and a taken "
+              "slot is 409, the status its own OpenAPI promises")
+
         # --- one definition of a leaf, everywhere --------------------------
         # A thesis whose source row is gone is invisible to /theses, /ideas and
         # /retrieve. It must be invisible to the counts as well, or /stats and
@@ -575,8 +610,12 @@ def _run(tmp: Path, idx: Path) -> None:
         assert client.get(f"/ideas/{idea_a}").json()["theses"] == []
         assert client.post("/admin/reindex").json() == {
             "indexed_before": 3, "leaves_in_store": 0, "indexed_after": 0, "in_sync": True}
-        print("ok: a leaf is a thesis with a source — the pages, the counts and the "
-              "invariant check agree on it")
+        # The lake is broken now, and that is exactly when someone opens the graph to
+        # look. The export marks the orphans instead of refusing (§11.3.7).
+        broken = client.post("/vault/export").json()
+        assert broken["theses"] == 0 and broken["orphans"] == len(made["ideas"]), broken
+        print("ok: a leaf is a thesis with a source — the pages, the counts, the "
+              "invariant check and the vault export agree on it")
 
 
 def _await(client, job_id: str, timeout: float = 10.0) -> dict:

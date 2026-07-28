@@ -44,6 +44,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .. import graph_client, ops
+from . import jobs
 from .routes import ROUTERS
 
 # `lake.ops` refusals -> statuses, declared once. The composed operations live in a
@@ -123,6 +124,18 @@ def create_app(mock: bool = False, warmup: bool = True) -> FastAPI:
         return JSONResponse(status_code=status, content={"error": str(exc)})
 
     app.add_exception_handler(ops.OpsError, _ops_error)
+
+    async def _busy(request: Request, exc: Exception) -> JSONResponse:
+        """The single slot is taken: 409, the same refusal `ops.reindex` converts by hand.
+
+        Registered here because `jobs.Busy` is a bare `RuntimeError` and `jobs` cannot
+        subclass `ops.Conflict` — `ops` imports `jobs`, not the other way round. Two
+        routes already remembered to convert it and a third did not, answering 500 while
+        its own OpenAPI promised 409; a handler cannot be forgotten.
+        """
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+
+    app.add_exception_handler(jobs.Busy, _busy)
 
     async def _store_down(request: Request, exc: Exception) -> JSONResponse:
         """The store raised: 503, and it says so. A 500 with an empty body would let

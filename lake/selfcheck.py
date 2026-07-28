@@ -1,7 +1,8 @@
-"""One run, one file: the 19 assertions of spec 10 §6 (`10-implementation-spec.md:638-664`).
+"""One run, one file: the 19 assertions of spec 10 §6 (`10-implementation-spec.md:638-664`)
+plus the vault export of §11.6, which the spec asks for in the same shape.
 
     python3 -m lake.selfcheck             # 6.1 talks to both school servers
-    python3 -m lake.selfcheck --offline   # 18 of 19, no network, no key in the env
+    python3 -m lake.selfcheck --offline   # 19 of 20, no network, no key in the env
 
 Only `assert`, no framework. Every check gets its own temporary directory and the
 writers are pointed at it: the real `data/lake.db`, `data/index.db`,
@@ -10,7 +11,8 @@ are never opened for writing — they hold the results of real runs. The one thi
 read from `data/` is the parse cache, and only as the §6.2 fixture.
 
 Checks that already exist inside a module are CALLED, never copied: `index.demo`
-(§6.12, §6.13), `search.demo`, `rank.demo` (§6.4), `hybrid_recipe.demo` (§6.3).
+(§6.12, §6.13), `search.demo`, `rank.demo` (§6.4), `hybrid_recipe.demo` (§6.3),
+`vault.demo` (§11.6).
 The rest drive the real code — `run.phase2`, `link.link_batch`,
 `rederive.maybe_rederive`, `api.retrieve` — with the LLM scripted and the encoder
 replaced by seeded vectors (`python3 -m lake.embed` is what proves the encoder).
@@ -33,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import graph_client, index, llm, stub_store, trace
+from . import graph_client, index, llm, stub_store, trace, vault
 from .ingest import link, parse, rederive, run
 from .models import (CACHE_DIR, EMBED_DIM, GENERALIZE_SCHEMA, PARSE_SCHEMA,
                      SCHEMA_BINDINGS, DraftThesis, Idea, Section, Source, Thesis,
@@ -756,6 +758,13 @@ def check_19(tmp: Path) -> str:
     return "rebuild_from(staging) refuses without damaging the index; reset() + index_rows() repairs"
 
 
+@check(20, "vault export: every [[link]] resolves, a source lists only its own leaves, "
+           "a store that contradicts itself is refused (vault.demo, §11.6)")
+def check_20(tmp: Path) -> None:
+    # Owns its temp store and its own data/ fingerprint, like the demos above.
+    vault.demo()
+
+
 # ------------------------------------------------------------------- the runner
 
 def _fingerprint_real_data() -> dict[str, str]:
@@ -774,10 +783,10 @@ def _fingerprint_real_data() -> dict[str, str]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m lake.selfcheck",
-        description="The 19 assertions of spec 10 §6, one run, only assert.")
+        description="The 19 assertions of spec 10 §6 plus §11.6, one run, only assert.")
     parser.add_argument("--offline", action="store_true",
                         help="skip 6.1, the only check that opens a socket; the other "
-                             "18 need neither the network nor a key")
+                             "19 need neither the network nor a key")
     args = parser.parse_args(argv)
 
     trace.set_run_id("selfcheck-" + uuid.uuid4().hex[:6])

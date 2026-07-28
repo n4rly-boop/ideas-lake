@@ -183,6 +183,18 @@ class ReindexResult(BaseModel):
     in_sync: bool
 
 
+class VaultExportResult(BaseModel):
+    """Spec 11: the lake as a folder of markdown notes. `files` counts the README,
+    `ideas + theses + sources` does not — the invariant is `.md` minus README == /stats."""
+    ideas: int
+    theses: int
+    sources: int
+    orphans: int = Field(..., description="Ideas exported with no leaf — `INVARIANT BROKEN` "
+                                          "(`06:85`), marked in the note, not silently dropped.")
+    files: int
+    dest: str
+
+
 # ---------------------------------------------------------------------- retrieve
 
 class RetrieveRequest(BaseModel):
@@ -306,7 +318,11 @@ class JobOut(BaseModel):
     """One ingest run. Jobs live in this process only: a restart loses the history,
     the graph and `staging.cursor` are what actually carry the state (§4.7)."""
     id: str
-    kind: Literal["phase1", "phase2", "reindex"]
+    # Every string ever passed to `jobs.exclusive`/`jobs.start` must be listed here.
+    # A missing one does not fail where it is used: the job is claimed and served, and
+    # `/ingest/jobs` dies later on response validation — a 500 on the only operator view
+    # of an ingest that is in fact healthy, for every record until the slot log evicts it.
+    kind: Literal["phase1", "phase2", "reindex", "vault-export"]
     status: Literal["running", "ok", "failed"]
     created_at: str
     finished_at: str | None = None
