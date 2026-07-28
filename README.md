@@ -93,6 +93,7 @@ python -m lake.api.app --port 8077            # сервер; --mock отдаё�
 python -m lake.ingest.run phase1 --limit 3    # то же, что POST /ingest/phase1, из терминала
 python -m lake.ingest.run phase2              # staging → граф + индекс, последовательно, с курсором
 python -m lake.vault                          # озеро → data/vault, открыть папку как vault в Obsidian
+python -m lake.neo4j_load --dry-run           # что уедет в Neo4j блока B; без флага — записывает
 ```
 
 Приёмка стоит между фазами намеренно: тезисы читаются глазами из `staging.jsonl`, промпт
