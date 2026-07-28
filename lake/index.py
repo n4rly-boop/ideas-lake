@@ -125,17 +125,24 @@ def rrf_fuse(ranked_lists: list[list[int]], k: int = K_RRF) -> list[tuple[int, f
 
 # ------------------------------------------------------------------- public api
 
+def _check_vector(tag: str, vector) -> np.ndarray:
+    """Shape and L2 norm, or raise. Cosine assumes normalized rows (§3.2), and a
+    vector that is neither is a silently worse ranking, not an error anyone sees."""
+    vec = np.asarray(vector, dtype=np.float32)
+    if vec.shape != (EMBED_DIM,):
+        raise ValueError(f"{tag}: vector shape {vec.shape}, expected ({EMBED_DIM},)")
+    norm = float(np.linalg.norm(vec))
+    if abs(norm - 1.0) > 1e-3:
+        raise ValueError(f"{tag}: vector not L2-normalized, norm={norm:.4f}")
+    return vec
+
+
 def _insert(con: sqlite3.Connection, rows: list[tuple[str, str, str, list]]) -> int:
     """rows: (thesis_id, idea_id, text, vector). Returns the number actually written."""
     written = 0
     with con:  # one transaction: idx_thesis and thesis_fts must never diverge
         for thesis_id, idea_id, text, vector in rows:
-            vec = np.asarray(vector, dtype=np.float32)
-            if vec.shape != (EMBED_DIM,):
-                raise ValueError(f"{thesis_id}: vector shape {vec.shape}, expected ({EMBED_DIM},)")
-            norm = float(np.linalg.norm(vec))
-            if abs(norm - 1.0) > 1e-3:  # cosine assumes normalized rows (§3.2)
-                raise ValueError(f"{thesis_id}: vector not L2-normalized, norm={norm:.4f}")
+            vec = _check_vector(thesis_id, vector)
             old = con.execute(
                 "SELECT idea_id, text FROM idx_thesis WHERE thesis_id = ?", (thesis_id,)
             ).fetchone()
@@ -226,6 +233,53 @@ def index_rows(rows: list[dict], db=INDEX_DB) -> int:
     return written
 
 
+def _rebuild(con: sqlite3.Connection, rows: list[tuple[str, str, str, list]]) -> int:
+    """Drop, recreate and refill in ONE transaction. Returns the rows written.
+
+    Validating first and dropping second is not enough on its own: the drop used to
+    commit before the inserts began, so anything that failed afterwards — a
+    duplicate id, a full disk, a killed process — left the index EMPTY and rolled
+    back only the inserts. An empty index is the worst possible failure here,
+    because it does not raise: `/search` answers 200 with `[]` and ranking reads it
+    as "the lake has nothing on this query" (§5.4). SQLite makes DDL transactional,
+    so one transaction turns that into "the repair failed, the old index is still
+    there" — which is what the caller was promised.
+    """
+    with con:
+        con.execute("DROP TABLE IF EXISTS idx_thesis")
+        con.execute("DROP TABLE IF EXISTS thesis_fts")
+        for stmt in DDL:
+            con.execute(stmt)
+        for thesis_id, idea_id, text, vector in rows:
+            vec = _check_vector(thesis_id, vector)
+            cur = con.execute(
+                "INSERT INTO idx_thesis(thesis_id, idea_id, text, vec) VALUES (?, ?, ?, ?)",
+                (thesis_id, idea_id, text, vec.tobytes()),
+            )
+            con.execute("INSERT INTO thesis_fts(rowid, text) VALUES (?, ?)",
+                        (cur.lastrowid, text))
+    return len(rows)
+
+
+def reconcile(rows: list[dict], db=INDEX_DB) -> int:
+    """§6.19 repair: rebuild the index from the store, all or nothing.
+
+    `rows` is `graph_client.all_theses()` — the store is what carries `idea_id`,
+    which phase 2 assigns and `staging.jsonl` therefore never holds.
+
+    Vectors are checked before the drop AND the whole thing is one transaction: the
+    caller reaches for this exactly when the index is already suspect, so a repair
+    that fails must leave what it was asked to fix intact rather than empty.
+    """
+    with _LOCK:
+        con = _con(db)
+        for row in rows:                        # loud refusal before anything moves
+            _check_vector(row["id"], row["vector"])
+        written = _rebuild(con, [(r["id"], r["idea_id"], r["text"], r["vector"]) for r in rows])
+        _MATS.pop(str(db), None)
+        return written
+
+
 def rebuild_from(path: str, db=INDEX_DB) -> int:
     """Replay staging.jsonl from scratch (§3.5). Line format §4.7:
     {"source": {...}, "thesis": {...Thesis without vector...}, "draft": {...}, "vector": [...]}.
@@ -251,13 +305,7 @@ def rebuild_from(path: str, db=INDEX_DB) -> int:
                         f"{path}:{lineno}: thesis {thesis.get('id')!r} has no idea_id — "
                         "phase 2 must write the linked idea_id back into staging"
                     )
-                vec = np.asarray(rec["vector"], dtype=np.float32)
-                if vec.shape != (EMBED_DIM,):
-                    raise ValueError(f"{path}:{lineno}: vector shape {vec.shape}, "
-                                     f"expected ({EMBED_DIM},)")
-                norm = float(np.linalg.norm(vec))
-                if abs(norm - 1.0) > 1e-3:
-                    raise ValueError(f"{path}:{lineno}: vector not L2-normalized, norm={norm:.4f}")
+                _check_vector(f"{path}:{lineno}", rec["vector"])
                 if thesis["id"] in seen:
                     raise ValueError(f"{path}:{lineno}: thesis {thesis['id']!r} appears twice")
                 seen.add(thesis["id"])

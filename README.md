@@ -18,7 +18,8 @@ AIRI Summer 2026, проект 28 «Озеро идей».
 |---|---|
 | `lake/models.py` | `Source` / `Thesis` / `Idea` — pydantic; отдельно литеральные JSON-схемы для LLM |
 | `lake/ingest/` | write path: fetch → parse → generalize → link → запись батчем |
-| `lake/retrieve/` | read path: rewrite → гибридный поиск → подъём к идеям → ранжирование → `POST /retrieve` |
+| `lake/retrieve/` | read path: rewrite → гибридный поиск → подъём к идеям → ранжирование |
+| `lake/api/` | HTTP-слой на всё: граф, поиск, ингест заданиями, retrieve, починка индекса |
 | `lake/index.py` | индекс тезисов: SQLite FTS5 + вектора + RRF |
 | `lake/graph_client.py` | единственное место, знающее формат графового хранилища |
 | `lake/llm.py` | клиент llama.cpp: принуждение схемой, канарейка, fail-closed |
@@ -45,6 +46,16 @@ POST /retrieve
 ```
 
 `via` — как идея попала в выдачу: `thesis` | `edge` | `padding`.
+
+Это контракт C3, но не весь сервер. Тем же приложением ходят чтение графа
+(`/sources`, `/ideas`, `/theses` — постранично, с фильтрами), сырой гибридный поиск
+по тезисам (`/search`), ингест фоновыми заданиями (`/ingest/phase1|phase2`, слот один,
+второй запуск → `409`), очередь отказов арбитра (`/ingest/pending-link`) и починка
+индекса (`/admin/reindex`). Скриптов, которые надо звать руками на машине с данными,
+не осталось. Полный список — `GET /docs`, разбор — в [`lake/README.md`](lake/README.md#5-слой-api).
+
+Ручки на запись тезиса нет: тезис неизменяем и создаётся только фазой 2, которая
+назначает ему идею через арбитра. Удаления нет ни у чего.
 
 FastAPI: `GET /docs` — Swagger, `GET /openapi.json` — машинная схема контракта,
 `GET /healthz` — живость плюс сверка «индекс == хранилище».
@@ -73,9 +84,10 @@ NEO4J_DATABASE
 
 ```bash
 python -m lake.selfcheck                      # инварианты; --offline снимает единственный сетевой пункт
-python -m lake.ingest.run phase1 --limit 3    # → data/staging.jsonl, граф не трогается
+python -m lake.api.selfcheck                  # офлайн-проверка HTTP-слоя, реальный data/ не трогает
+python -m lake.api.app --port 8077            # сервер; --mock отдаёт форму /retrieve без графа и LLM
+python -m lake.ingest.run phase1 --limit 3    # то же, что POST /ingest/phase1, из терминала
 python -m lake.ingest.run phase2              # staging → граф + индекс, последовательно, с курсором
-python -m lake.retrieve.app --port 8077       # POST /retrieve; --mock отдаёт форму без графа и LLM
 ```
 
 Приёмка стоит между фазами намеренно: тезисы читаются глазами из `staging.jsonl`, промпт

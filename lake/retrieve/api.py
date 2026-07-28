@@ -182,15 +182,27 @@ def retrieve(query: str, k: int = K_DEFAULT, *, budget: int | None = None,
                 from . import rank
                 ideas, payload = rank.rank(record["query_rewritten"], k=k)
                 record["returned"], record["cut_off"] = payload["returned"], payload["cut_off"]
+                # The body is validated HERE, inside the guard, and not left to the
+                # HTTP layer. FastAPI validates a response AFTER this function has
+                # returned 200 and its `finally` has already written `returned: [...]`
+                # to the metrics log — so a body it could not serialize left the
+                # caller with a 500 while the log recorded a successful answer with
+                # two ideas in it. The A/B is measured off that log (§5.5).
+                # Imported lazily: `api.schemas` IS the §5.4 contract, but this
+                # module must stay importable without the HTTP layer.
+                from ..api.schemas import RetrieveResponse
+                body = {"ideas": ideas, "log_id": log_id, "cost": cost}
+                RetrieveResponse.model_validate(body)
+                return 200, body
             except Exception as exc:
                 # §5.4 — the store raised, or ranking could not produce an answer at
                 # all. That is "the lake is broken", not "the lake is empty": 503, and
                 # the reason lands in the log next to `returned: []`.
+                # An empty `ideas` is NOT this branch: a live graph with nothing to say
+                # returns 200 above, and that is data for the A/B (§5.4).
                 record["error"] = f"{type(exc).__name__}: {exc}"
+                record["returned"], record["cut_off"] = [], []
                 return 503, {"error": record["error"], "log_id": log_id}
-            # An empty `ideas` here is a live graph with nothing to say — 200, and it
-            # is data for the A/B (§5.4).
-            return 200, {"ideas": ideas, "log_id": log_id, "cost": cost}
         finally:
             cost["tokens_in"] = own["tokens_in"]
             cost["tokens_out"] = own["tokens_out"]

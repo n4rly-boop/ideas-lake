@@ -22,9 +22,9 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 | `python3 -m lake.ingest.run phase1 [--limit N] [--sources path]` | fetch → parse → generalize → `data/staging.jsonl`. 8 потоков. **В граф не пишет ничего** |
 | `python3 -m lake.ingest.run phase2 [--limit N]` | staging → линковка → граф + индекс → пере-вывод. Последовательно, курсор |
 | `python3 -m lake.ingest.run selfcheck` | офлайн end-to-end на фикстурах, временные БД |
-| `python3 -m lake.retrieve.app [--port 8077] [--host H] [--mock]` | FastAPI-сервер под uvicorn |
-| `uvicorn lake.retrieve.app:app --port 8077` | то же штатным способом |
-| `python3 -m lake.retrieve.app --selfcheck` | офлайн-проверка HTTP-слоя |
+| `python3 -m lake.api.app [--port 8077] [--host H] [--mock]` | FastAPI-сервер под uvicorn: граф, поиск, ингест, retrieve |
+| `uvicorn lake.api.app:app --port 8077` | то же штатным способом |
+| `python3 -m lake.api.selfcheck` | офлайн-проверка HTTP-слоя (она же `--selfcheck`) |
 | `python3 -m lake.selfcheck [--offline]` | 19 проверок §6. `--offline` пропускает канарейку (единственный сетевой пункт) |
 | `python3 tools/gen_sources.py` | `09-raw/a11-sources.yaml` → `lake/sources.yaml` (84 записи) |
 
@@ -51,7 +51,8 @@ lake/
   selfcheck.py      # 19 assert-проверок, один запуск
   sources.yaml      # сгенерирован маппером
   ingest/  fetch parse generalize link rederive run
-  retrieve/ rewrite search rank api app
+  retrieve/ rewrite search rank api        # api.py — ядро чтения, без транспорта
+  api/     app routes schemas jobs selfcheck   # HTTP-слой на всё, единственный сервер
   prompts/{parse,generalize,link,rederive,rewrite}/system.txt
   data/             # gitignored: raw/ cache/ traces/ logs/ staging.jsonl index.db lake.db
 ```
@@ -119,10 +120,48 @@ POST /retrieve
 
 ## 5. Слой API
 
-### 5.1 HTTP — контракт C3, единственная зависимость соседей от блока A
+### 5.1 HTTP — единственная зависимость соседей от блока A
+
+Один сервер на весь блок: `lake.api.app`. Скриптов, которые надо запускать руками на машине с
+данными, не осталось — ингест, чтение графа, поиск и починка индекса ходят через HTTP.
 
 `GET /docs` — Swagger, `GET /openapi.json` — машинная схема (422 из неё убран: мы его не отдаём).
-`GET /healthz` — состояние плюс инвариант «индекс == хранилище» (§6.19), который тухнет молча.
+
+| | |
+|---|---|
+| `POST /retrieve` | контракт C3: запрос → идеи с провенансом (ниже) |
+| `GET /search?q&k` | сырой гибрид по тезисам: BM25 + косинус, RRF. Без переписывания и без идей |
+| `GET /sources`, `GET /sources/{id}` | постранично; `total` считается тем же фильтром и тем же JOIN, что и страница |
+| `POST /sources` | upsert: сюда блок C пишет исход прогона. id = f(url, version), повтор заменяет строку. Повтор с другим `title`/`type` → `409`: это провенанс уже записанных листьев |
+| `GET /ideas`, `GET /ideas/{id}` | идеи с листьями; `?include_vector=true` — 384 float, иначе их нет в ответе |
+| `PATCH /ideas/{id}` | правка полей. Меняешь `text` — сервер пересчитывает вектор (§1.3), порознь нельзя |
+| `GET /ideas/{id}/theses`, `/neighbors` | листья и рёбра. Рёбра пусты: это блок B |
+| `GET /theses?idea_id&source_id`, `GET /theses/{id}` | листья постранично |
+| `POST /ingest/phase1`, `POST /ingest/phase2` | `202` + задание; слот один на процесс, второй запуск → `409` |
+| `GET /ingest/jobs`, `/jobs/{id}` | статус задания: `running` \| `ok` + отчёт \| `failed` + текст ошибки |
+| `GET /ingest/staging` | что лежит между фазами: строк, курсор, разбивка по источникам |
+| `GET /ingest/pending-link` | очередь отказов арбитра (§4.5) — работа, которая ждёт, а не потеряна |
+| `GET /healthz` | живость плюс инвариант «индекс == хранилище» (§6.19), который тухнет молча |
+| `GET /stats` | числа отчёта §4.7 по всему озеру |
+| `POST /admin/reindex` | пересборка индекса из хранилища: путь починки §6.19 |
+
+Ручек на запись тезиса нет и не будет: тезис неизменяем (§1.2) и создаётся только фазой 2,
+которая назначает `idea_id` через арбитра. Ручной лист прошёл бы мимо линковки. Удаления нет ни у чего.
+
+`404` там, где пустой список соврал бы: несуществующая идея не отвечает `[]` на `/theses` —
+идея без листьев это сломанный инвариант (`06:85`), и он не должен выглядеть как «нет такой идеи».
+
+Тело ошибки — всегда `{"error": ...}`, на любом статусе, включая `404` на неизвестный путь и
+`405` на неверный глагол (обработчик висит на классе Starlette, не на подклассе FastAPI — иначе
+эти два отвечают `{"detail": ...}`, единственным телом, которое C не разбирает). Необработанное
+исключение — тоже `{"error": "<Тип>: <текст>"}` с `500`, а не `text/plain`.
+Что значит «хранилище упало», знает `graph_client.STORE_ERRORS`, а не слой API: иначе в день
+переезда на Bolt все графовые ручки тихо съехали бы с `503` на `500`.
+
+OpenAPI перечисляет ровно то, что ручка отдаёт: `422` убран (мы его не возвращаем), `400`
+проставлен там и только там, где есть что валидировать, `503` — на всех графовых. Проверка
+держит эквивалентность в обе стороны: лишний статус в схеме — та же поломка, что и недостающий,
+C пишет ветку, которая никогда не сработает.
 
 ```
 POST /retrieve
@@ -137,10 +176,13 @@ POST /retrieve
 400 — битый JSON, нет `query`, `k <= 0`, `budget <= 0`, `allow_web=true`, неизвестное поле
 (`extra="forbid"`: опечатка в имени поля обязана падать, а не игнорироваться). Не 422:
 C интегрировался на 400, тело осталось `{"error": ...}`.
-503 — граф недоступен. `--mock` отдаёт ту же форму с захардкоженными данными и не трогает ни граф,
-ни LLM, и **не пишет строку в лог выдачи** — мок в метриках это загрязнение.
+503 — хранилище недоступно или упало. Это не то же самое, что пустая выдача: `ideas: []` с живым
+графом — данные для замера «с озером против без», а упавший граф — не данные вообще. `--mock`
+отдаёт ту же форму с захардкоженными данными и не трогает ни граф, ни LLM, и **не пишет строку в
+лог выдачи** — мок в метриках это загрязнение. Мок влияет только на `/retrieve`, остальные ручки
+работают как обычно.
 
-Ручка объявлена обычным `def`, не `async def`: ранжирование блокирующее (sqlite, numpy, один вызов
+Ручки объявлены обычным `def`, не `async def`: ранжирование блокирующее (sqlite, numpy, один вызов
 LLM на переписывание), поэтому Starlette уводит её в свой threadpool и не занимает event loop.
 `contextvars` туда копируются — на этом держится по-запросный `cost` (см. `trace.request`).
 
@@ -160,6 +202,7 @@ embed_query(text) -> np.ndarray            # (384,), с query-префиксом
 index_theses(theses, db=INDEX_DB) -> None
 search_theses(query, k, query_vec=None, db=INDEX_DB) -> list[dict]
 reset(db) -> None ; index_rows(rows, db) -> int ; count(db) -> int ; rebuild_from(path, db) -> int
+reconcile(rows, db=INDEX_DB) -> int        # путь §6.19: проверить всё, ПОТОМ сносить и собирать
 
 # lake/graph_client.py — единственное место, знающее формат B
 write_source(src) -> str
@@ -171,6 +214,9 @@ get_ideas(ids) -> list[dict]               # листья уже склеены 
 get_leaves(idea_id) -> list[dict] ; leaf_count(idea_id) -> int
 neighbors(ids, hops=1, min_weight=None) -> list[dict]
 all_theses() -> list[dict] ; ideas_without_leaves() -> list[str] ; trust_scale() -> float
+get_source(id) ; list_sources(limit, offset) ; list_idea_ids(limit, offset)
+list_theses(idea_id, source_id, limit, offset) ; count_theses(idea_id, source_id) ; get_thesis(id)
+counts() -> {source, idea, thesis, edge}   # постраничное чтение для HTTP-слоя
 # update_thesis НЕТ и не будет: иммутабельность тезиса держится отсутствием метода (§3.4)
 
 # write path
@@ -188,7 +234,11 @@ retrieve.rewrite.rewrite(query, budget=None) -> (query, failed)
 retrieve.search.search(query, query_vec, top_k=50, fuse="rrf"|"minmax") -> list[dict]
 retrieve.rank.rank(query, k=5, query_vec=None) -> (ideas, log_payload)
 retrieve.api.retrieve(query, k=5, ...) -> (status, body)   # транспорт-независимое ядро
-retrieve.app.create_app(mock=False) -> FastAPI ; retrieve.app.app                # HTTP-слой
+
+# HTTP-слой
+api.app.create_app(mock=False, warmup=True) -> FastAPI ; api.app.app
+api.jobs.start(kind, fn, args) -> dict     # фоновое задание, слот один; занят → Busy
+api.jobs.exclusive(kind) -> ctx            # тот же слот для короткой работы внутри запроса
 ```
 
 Границы, которые держатся кодом, а не аккуратностью:
@@ -212,9 +262,22 @@ retrieve.app.create_app(mock=False) -> FastAPI ; retrieve.app.app               
 | сбой арбитра → «новая идея», дубли копятся | `pending_link`, тезис не пишется (проверка 6.8) |
 | идея без листьев после отказа на записи | одна транзакция (проверка 6.17) |
 | индекс разъехался с графом | индексация в том же шаге + проверка 6.19 |
+| `PATCH` с явным `null` пишет NULL в ненулевую колонку — строка больше не читается, и с ней падают `/ideas` и весь `/retrieve` | `null` запрещён в `IdeaPatch` **и** в `update_idea`: страж в хранилище закрывает и будущих вызывающих |
+| пересборка индекса упала после сноса → индекс пуст, а пустой индекс не бросает: `/search` отдаёт `200 []`, ранжирование читает это как «в озере ничего нет» | снос, создание и заливка одной транзакцией (`index._rebuild`), векторы проверены до неё |
+| задание держит единственный слот навсегда, если поток не стартовал, и врёт статусом `running` | слот отпускается в `except BaseException` вокруг `Thread.start` |
+| ответ не прошёл валидацию модели → `500`, а в логе выдачи уже записан успех с двумя идеями | тело валидируется в `retrieve.api` **до** записи строки лога |
+| «лист» считается по-разному: `/theses` через JOIN, а `/stats` без него → `in_sync: false` навечно по строкам, которых никто не видит | одно определение: `counts`, `all_theses`, `ideas_without_leaves` идут тем же JOIN |
+| курсор ушёл за конец staging → `pending_lines: 0`, «всё загружено» | `503` с числами; мусор в курсоре и рваная строка staging тоже названы поимённо |
 
 `python3 -m lake.selfcheck` — **19/19**, проверки прогнаны на мутациях: сломай любую из этих
 защит, и краснеет ровно её пункт.
+
+`python3 -m lake.api.selfcheck` — HTTP-слой, офлайн. Тоже прогнан на мутациях: 12 из 12 внесённых
+по одному дефектов роняют проверку (снос индекса до валидации, `counts` без JOIN, `null` в патче,
+обработчик `HTTPException` на подклассе FastAPI, `listing()` в обратном порядке, `/search` мимо `k`,
+непереадресованный `TRACES_DIR` и т.д.). Заканчивается сверкой всего дерева `data/` по (размер,
+mtime) до и после — сверка стоит в `finally`, иначе упавший ассерт уносил её с собой, и прогон,
+который натёк, ровно тем и был прогоном, который отлаживают.
 
 ---
 
@@ -223,6 +286,13 @@ retrieve.app.create_app(mock=False) -> FastAPI ; retrieve.app.app               
 Канарейка 9B/35B → фаза 1 на 3 источниках (60 тезисов, утечка конкретики 0/60, 10 срезано
 потолком 30/документ) → фаза 2 (26 идей, `pending_link` пуст, идей без листьев 0, 3 мин 20 с) →
 `/retrieve` (1.1–1.3 с при бюджете 5 с p95).
+
+HTTP-слой прогнан на этих же данных: `/healthz` и `/stats` (2 источника, 26 идей, 60 тезисов,
+`in_sync: true`), страницы `/sources` `/ideas` `/theses` с фильтрами, `404` в форме `{"error"}`,
+`400` на `limit=0`, `409` на попытку сменить `type` существующего источника (записи не было),
+`/search` (`bm25_rank` заполнен — FTS-плечо живо), `/retrieve` с переписыванием на 9B
+(498 in / 20 out, 1.35 с), `POST /admin/reindex` (60 → 60, `in_sync` держится). OpenAPI: 21
+операция, 12 объявляют `400`, 15 — `503`, ноль — `422`.
 
 Не прогнано: корпус целиком (84 источника), PDF-ветка (PyMuPDF не установлен), Neo4j (работает stub).
 

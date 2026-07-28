@@ -18,6 +18,7 @@ import sqlite3
 import threading
 from array import array
 from pathlib import Path
+from typing import get_args
 
 from .models import LAKE_DB, Idea, Source, Thesis
 
@@ -153,6 +154,13 @@ def create_idea_with_theses(idea: Idea | None, source_id: str, theses: list[Thes
 
 
 _IDEA_FIELDS = set(Idea.model_fields) - {"id"}
+# Only these may hold NULL. The columns are untyped (SQLite) and nothing else
+# rejects a None, so a NULL written into any other one makes the row impossible
+# to read back: `get_ideas` raises, and with it `/ideas`, `/ideas/{id}/theses`
+# and every `/retrieve` whose ranking touches that idea. Guarded here rather
+# than at the HTTP layer so it covers every caller, present and future.
+_NULLABLE_IDEA_FIELDS = {name for name, field in Idea.model_fields.items()
+                         if type(None) in get_args(field.annotation)}
 
 
 def update_idea(idea_id: str, fields: dict) -> None:
@@ -161,6 +169,10 @@ def update_idea(idea_id: str, fields: dict) -> None:
     unknown = set(fields) - _IDEA_FIELDS
     if unknown:                     # a typo must not become a silent no-op
         raise ValueError(f"unknown Idea fields: {sorted(unknown)}")
+    nulls = sorted(k for k, v in fields.items() if v is None
+                   and k not in _NULLABLE_IDEA_FIELDS)
+    if nulls:
+        raise ValueError(f"NULL is not a value for Idea fields: {nulls}")
     cols = [_column(k) for k in fields]
     values = [_encode(k, v) for k, v in fields.items()]
     sql = f"UPDATE idea SET {', '.join(c + '=?' for c in cols)} WHERE id=?"
@@ -215,24 +227,121 @@ def leaf_count(idea_id: str) -> int:
         return _c().execute("SELECT COUNT(*) FROM thesis WHERE idea_id=?", (idea_id,)).fetchone()[0]
 
 
+# --- paged reads, for the HTTP layer (lake/api) -------------------------------
+# The ingest path never needs these: it walks staging, not the store. They exist so
+# the API can page over the graph without any caller writing SQL of its own —
+# format B stays inside this file (§3.4).
+
+def _source_out(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["run_success"] = None if d["run_success"] is None else bool(d["run_success"])
+    d["run_meta"] = None if d["run_meta"] is None else json.loads(d["run_meta"])
+    return d
+
+
+_THESIS_SQL = """SELECT t.*, s.type AS source_type, s.url AS source_url, s.title AS source_title,
+                        s.run_success AS run_success, s.run_meta AS run_meta
+                 FROM thesis t JOIN source s ON s.id = t.source_id"""
+
+
+def get_source(source_id: str) -> dict | None:
+    with _lock:
+        row = _c().execute("SELECT * FROM source WHERE id=?", (source_id,)).fetchone()
+    return None if row is None else _source_out(row)
+
+
+def list_sources(limit: int = 50, offset: int = 0) -> list[dict]:
+    with _lock:
+        rows = _c().execute("SELECT * FROM source ORDER BY retrieved_at, rowid LIMIT ? OFFSET ?",
+                            (limit, offset)).fetchall()
+    return [_source_out(r) for r in rows]
+
+
+def list_idea_ids(limit: int = 50, offset: int = 0) -> list[str]:
+    """Ids only: the bodies come from `get_ideas`, which already joins the leaves."""
+    with _lock:
+        rows = _c().execute("SELECT id FROM idea ORDER BY rowid LIMIT ? OFFSET ?",
+                            (limit, offset)).fetchall()
+    return [r["id"] for r in rows]
+
+
+def _thesis_filter(idea_id: str | None, source_id: str | None) -> tuple[str, list]:
+    where, params = [], []
+    for column, value in (("t.idea_id", idea_id), ("t.source_id", source_id)):
+        if value is not None:
+            where.append(f"{column}=?")
+            params.append(value)
+    return (" WHERE " + " AND ".join(where) if where else ""), params
+
+
+def list_theses(idea_id: str | None = None, source_id: str | None = None,
+                limit: int = 50, offset: int = 0) -> list[dict]:
+    where, params = _thesis_filter(idea_id, source_id)
+    sql = _THESIS_SQL + where + " ORDER BY t.rowid LIMIT ? OFFSET ?"
+    with _lock:
+        rows = _c().execute(sql, params + [limit, offset]).fetchall()
+    return [_leaf_out(r) for r in rows]
+
+
+def count_theses(idea_id: str | None = None, source_id: str | None = None) -> int:
+    """Total behind a `list_theses` page. Same JOIN as the listing on purpose: a
+    thesis whose source row is missing is invisible to one and must not be counted
+    by the other, or `total` promises a page nobody can reach."""
+    where, params = _thesis_filter(idea_id, source_id)
+    sql = "SELECT COUNT(*) FROM thesis t JOIN source s ON s.id = t.source_id" + where
+    with _lock:
+        return _c().execute(sql, params).fetchone()[0]
+
+
+def get_thesis(thesis_id: str) -> dict | None:
+    with _lock:
+        row = _c().execute(_THESIS_SQL + " WHERE t.id=?", (thesis_id,)).fetchone()
+    return None if row is None else _leaf_out(row)
+
+
+def counts() -> dict:
+    """{sources, ideas, theses, edges} — domain words, not table names: the API
+    republishes these keys, and a rename in the schema must not reach the wire.
+
+    `theses` counts through the same JOIN as every serving path. A raw COUNT(*)
+    would include a leaf whose source row is gone — invisible to `/theses`,
+    `/ideas` and `/retrieve`, but counted by `/stats` and `/healthz`, which then
+    report `in_sync: false` forever over rows nobody can reach."""
+    with _lock:
+        con = _c()
+        one = lambda sql: con.execute(sql).fetchone()[0]
+        return {"sources": one("SELECT COUNT(*) FROM source"),
+                "ideas": one("SELECT COUNT(*) FROM idea"),
+                "theses": one("SELECT COUNT(*) FROM thesis t JOIN source s ON s.id = t.source_id"),
+                "edges": one("SELECT COUNT(*) FROM edge")}
+
+
 def all_theses() -> list[dict]:
     """Every leaf with its vector — the reconciliation source for the index (§6.19).
     Replaying `staging.jsonl` cannot do this: `idea_id` is assigned in phase 2, so a
     staging line does not carry one. The store does, and it holds the vectors too."""
+    # Same JOIN as the serving paths, on purpose: this feeds the index, and
+    # indexing a leaf that `/theses` cannot return would put a thesis_id into
+    # `/search` results that `/theses/{id}` answers 404 for.
     with _lock:
         rows = _c().execute(
-            "SELECT id, idea_id, text, vec FROM thesis ORDER BY rowid"
+            "SELECT t.id, t.idea_id, t.text, t.vec FROM thesis t"
+            " JOIN source s ON s.id = t.source_id ORDER BY t.rowid"
         ).fetchall()
     return [{"id": r["id"], "idea_id": r["idea_id"], "text": r["text"],
              "vector": array("f", r["vec"]).tolist()} for r in rows]
 
 
 def ideas_without_leaves() -> list[str]:
-    """Must always be empty (§4.7 report, selfcheck §6.17): `IDEA ||--|{ THESIS`."""
+    """Must always be empty (§4.7 report, selfcheck §6.17): `IDEA ||--|{ THESIS`.
+
+    "Leaf" means the same thing here as everywhere else — a thesis whose source
+    row exists. An idea holding only leaves with no source serves as empty and
+    must be reported as empty, not counted as healthy by a laxer query."""
     with _lock:
         rows = _c().execute(
-            "SELECT i.id FROM idea i LEFT JOIN thesis t ON t.idea_id = i.id"
-            " WHERE t.id IS NULL"
+            "SELECT i.id FROM idea i WHERE NOT EXISTS ("
+            " SELECT 1 FROM thesis t JOIN source s ON s.id = t.source_id WHERE t.idea_id = i.id)"
         ).fetchall()
     return [r["id"] for r in rows]
 

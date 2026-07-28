@@ -15,9 +15,19 @@ is not (§5.4).
 There is no `update_thesis` and there will not be one: thesis immutability (§1.2)
 is held by the absence of the method (§3.4), checked by selfcheck §6.9.
 """
+import sqlite3
+
 from . import stub_store
 from .models import Idea, Source, Thesis
 from .trace import trace
+
+# What "the store is down" is, as an exception type. The HTTP layer turns these
+# into 503 and everything else into 500, and it must not name `sqlite3` itself to
+# do it: §3.4 keeps format B in this file, and the day the backend becomes Bolt
+# an API layer keyed on `sqlite3.Error` would quietly downgrade every store
+# failure from 503 to 500 — the distinction §5.4 exists to protect. Swapping the
+# backend means editing this tuple, here, next to the calls it describes.
+STORE_ERRORS: tuple[type[BaseException], ...] = (sqlite3.Error,)
 
 
 @trace(component="graph", op="write_source")
@@ -60,6 +70,44 @@ def get_leaves(idea_id: str) -> list[dict]:
 @trace(component="graph", op="leaf_count")
 def leaf_count(idea_id: str) -> int:
     return stub_store.leaf_count(idea_id)
+
+
+@trace(component="graph", op="get_source")
+def get_source(source_id: str) -> dict | None:
+    return stub_store.get_source(source_id)
+
+
+@trace(component="graph", op="list_sources")
+def list_sources(limit: int = 50, offset: int = 0) -> list[dict]:
+    return stub_store.list_sources(limit, offset)
+
+
+@trace(component="graph", op="list_idea_ids")
+def list_idea_ids(limit: int = 50, offset: int = 0) -> list[str]:
+    """Ids for one page; `get_ideas` turns them into bodies with leaves."""
+    return stub_store.list_idea_ids(limit, offset)
+
+
+@trace(component="graph", op="list_theses")
+def list_theses(idea_id: str | None = None, source_id: str | None = None,
+                limit: int = 50, offset: int = 0) -> list[dict]:
+    return stub_store.list_theses(idea_id, source_id, limit, offset)
+
+
+@trace(component="graph", op="count_theses")
+def count_theses(idea_id: str | None = None, source_id: str | None = None) -> int:
+    return stub_store.count_theses(idea_id, source_id)
+
+
+@trace(component="graph", op="get_thesis")
+def get_thesis(thesis_id: str) -> dict | None:
+    return stub_store.get_thesis(thesis_id)
+
+
+@trace(component="graph", op="counts")
+def counts() -> dict:
+    """Rows per table — what `/stats` reports (§4.7 numbers, served over HTTP)."""
+    return stub_store.counts()
 
 
 @trace(component="graph", op="all_theses")
