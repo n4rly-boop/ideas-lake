@@ -11,6 +11,9 @@ LLM-серверы — подключение.ipynb
 # и рабочие документы; наружу не идёт.
 knowledge/
 
+# Рабочие инструкции агенту: ссылаются на knowledge/, наружу смысла не имеют.
+CLAUDE.md
+
 # Runtime data (10-implementation-spec.md §2)
 data/
 
