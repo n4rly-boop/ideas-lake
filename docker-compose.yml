@@ -19,12 +19,23 @@
 
 services:
   lake:
+    # Образ собирает CI и кладёт в GHCR (`.github/workflows/deploy.yml`); сервер
+    # его тянет и исходников не держит. `LAKE_TAG` деплой выставляет в короткий
+    # sha прогона — тогда откат это тот же up с другим тегом, а не пересборка.
+    # `build:` остаётся для локальной разработки: `docker compose build` собирает
+    # и метит тем же именем, `up` без pull возьмёт локальный образ.
+    image: ghcr.io/n4rly-boop/ideas-lake:${LAKE_TAG:-latest}
     build: .
     # Всё окружение отсюда: LAKE_KEY_9B, LAKE_KEY_35B, NEO4J_*.
     env_file: [.env.local]
-    # 127.0.0.1, а не 0.0.0.0: у API аутентификации нет вовсе, а внутри
-    # контейнера uvicorn слушает все интерфейсы.
-    ports: ["127.0.0.1:8077:8077"]
+    # Внутри контейнера uvicorn слушает все интерфейсы; наружу порт отдаёт вот
+    # эта строка, и по умолчанию — только на петлю хоста. Чтобы блок C ходил с
+    # другой машины, в `.env.local`: `LAKE_BIND=0.0.0.0`.
+    #
+    # Это не «просто переменная»: ключ (`LAKE_API_KEY`) ходит в заголовке открытым
+    # текстом, TLS здесь нет. 0.0.0.0 без прокси с TLS — осознанный размен, а не
+    # настройка по умолчанию.
+    ports: ["${LAKE_BIND:-127.0.0.1}:8077:8077"]
     volumes:
       # Bind, а не именованный том: `lake/data` — это результаты живых прогонов,
       # и они должны остаться видимыми на хосте (`10` §2).
@@ -35,9 +46,12 @@ services:
       # Значение по умолчанию есть, поэтому голые `down`/`ps` не ломаются.
       - ${LAKE_DATA:-./lake/data}:/app/lake/data
     healthcheck:
-      # `/healthz` сверяет индекс с хранилищем, а не просто отвечает 200.
+      # `/healthz` сверяет индекс с хранилищем, а не просто отвечает 200. Ключ идёт
+      # из окружения того же контейнера: ручка закрыта наравне с остальными — она
+      # отдаёт число листьев, — а healthcheck без ключа получал бы 401 и вечный
+      # `unhealthy` на живом сервисе.
       test: ["CMD", "python", "-c",
-             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8077/healthz', timeout=5).status==200 else 1)"]
+             "import os,urllib.request,sys; r=urllib.request.Request('http://localhost:8077/healthz', headers={'Authorization': 'Bearer ' + os.environ.get('LAKE_API_KEY', '')}); sys.exit(0 if urllib.request.urlopen(r, timeout=5).status==200 else 1)"]
       interval: 30s
       timeout: 10s
       start_period: 120s   # первый старт греет энкодер до открытия порта

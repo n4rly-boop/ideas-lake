@@ -3,7 +3,7 @@
     graph     /sources /ideas /theses          reads and the two legal writes
     search    /search                          the raw index, no ideas, no LLM
     retrieve  /retrieve                        the read path of §5.4
-    ingest    /ingest/*                        the write path, as background jobs
+    ingest    /fetch /ingest/*                 the write path, as background jobs
     ops       /healthz /stats /admin/reindex   is the lake alive and consistent
 
 Two rules run through all of them, both §5.4 in origin and both about not lying:
@@ -32,8 +32,9 @@ from fastapi.responses import JSONResponse
 from .. import graph_client, index, ops, vault
 from ..retrieve import api as retrieve_api
 from . import jobs
-from .schemas import (MAX_K, MAX_PAGE, EdgeOut, ErrorResponse, Health, IdeaOut, IdeaPatch,
-                      JobOut, Page, PendingLinkOut, Phase1Request, Phase2Request,
+from ..models import FETCH_DIR
+from .schemas import (MAX_K, MAX_PAGE, EdgeOut, ErrorResponse, FetchRequest, Health, IdeaOut,
+                      IdeaPatch, JobOut, Page, PendingLinkOut, Phase1Request, Phase2Request,
                       ReindexResult, RetrieveRequest, RetrieveResponse, SearchHit, SourceIn,
                       SourceOut, StagingOut, Stats, ThesisOut, VaultExportResult)
 
@@ -221,6 +222,38 @@ def _start(kind: str, fn, args: dict) -> dict:
         raise HTTPException(409, str(busy))
 
 
+# `/fetch`, not `/ingest/fetch`: its own router, because the `ingest` one carries a
+# prefix. Same tag — it is the same write path, with both phases in one call.
+fetch_router = APIRouter(tags=["ingest"])
+
+
+@fetch_router.post("/fetch", response_model=JobOut, status_code=202,
+                   responses={**_BAD, **_BUSY},
+                   summary="Одна статья с arXiv по ссылке: fetch → тезисы → идеи в графе")
+def fetch_article(body: FetchRequest):
+    """Both phases for one url, as a background job (202 + `JobOut`, poll /ingest/jobs).
+
+    The acceptance stop between the phases (§4.7) is what the corpus run is for; here
+    the caller named one article and wants it in the lake, so phase 2 follows phase 1
+    in the same job. Everything else is unchanged: the single slot, so this cannot race
+    an ingest (§4.5), the arbiter, `pending_link`, the re-derivation trigger.
+
+    The article gets its own staging file under `data/fetch/` rather than a line in the
+    corpus staging — see `run.ingest_one` for why sharing it would ingest other people's
+    sources. Re-posting the same url is idempotent: same `Source.id`, and link step [0]
+    skips leaves already stored (§4.8).
+    """
+    from ..ingest import run
+    arxiv_id = body.arxiv_id
+    # No sanitizing, because there is nothing to sanitize: `fetch._ARXIV_ID` admits
+    # digits, one dot and an optional `vN`, and nothing else reaches this line.
+    # Stripping separators here would read as a guard and hide that the door is one.
+    staging = FETCH_DIR / f"{arxiv_id}.jsonl"
+    return _start("fetch", lambda: run.ingest_one({"arxiv_id": arxiv_id, "type": "paper"},
+                                                  staging),
+                  {"url": body.url, "arxiv_id": arxiv_id})
+
+
 @ingest.post("/phase1", response_model=JobOut, status_code=202, responses={**_BUSY, 400:
              {"model": ErrorResponse, "description": "Nothing to ingest."}},
              summary="Фаза 1: fetch → parse → generalize → staging.jsonl (граф не трогается)")
@@ -332,4 +365,4 @@ def vault_export():
         return job["report"]
 
 
-ROUTERS = (retrieve, graph, search, ingest, ops_router)
+ROUTERS = (retrieve, graph, search, fetch_router, ingest, ops_router)

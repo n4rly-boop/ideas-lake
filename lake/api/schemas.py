@@ -11,7 +11,7 @@ column added to the store does not leak out of the API unannounced.
 """
 from typing import ClassVar, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from ..models import EMBED_DIM
 
@@ -294,6 +294,42 @@ class SourceEntry(BaseModel):
         return self
 
 
+class FetchRequest(BaseModel):
+    """One arXiv url, both phases, straight into the graph (§4.7 collapsed to one call).
+
+    The url is validated against `fetch.arxiv_id_from_url` here, at the door: the route
+    starts minutes of fetch and LLM spend, and a link to something that is not an arXiv
+    article must be a 400 now rather than a failed job later. `type` is not a field —
+    an arXiv article is a `paper`; a `run` is reported through POST /sources by block C.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(..., min_length=1, examples=["https://arxiv.org/abs/2406.04824"],
+                     description="Ссылка на статью arXiv: /abs/, /pdf/ или /html/, с "
+                                 "версией или без. Версия из ссылки уважается — "
+                                 "Source.id = sha1(url + version).")
+
+    # Parsed once, in the validator, and read back through `arxiv_id`. A property that
+    # re-parsed would put a second, unvalidated call to `arxiv_id_from_url` inside the
+    # route, where its `FetchError` is a 500 — the one status this request shape can
+    # never legitimately produce.
+    _arxiv_id: str = PrivateAttr(default="")
+
+    @property
+    def arxiv_id(self) -> str:
+        """The id `_check` already proved is there."""
+        return self._arxiv_id
+
+    @model_validator(mode="after")
+    def _check(self):
+        from ..ingest.fetch import FetchError, arxiv_id_from_url
+        try:
+            self._arxiv_id = arxiv_id_from_url(self.url)
+        except FetchError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
 class Phase1Request(BaseModel):
     """§4.7 phase 1: fetch -> parse -> generalize -> staging.jsonl. The graph is not
     opened at all, so this is the safe half to trigger over HTTP."""
@@ -322,7 +358,7 @@ class JobOut(BaseModel):
     # A missing one does not fail where it is used: the job is claimed and served, and
     # `/ingest/jobs` dies later on response validation — a 500 on the only operator view
     # of an ingest that is in fact healthy, for every record until the slot log evicts it.
-    kind: Literal["phase1", "phase2", "reindex", "vault-export"]
+    kind: Literal["fetch", "phase1", "phase2", "reindex", "vault-export"]
     status: Literal["running", "ok", "failed"]
     created_at: str
     finished_at: str | None = None

@@ -1,0 +1,156 @@
+# Собрать образ, прогнать на нём проверки, выложить в GHCR, обновить сервер.
+#
+# Сервер исходники не держит и ничего не собирает: приезжает готовый образ, а
+# логин в GHCR делается токеном самого прогона — он живёт минуты, поэтому на
+# машине не остаётся долгоживущего PAT.
+#
+# Секреты (Settings → Secrets → Actions):
+#   DEPLOY_HOST         82.202.156.206
+#   DEPLOY_USER         User10
+#   DEPLOY_SSH_KEY      приватный ключ пары, чей public лежит в authorized_keys
+#   DEPLOY_KNOWN_HOSTS  вывод `ssh-keyscan -H <host>` — чтобы не отключать
+#                       проверку хоста и не пускать MITM в деплой
+#
+# На сервере нужны только `docker-compose.yml` (его кладёт этот же workflow),
+# `.env.local` с ключами и каталог данных. `.env.local` в CI не приезжает
+# никогда: ключи школы и LAKE_API_KEY живут на машине.
+name: build & deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'lake/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# Два прогона подряд не должны обновлять сервер одновременно: у ингеста слот
+# один на процесс, и перезапуск посреди чужого up -d — это гонка на ровном месте.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ideas-lake
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE,,}" >> "$GITHUB_OUTPUT"   # GHCR требует нижний регистр
+
+      # --provenance=false: иначе buildx делает манифест-лист с attestation, а
+      # `docker push` такого листа падает на GHCR как `unknown blob` — блобы
+      # аттестации в локальном сторе не лежат. Нам нужен обычный однослойный
+      # образ: его же гоняют проверки ниже, его же тянет сервер.
+      - name: build
+        run: |
+          docker build --provenance=false \
+            -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" .
+
+      # Проверки гоняются В СОБРАННОМ ОБРАЗЕ, а не в отдельном окружении: иначе
+      # зелёный прогон говорит про питон раннера, а не про то, что поедет на
+      # сервер. Порядок — от дешёвого к дорогому.
+      #
+      # Ни одна из трёх не ходит в сеть и не требует ключей: 6.1 (канарейка LLM)
+      # пропускается сама, `--offline` это её единственный сетевой пункт.
+      - name: self-checks inside the image
+        run: |
+          img="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          for check in "lake.ingest.run selfcheck" "lake.api.selfcheck" "lake.selfcheck --offline"; do
+            echo "::group::$check"
+            docker run --rm "$img" python -m $check
+            echo "::endgroup::"
+          done
+
+      - name: push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          img="${{ steps.meta.outputs.image }}"
+          docker tag "$img:${{ steps.meta.outputs.tag }}" "$img:latest"
+          docker push "$img:${{ steps.meta.outputs.tag }}"
+          docker push "$img:latest"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Секреты только через env и никогда внутрь строки, которую разбирает
+      # удалённый shell: значение с кавычкой иначе выходит из своих кавычек и
+      # исполняется на сервере.
+      - name: ssh
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$HOSTS" > ~/.ssh/known_hosts
+
+      # Один файл, не исходники: всё остальное внутри образа.
+      - name: copy compose file
+        env:
+          TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+        run: scp docker-compose.yml "$TARGET:ideas-lake/docker-compose.yml"
+
+      - name: pull & up
+        env:
+          TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ needs.build.outputs.tag }}
+        # Логин отдельным вызовом: токен уезжает по stdin самого ssh, поэтому на
+        # сервере он не появляется ни в argv, ни в истории, ни в файле. Внутри
+        # heredoc это было бы невозможно — stdin там занят самим скриптом.
+        # Токен живёт минуты, долгоживущего PAT на машине не остаётся.
+        run: |
+          printf '%s' "$TOKEN" | ssh "$TARGET" docker login ghcr.io -u "$ACTOR" --password-stdin
+          ssh "$TARGET" bash -s -- "$TAG" <<'EOF'
+            set -euo pipefail
+            cd ~/ideas-lake
+            export LAKE_TAG="$1"
+            docker compose --env-file .env.local pull lake
+            docker compose --env-file .env.local up -d
+            docker logout ghcr.io
+          EOF
+
+      # Без этого шага прогон зеленеет над мёртвым сервисом: up -d возвращает 0,
+      # как только контейнер СОЗДАН, а не когда он отвечает. Здоровье считает сам
+      # healthcheck compose — он ходит в /healthz с ключом, то есть проверяет и
+      # авторизацию, и то, что индекс сходится с хранилищем.
+      - name: wait for healthy
+        env:
+          TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh "$TARGET" bash -s <<'EOF'
+            set -euo pipefail
+            for i in $(seq 1 40); do
+              status=$(docker inspect --format '{{.State.Health.Status}}' ideas-lake-lake-1 2>/dev/null || echo missing)
+              case "$status" in
+                healthy) echo "healthy after ${i}0s"; exit 0 ;;
+                unhealthy) echo "UNHEALTHY"; docker compose -f ~/ideas-lake/docker-compose.yml logs lake --tail 40; exit 1 ;;
+              esac
+              sleep 10
+            done
+            echo "still $status after 400s"
+            docker logs ideas-lake-lake-1 --tail 40
+            exit 1
+          EOF

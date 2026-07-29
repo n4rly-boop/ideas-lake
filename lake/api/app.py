@@ -28,6 +28,11 @@ half: they map `ops` refusals to statuses and nothing else.
    exception: frozen rows in the metrics log are contamination.
 3. **Validation answers 400**, not FastAPI's default 422 — C was integrated
    against 400 and the body stays `{"error": ...}` on every status.
+4. **Every route needs `Authorization: Bearer $LAKE_API_KEY`.** There is no other
+   authentication anywhere in block A, and every route either writes to the graph
+   or spends the school's GPUs, so the server refuses to START without a key
+   rather than serving an open one. `--no-auth` exists for a loopback-only port
+   and says so in the log. See `_require_key` and `OPEN_PATHS`.
 
 Routes are plain `def`, not `async def`: everything under them is blocking work
 (sqlite, numpy, LLM calls), so Starlette runs them in its threadpool and the
@@ -35,6 +40,8 @@ event loop stays free. `contextvars` are copied into that threadpool, which is
 what keeps `trace.request` per-request (see trace.py).
 """
 import argparse
+import hmac
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -55,6 +62,12 @@ from .routes import ROUTERS
 OPS_STATUS: tuple[tuple[type[ops.OpsError], int], ...] = (
     (ops.NotFound, 404), (ops.Conflict, 409), (ops.Broken, 503))
 
+# The only paths served without a key, and the list is deliberately three lines long:
+# the OpenAPI document is the integration contract, it holds no lake data, and C reads
+# it before it has anything to authenticate with. Everything else — including /healthz,
+# which counts the leaves, and including paths that do not exist — needs the key.
+OPEN_PATHS = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"})
+
 DESCRIPTION = """\
 Долговременная память между прогонами эволюции (проект 28, блок A).
 
@@ -72,6 +85,19 @@ DESCRIPTION = """\
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Refused at startup, not per request: every route of this app writes to the graph
+    # or spends the school's GPUs, and a server that came up without a key would be an
+    # open one. The check lives here rather than in `create_app` so that importing the
+    # module — which every self-check does — never needs a secret.
+    if app.state.api_key is not False and not app.state.api_key:
+        raise RuntimeError(
+            "LAKE_API_KEY is empty: this API has no other authentication and every "
+            "route either writes to the lake or spends LLM budget. Set the variable, "
+            "or start with --no-auth if the port is bound to the loopback only "
+            "(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')")
+    if app.state.api_key is False:
+        print("lake.api: WARNING — started with --no-auth, every route is open to "
+              "anyone who can reach the port")
     # §8: the budget is p95 <= 5 s and the first embedding call loads the model
     # (seconds, once per process). Pay it before the port accepts anything, so no
     # request does. No try/except: a server that cannot embed cannot answer, and
@@ -82,7 +108,10 @@ async def lifespan(app: FastAPI):
     yield
 
 
-def create_app(mock: bool = False, warmup: bool = True) -> FastAPI:
+def create_app(mock: bool = False, warmup: bool = True, api_key=None) -> FastAPI:
+    """`api_key`: `None` reads `LAKE_API_KEY` from the environment (the normal path),
+    a string is the key itself, and `False` turns the check off — which is a choice
+    somebody has to type, on the command line as `--no-auth` or here in a check."""
     app = FastAPI(
         title="Ideas Lake — block A",
         version="0.2.0",
@@ -92,8 +121,38 @@ def create_app(mock: bool = False, warmup: bool = True) -> FastAPI:
     )
     app.state.mock = mock
     app.state.warmup = warmup
+    # Read here, not per request: a key that changes under a running server would make
+    # "it works on my machine" depend on when the request landed.
+    app.state.api_key = os.environ.get("LAKE_API_KEY", "") if api_key is None else api_key
     for router in ROUTERS:
         app.include_router(router)
+
+    @app.middleware("http")
+    async def _require_key(request: Request, call_next):
+        """`Authorization: Bearer <LAKE_API_KEY>` on everything but `OPEN_PATHS`.
+
+        Middleware, not a dependency per route: a dependency is something a new route
+        can be written without, and this app's routes ingest papers and rewrite ideas.
+        It also runs BEFORE routing, so an unknown path answers 401 rather than 404 —
+        the key is needed even to learn which paths exist.
+        """
+        expected = request.app.state.api_key
+        if expected is False or request.url.path in OPEN_PATHS:
+            return await call_next(request)
+        if not expected:
+            # Unreachable once `lifespan` has run, and 503 rather than "let it through"
+            # if it ever is: a server with no key configured is broken, not open.
+            return JSONResponse(status_code=503,
+                                content={"error": "server started without LAKE_API_KEY"})
+        scheme, _, token = request.headers.get("authorization", "").partition(" ")
+        # compare_digest, not `==`: the comparison is over a secret and against
+        # whatever the caller sent. Both sides encoded, so a non-ASCII header cannot
+        # raise TypeError out of the middleware and become a 500.
+        if scheme.lower() != "bearer" or not hmac.compare_digest(
+                token.encode("utf-8"), expected.encode("utf-8")):
+            return JSONResponse(status_code=401, content={"error": "missing or wrong API key"},
+                                headers={"WWW-Authenticate": "Bearer"})
+        return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -165,10 +224,13 @@ def create_app(mock: bool = False, warmup: bool = True) -> FastAPI:
 
 
 def _drop_422(app: FastAPI) -> None:
-    """Remove FastAPI's automatic 422 from the schema: this app never returns one.
+    """Fix the schema to what the server actually answers: no 422, and a 401 on every
+    operation when the key is on.
 
-    The OpenAPI document is what C integrates against, and a documented status the
-    server cannot produce sends the other side writing a branch that never runs.
+    The OpenAPI document is what C integrates against. A documented status the server
+    cannot produce sends the other side writing a branch that never runs; an
+    undocumented one it DOES produce — 401 on every call until the header is right —
+    sends it into a branch it never wrote.
     """
     def openapi():
         if app.openapi_schema:
@@ -177,9 +239,21 @@ def _drop_422(app: FastAPI) -> None:
                              description=app.description, routes=app.routes)
         for path in schema.get("paths", {}).values():
             for operation in path.values():
+                if not isinstance(operation, dict):
+                    continue
                 operation.get("responses", {}).pop("422", None)
+                if app.state.api_key is not False:
+                    operation.setdefault("responses", {})["401"] = {
+                        "description": "Нет заголовка `Authorization: Bearer "
+                                       "<LAKE_API_KEY>` или ключ не тот.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/ErrorResponse"}}}}
         for name in ("HTTPValidationError", "ValidationError"):
             schema.get("components", {}).get("schemas", {}).pop(name, None)
+        if app.state.api_key is not False:
+            schema.setdefault("components", {}).setdefault("securitySchemes", {})[
+                "bearerAuth"] = {"type": "http", "scheme": "bearer"}
+            schema["security"] = [{"bearerAuth": []}]
         app.openapi_schema = schema
         return schema
 
@@ -195,6 +269,10 @@ def main(argv=None) -> None:
     parser.add_argument("--host", default="0.0.0.0",
                         help="C calls the endpoint from another machine (default: all "
                              "interfaces); 127.0.0.1 to keep it local")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="serve without the LAKE_API_KEY check. Only for a port bound "
+                             "to 127.0.0.1: every route writes to the lake or spends LLM "
+                             "budget, and there is no other authentication")
     parser.add_argument("--mock", action="store_true",
                         help="/retrieve serves the frozen MOCK_RESPONSE and touches neither "
                              "graph nor LLM; the other routes are unaffected")
@@ -208,7 +286,8 @@ def main(argv=None) -> None:
         return
 
     import uvicorn
-    uvicorn.run(create_app(mock=args.mock), host=args.host, port=args.port, log_level="info")
+    uvicorn.run(create_app(mock=args.mock, api_key=False if args.no_auth else None),
+                host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

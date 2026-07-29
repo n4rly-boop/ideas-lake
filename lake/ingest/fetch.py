@@ -44,6 +44,19 @@ CHUNK_TOKENS = 1500      # §4.2 / 08:122, PDF fallback when there are no headin
 CHUNK_OVERLAP = 100
 
 NS = {"a": "http://www.w3.org/2005/Atom"}
+# New-style arXiv ids only: `2406.04824`, optionally `v2`. Old-style ones
+# (`hep-th/9901001`) are refused at the door BY DESIGN — `fetch_metadata` keeps only
+# the last path segment of the API's id (`_VERSION` below, `9901001v3`), and all three
+# paths of `fetch_sections` answer 404 for that, so accepting them would buy a job that
+# dies after three network round trips with a message about the missing PDF library.
+# Narrow on purpose in the other direction too: the id becomes a cache key and a
+# staging file name, and `\d{4}\.\d{4,5}(v\d+)?` is safe as both with nothing to strip.
+_ARXIV_ID = r"\d{4}\.\d{4,5}(?:v\d+)?"
+_ARXIV_URL = re.compile(
+    rf"^(?:https?://)?(?:www\.|export\.)?arxiv\.org/(?:abs|pdf|html)/({_ARXIV_ID})"
+    r"(?:\.pdf)?/?$", re.I)
+_OLD_STYLE = re.compile(r"^(?:https?://)?(?:www\.|export\.)?arxiv\.org/(?:abs|pdf|html)/"
+                        r"[a-z-]+(?:\.[a-z-]+)?/\d{7}", re.I)
 # Identify the client: arXiv's ToU asks for it, and readthedocs answers 403 to the
 # default urllib UA — a 403 on three of the six doc rows and nothing to show for it.
 USER_AGENT = "ideas-lake/0.1 (AIRI Summer 2026 corpus fetch; +https://arxiv.org/help/api)"
@@ -213,6 +226,32 @@ def fetch_metadata(arxiv_id: str) -> dict:
             "title": re.sub(r"\s+", " ", field("title")),
             "updated": field("updated"),
             "summary": re.sub(r"\s+", " ", field("summary"))}
+
+
+def arxiv_id_from_url(url: str) -> str:
+    """`https://arxiv.org/abs/2406.04824v2` -> `2406.04824v2`. Raises on anything else.
+
+    `/abs/`, `/pdf/` and `/html/` are the same article, so all three are accepted, and
+    the version stays on the id: it is the version the arXiv API is asked for, and
+    `Source.id = sha1(url + version)` (§4.8) has to follow the paper the link points at.
+    Lower-cased, so that `...v2` and `...V2` are one cache key and one staging file
+    rather than two fetches of one article.
+
+    Refusing here is the point: this is the door in front of the fetch and minutes of
+    LLM spend. An unknown url would otherwise be found out by `fetch_metadata` as an
+    empty API answer, one job later, and an old-style id not even then — it dies three
+    round trips deep with a message about a missing PDF library (see `_ARXIV_ID`).
+    """
+    url = url.strip()
+    match = _ARXIV_URL.match(url)
+    if not match:
+        old = _OLD_STYLE.match(url)
+        raise FetchError(
+            f"{url!r} is not an arXiv article url this can fetch: expected "
+            "https://arxiv.org/abs/2406.04824 (also /pdf/ or /html/, with or without a "
+            "version)" + (". Old-style ids (hep-th/9901001) are not supported: the "
+                          "fetch paths answer 404 for them" if old else ""))
+    return match.group(1).lower()
 
 
 def _blocks(html: str, tag: str, marker: re.Pattern):
@@ -453,6 +492,40 @@ if __name__ == "__main__":
              Section(id="S4", kind="section", title="Discussion and Limitations", text="L")]
     assert find_limitations(fakes) == "L" and find_abstract(fakes) == "A"
     assert find_limitations(fakes[:1]) == ""
+
+    # /fetch hands whatever the caller pasted to this one regex, and the id it returns
+    # becomes a cache key and a staging file name.
+    for url, want in (("https://arxiv.org/abs/2406.04824", "2406.04824"),
+                      ("http://arxiv.org/abs/2406.04824v2", "2406.04824v2"),
+                      ("https://www.arxiv.org/pdf/2406.04824v2.pdf", "2406.04824v2"),
+                      ("https://arxiv.org/html/2406.04824v1", "2406.04824v1"),
+                      ("https://export.arxiv.org/abs/2406.04824/", "2406.04824"),
+                      ("https://arxiv.org/abs/2406.04824V2", "2406.04824v2"),
+                      ("  https://arxiv.org/abs/1706.03762  ", "1706.03762")):
+        assert arxiv_id_from_url(url) == want, (url, arxiv_id_from_url(url))
+    # An id this returns is a `data/raw` cache key and a `data/fetch` file name with no
+    # sanitizing anywhere after it, so the refusals are load-bearing, not tidiness.
+    for bad_url in ("https://arxiv.org/abs/", "https://arxiv.org/list/cs.LG/2406",
+                    "https://example.com/abs/2406.04824", "https://arxiv.org.evil.com/abs/1",
+                    "https://arxiv.org/abs/../../etc/passwd", "2406.04824", "",
+                    "https://arxiv.org/abs/2406.04824?x=1", "https://arxiv.org/abs/x#s1",
+                    "https://openreview.net/forum?id=x"):
+        try:
+            arxiv_id_from_url(bad_url)
+        except FetchError as exc:
+            assert "not an arXiv article url" in str(exc), exc
+        else:
+            raise AssertionError(f"{bad_url!r} must be refused, not fetched")
+    # Old-style ids pass the regex of an arXiv link and nothing after it: the refusal
+    # has to say so, or the operator retries a url that cannot work.
+    for old in ("arxiv.org/abs/hep-th/9901001",
+                "https://arxiv.org/abs/cond-mat.stat-mech/0012345v3"):
+        try:
+            arxiv_id_from_url(old)
+        except FetchError as exc:
+            assert "Old-style ids" in str(exc), exc
+        else:
+            raise AssertionError(f"{old!r} cannot be fetched and must be refused at the door")
 
     for bad, needle in (({"type": "paper", "skip": "no arXiv id"}, "marks it skip"),
                         ({"type": "paper"}, "neither arxiv_id nor url"),

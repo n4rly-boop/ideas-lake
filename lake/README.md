@@ -22,11 +22,25 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 | `python3 -m lake.ingest.run phase1 [--limit N] [--sources path]` | fetch → parse → generalize → `data/staging.jsonl`. 8 потоков. **В граф не пишет ничего** |
 | `python3 -m lake.ingest.run phase2 [--limit N]` | staging → линковка → граф + индекс → пере-вывод. Последовательно, курсор |
 | `python3 -m lake.ingest.run selfcheck` | офлайн end-to-end на фикстурах, временные БД |
-| `python3 -m lake.api.app [--port 8077] [--host H] [--mock]` | FastAPI-сервер под uvicorn: граф, поиск, ингест, retrieve |
+| `python3 -m lake.api.app [--port 8077] [--host H] [--mock] [--no-auth]` | FastAPI-сервер под uvicorn: граф, поиск, ингест, retrieve. Нужен `LAKE_API_KEY`, иначе не поднимется |
 | `uvicorn lake.api.app:app --port 8077` | то же штатным способом |
 | `python3 -m lake.api.selfcheck` | офлайн-проверка HTTP-слоя (она же `--selfcheck`) |
 | `python3 -m lake.selfcheck [--offline]` | 23 проверки §6. `--offline` пропускает канарейку (единственный сетевой пункт) |
 | `python3 tools/gen_sources.py` | `09-raw/a11-sources.yaml` → `lake/sources.yaml` (84 записи) |
+| `docker compose --env-file .env.local up -d` | локально: соберёт образ сам. На сервере образ приезжает из GHCR, см. ниже |
+
+**CI/CD** — `.github/workflows/deploy.yml`, срабатывает на push в `main`, если тронуты
+`lake/**`, `Dockerfile`, `docker-compose.yml` или сам workflow. Порядок: собрать образ →
+**прогнать три офлайн-проверки внутри собранного образа** (не в окружении раннера: иначе
+зелёный прогон говорит про питон раннера, а не про то, что поедет) → выложить в
+`ghcr.io/n4rly-boop/ideas-lake` тегами `latest` и коротким sha → по ssh обновить сервер →
+**дождаться `healthy`**, иначе прогон красный. Без последнего шага CI зеленел бы над
+мёртвым сервисом: `up -d` возвращает 0, как только контейнер создан, а не когда отвечает.
+
+Сервер исходников не держит и не собирает: приезжает готовый образ плюс один
+`docker-compose.yml`. Логин в GHCR делается токеном самого прогона и живёт минуты —
+долгоживущего PAT на машине нет. `.env.local` в CI не приезжает никогда.
+Откат — `LAKE_TAG=<старый sha> docker compose --env-file .env.local up -d`, без пересборки.
 
 Каждый модуль дополнительно исполняем: `python3 -m lake.index`, `python3 -m lake.embed`,
 `python3 -m lake.ingest.link` и т.д. — свой `__main__` self-check без сети.
@@ -57,7 +71,7 @@ lake/
   retrieve/ rewrite search rank api        # api.py — ядро чтения, без транспорта
   api/     app routes schemas jobs selfcheck   # HTTP-слой на всё, единственный сервер
   prompts/{parse,generalize,link,rederive,rewrite}/system.txt
-  data/             # gitignored: raw/ cache/ traces/ logs/ staging.jsonl index.db lake.db
+  data/             # gitignored: raw/ cache/ traces/ logs/ fetch/ staging.jsonl index.db lake.db
 ```
 
 ---
@@ -91,12 +105,35 @@ lake/
     → курсор
 ```
 
+**`POST /fetch` — те же две фазы для одной ссылки, в одном задании.** Приёмка глазами —
+свойство корпусного прогона, а не пути записи: кто прислал ссылку, тот ждёт статью в графе.
+Статья получает собственный `data/fetch/{id}.jsonl` и собственный курсор — на общем файле
+фаза 1 сбросила бы корпусный курсор, и следом идущая фаза 2 залила бы в граф все источники,
+которые ещё ждут приёмки. Слот, арбитр, `pending_link` и триггер пере-вывода — те же.
+Повторный `POST` той же ссылки идемпотентен: тот же `Source.id`, шаг [0] пропускает
+записанные листья.
+
+**Три способа кончить неизменившимся озером — все три `status: failed` с причиной, не `ok`:**
+мёртвая ссылка; статья, из которой парсер не достал ни тезиса; арбитр линковки, отказавший
+на **всех** тезисах (тогда каждый лежит в `pending_link`, в графе нет ничего). Третий отличим
+от легального повтора только потому, что отчёт фазы 2 считает отказы арбитра отдельно от
+дублей — `theses_refused` против `theses_skipped`; одним счётчиком эти два случая
+неразличимы побайтно. Канарейки **обеих** моделей — до фетча, чтобы мёртвый 35B не стоил
+полного разбора статьи.
+
+Свой `data/fetch/{id}.jsonl` удаляется после успешного залива: в каталоге остаются ровно те
+статьи, которые не доехали, — ни `/ingest/staging`, ни `/stats` их не показывают, они читают
+только корпусный файл.
+
 Порога косинуса на линковке **нет** — решает всегда арбитр, «дубля нет» говорит сентинелом `-1` (§0.6).
 Батч-оверлей — условие корректности, а не оптимизация: без него тезис №2 не видит идею,
 созданную тезисом №1, и одна статья заводит два дубля под один механизм (§0.1.13, `link.py`).
 
 Отчёт фазы 2: источники, тезисы, идеи, доля идей с ≥2 источниками, длина `pending_link`,
 доля утечек, **число идей без листьев (обязано быть 0)**, токены и время из трейсов.
+Пропуски разведены на два числа: `theses_skipped` — дубль, лист уже в озере;
+`theses_refused` — арбитр отказал, лист нигде и ждёт в `pending_link`. Это противоположные
+исходы, и одним счётчиком они читаются одинаково.
 
 ---
 
@@ -132,6 +169,15 @@ POST /retrieve
 
 `GET /docs` — Swagger, `GET /openapi.json` — машинная схема (422 из неё убран: мы его не отдаём).
 
+**Ключ обязателен на всех ручках:** `Authorization: Bearer $LAKE_API_KEY`, иначе `401`
+(`{"error": ...}` + `WWW-Authenticate: Bearer`). Проверка — middleware в `app.py`, а не
+зависимость на маршруте: маршрут можно написать без зависимости, а эти маршруты пишут в
+граф и тратят GPU школы. Она стоит **до** роутинга, поэтому несуществующий путь тоже `401`:
+чтобы узнать, какие пути есть, ключ уже нужен. Без ключа в окружении сервер **не стартует** —
+пустая строка это отказ на старте, а не «аутентификация выключена»; выключается явно,
+флагом `--no-auth`, и он пишет об этом в лог. Открыты `/openapi.json` и `/docs` — контракт
+интеграции, данных озера в нём нет.
+
 | | |
 |---|---|
 | `POST /retrieve` | контракт C3: запрос → идеи с провенансом (ниже) |
@@ -142,6 +188,7 @@ POST /retrieve
 | `PATCH /ideas/{id}` | правка полей. Меняешь `text` — сервер пересчитывает вектор (§1.3), порознь нельзя |
 | `GET /ideas/{id}/theses`, `/neighbors` | листья и рёбра. Рёбра пусты: это блок B |
 | `GET /theses?idea_id&source_id`, `GET /theses/{id}` | листья постранично |
+| `POST /fetch` | одна статья arXiv по ссылке: обе фазы в одном задании, `202` + задание. В теле только `url` (`/abs/`, `/pdf/`, `/html/`, версия уважается). Не-arXiv ссылка → `400` на входе, до фетча и трат на LLM; **старый формат id** (`hep-th/9901001`) тоже `400` и с указанием причины: `fetch_metadata` теряет класс архива, и все три пути фетча отвечают 404. Свой `data/fetch/{id}.jsonl`: корпусный файл приёмки не трогается |
 | `POST /ingest/phase1`, `POST /ingest/phase2` | `202` + задание; слот один на процесс, второй запуск → `409` |
 | `GET /ingest/jobs`, `/jobs/{id}` | статус задания: `running` \| `ok` + отчёт \| `failed` + текст ошибки |
 | `GET /ingest/staging` | что лежит между фазами: строк, курсор, разбивка по источникам |
@@ -234,6 +281,7 @@ counts() -> {source, idea, thesis, edge}   # постраничное чтени
 
 # write path
 ingest.fetch.fetch_source(entry) -> (Source, list[Section])
+ingest.fetch.arxiv_id_from_url(url) -> str             # ссылка arXiv → id, иначе FetchError
 ingest.parse.parse_section(section, abstract, limitations) -> list[DraftThesis]
 ingest.parse.parse_document(sections, abstract, limitations) -> (list[DraftThesis], report)
 ingest.generalize.generalize(draft) -> IdeaFields
@@ -244,6 +292,7 @@ ingest.rederive.derive(idea, leaves) -> dict          # шесть полей §
 ingest.split.due(max_leaves=16) -> list[str] ; ingest.split.split_idea(idea_id) -> dict
 ingest.split.leaf_counts() -> dict[idea_id, int]      # распределение листьев, максимум в отчёт
 ingest.run.phase1(entries, workers=8) -> int ; ingest.run.phase2(staging_path, limit=None) -> dict
+ingest.run.ingest_one(entry, staging_path) -> dict     # /fetch: обе фазы, один источник, свой staging
 
 # read path
 retrieve.rewrite.rewrite(query, budget=None) -> (query, failed)

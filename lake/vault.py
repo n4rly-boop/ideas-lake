@@ -887,7 +887,12 @@ def demo() -> None:
         # `not leaked` true for the wrong reason — and noticing that afterwards
         # means noticing it with the fixture already written into data/lake.db.
         assert stub_store._db_path.is_relative_to(tmp), stub_store._db_path
-        assert not DATA.exists() or before, "the leak guard measured nothing"
+        # "There are files under data/ and the fingerprint saw none" — that is a
+        # fingerprint pointed at the wrong path. An EMPTY data/ measuring `{}` is not
+        # the same thing and must pass: the image declares `VOLUME /app/lake/data`, so
+        # in a fresh container the directory exists and is empty, and the earlier
+        # `not DATA.exists() or before` failed there — on every clean checkout too.
+        assert not any(DATA.rglob("*")) or before, "the leak guard measured nothing"
         _demo_body(tmp)
     finally:
         if stub_store._conn is not None:
