@@ -51,8 +51,14 @@ jobs:
           echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE,,}" >> "$GITHUB_OUTPUT"   # GHCR требует нижний регистр
 
+      # --provenance=false: иначе buildx делает манифест-лист с attestation, а
+      # `docker push` такого листа падает на GHCR как `unknown blob` — блобы
+      # аттестации в локальном сторе не лежат. Нам нужен обычный однослойный
+      # образ: его же гоняют проверки ниже, его же тянет сервер.
       - name: build
-        run: docker build -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" .
+        run: |
+          docker build --provenance=false \
+            -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" .
 
       # Проверки гоняются В СОБРАННОМ ОБРАЗЕ, а не в отдельном окружении: иначе
       # зелёный прогон говорит про питон раннера, а не про то, что поедет на
