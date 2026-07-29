@@ -75,6 +75,12 @@ def _encode(name: str, value):
 
 
 def _insert(conn: sqlite3.Connection, table: str, obj, replace: bool = False, **override) -> None:
+    if replace and table == "thesis":
+        # §1.2: `INSERT OR REPLACE` rewrites every column of an existing row, so it is a
+        # thesis edit that carries no `UPDATE` for §6.9's source scan to find. Refused
+        # here, where every writer passes, rather than left to a check that cannot see it.
+        raise ValueError("thesis rows are immutable (§1.2): INSERT OR REPLACE is not a "
+                         "way around the absent update_thesis")
     row = {_column(name): _encode(name, override.get(name, getattr(obj, name)))
            for name in type(obj).model_fields}
     verb = "INSERT OR REPLACE" if replace else "INSERT"
@@ -151,6 +157,15 @@ def create_idea_with_theses(idea: Idea | None, source_id: str, theses: list[Thes
 
 # No `update_thesis`, here or anywhere: thesis immutability (§1.2) is held by the
 # absence of the method (§3.4). Do not add one.
+#
+# `split_idea` below is not one, and the difference is worth being precise about,
+# because "it also writes a thesis row" is true of both. §1.2 immutability is about
+# what the SOURCE said: text, context, effect, locator, text_hash, source_id. None of
+# those is touched here and the self-check proves it column by column. `idea_id` is
+# not something a source said — it is the arbiter's decision from phase 2 (§4.5), and
+# the idea on the other end of it is already rewritten in place by every re-derivation
+# (§4.6). A link the arbiter got wrong has to be repairable by something, or the only
+# repair left is dropping the leaf, which loses what the source actually said.
 
 
 _IDEA_FIELDS = set(Idea.model_fields) - {"id"}
@@ -163,7 +178,9 @@ _NULLABLE_IDEA_FIELDS = {name for name, field in Idea.model_fields.items()
                          if type(None) in get_args(field.annotation)}
 
 
-def update_idea(idea_id: str, fields: dict) -> None:
+def _update_idea(conn: sqlite3.Connection, idea_id: str, fields: dict) -> None:
+    """The validated UPDATE, on a caller-owned transaction. `split_idea` needs the
+    same guards inside a transaction it did not open."""
     if not fields:
         raise ValueError("update_idea called with no fields")
     unknown = set(fields) - _IDEA_FIELDS
@@ -176,10 +193,63 @@ def update_idea(idea_id: str, fields: dict) -> None:
     cols = [_column(k) for k in fields]
     values = [_encode(k, v) for k, v in fields.items()]
     sql = f"UPDATE idea SET {', '.join(c + '=?' for c in cols)} WHERE id=?"
-    with _lock, _c() as conn:
-        cur = conn.execute(sql, values + [idea_id])
+    cur = conn.execute(sql, values + [idea_id])
     if cur.rowcount != 1:
         raise KeyError(f"idea {idea_id} not found")
+
+
+def update_idea(idea_id: str, fields: dict) -> None:
+    with _lock, _c() as conn:
+        _update_idea(conn, idea_id, fields)
+
+
+def split_idea(parent_id: str, parent_fields: dict,
+               children: list[tuple[Idea, list[str]]]) -> None:
+    """Re-home part of an idea's leaves onto new ideas, in ONE transaction (§3.4).
+
+    `parent_id` keeps its id and its remaining leaves — edges and their accumulated
+    weights hang off it (`08:200`) — and takes `parent_fields`, which is what §4.6
+    derived over the leaves it is left with. Each `(idea, thesis_ids)` child is
+    inserted and takes exactly those leaves.
+
+    Refuses, before writing anything: a child with no leaves, a leaf that does not
+    currently belong to `parent_id` (a split may not take another idea's leaves), a
+    leaf named twice, and a split that would leave the parent with none — the whole
+    move happens or none of it does, and `IDEA ||--|{ THESIS` (`06:85`) holds at both
+    ends. See the note above `_update_idea` on why this is not `update_thesis`.
+    """
+    if not children:
+        raise ValueError("split_idea called with no children")
+    moving: list[str] = []
+    for idea, thesis_ids in children:
+        if not thesis_ids:
+            raise ValueError(f"split_idea: child {idea.id} would have no leaves")
+        moving += thesis_ids
+    if len(set(moving)) != len(moving):
+        raise ValueError("split_idea: the same leaf was given to two children")
+
+    with _lock, _c() as conn:
+        # Same JOIN as every other path that says "leaf": `ideas_without_leaves`,
+        # `counts` and `all_theses` all mean "a thesis whose source row exists", and the
+        # "parent must keep one" guard below has to mean the same thing they do, or a
+        # parent left holding only source-less rows passes here and is reported empty
+        # by the invariant check.
+        owned = {r["id"] for r in conn.execute(
+            "SELECT t.id FROM thesis t JOIN source s ON s.id = t.source_id"
+            " WHERE t.idea_id=?", (parent_id,)).fetchall()}
+        stolen = sorted(set(moving) - owned)
+        if stolen:
+            raise ValueError(f"split_idea: leaves {stolen} are not leaves of {parent_id}")
+        if not owned - set(moving):
+            raise ValueError(f"split_idea: would move every leaf off {parent_id}, "
+                             "leaving an idea with none")
+        if parent_fields:
+            _update_idea(conn, parent_id, parent_fields)
+        for idea, thesis_ids in children:
+            _insert(conn, "idea", idea)
+            conn.execute(
+                f"UPDATE thesis SET idea_id=? WHERE id IN ({_placeholders(thesis_ids)})",
+                [idea.id] + thesis_ids)
 
 
 # -------------------------------------------------------------------------- reads
@@ -503,6 +573,22 @@ if __name__ == "__main__":
         else:
             raise AssertionError("thesis written under a source_id it does not belong to")
         print("ok: create_idea + write_theses; a thesis from another source is refused")
+
+        # §1.2 the other way round: INSERT OR REPLACE rewrites every column of an
+        # existing row, so it is a thesis edit that carries no UPDATE for §6.9's source
+        # scan to find. Refused in `_insert`, where every writer passes.
+        with _lock, _c() as conn:
+            try:
+                _insert(conn, "thesis", t5, replace=True)
+            except ValueError as exc:
+                assert "immutable" in str(exc), exc
+            else:
+                raise AssertionError("INSERT OR REPLACE rewrote a thesis row")
+            _insert(conn, "source", Source(id=sid, url="u", title="A Paper", type="paper",
+                                           version="v1", retrieved_at="2026-07-28T10:00:00Z"),
+                    replace=True)        # still allowed where it is the documented upsert
+        assert get_leaves(idea3.id)[0]["text"] == "fifth leaf"
+        print("ok: INSERT OR REPLACE refused on thesis, still allowed on source")
 
     # §6.9: the name must be absent from the module, not merely unused. Parsed, not
     # grepped, so the comment explaining its absence does not trip the check.

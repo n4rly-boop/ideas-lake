@@ -121,8 +121,10 @@ def fts_candidates(text: str, vector, overlay, k: int = 30, db=INDEX_DB) -> list
     overlay's cosine (~0.9) outrank every stored candidate (~0.02) and a 30-thesis
     article would stop linking to the lake after its first few theses.
 
-    Inside one arm, several leaves of one idea collapse to that idea's BEST rank —
-    max, not sum (§4.5): leaf count must buy a place in the draw, not score.
+    Inside one arm, several leaves of one idea collapse to one entry (§4.5) — and the
+    rank of that entry is normalized by how many of the arm's hits the idea took, see
+    `_first_per_idea`: leaf count must buy a place in the draw, not a place at the top
+    of it.
     """
     store = index.search_theses(text, k, query_vec=vector, db=db)
     ranked_store = _first_per_idea((h["idea_id"], h["thesis_id"]) for h in store)
@@ -227,11 +229,29 @@ def _prompt(row: dict, described: list[tuple[str, str]]) -> str:
 # ----------------------------------------------------------------------- helpers
 
 def _first_per_idea(pairs) -> list[tuple[str, str]]:
-    """(idea_id, thesis_id) best-first -> one entry per idea, keeping its best rank."""
-    out: dict[str, str] = {}
-    for idea_id, thesis_id in pairs:
-        out.setdefault(idea_id, thesis_id)
-    return list(out.items())
+    """(idea_id, thesis_id) best-first -> one entry per idea, ranked by best rank TIMES
+    the number of hits the idea took in this arm.
+
+    The plain "keep the best rank" version is what let one idea eat a third of the lake
+    (issue #2): an idea with 92 leaves gets 92 draws inside a 30-hit window and an idea
+    with one leaf gets one, so the big idea reached rank 1 on almost every thesis and the
+    arbiter saw it almost every time. Best-of-n is not a similarity, it is a headcount.
+
+    The correction is the rank the volume alone would have bought: an idea holding `n` of
+    the window's slots lands at rank ~window/n by draw count, so multiplying its best rank
+    by `n` prices that back out. `n` is counted in the returned window, not over the store,
+    which is what makes it self-correcting — a big idea that is genuinely close still takes
+    many slots and pays for them, and one that took a single slot on this query pays
+    nothing. Ties keep their original order (the sort is stable).
+    """
+    best: dict[str, str] = {}
+    rank: dict[str, int] = {}
+    hits: dict[str, int] = {}
+    for position, (idea_id, thesis_id) in enumerate(pairs, start=1):
+        hits[idea_id] = hits.get(idea_id, 0) + 1
+        if idea_id not in best:
+            best[idea_id], rank[idea_id] = thesis_id, position
+    return sorted(best.items(), key=lambda kv: rank[kv[0]] * hits[kv[0]])
 
 
 def _overlay_hits(vector, overlay: list[dict], k: int) -> list[tuple[str, str]]:
@@ -298,9 +318,9 @@ if __name__ == "__main__":
     sys.modules["lake.embed"] = _fake_embed
 
     from .. import stub_store
-    from ..models import TRACES_DIR, Source, source_id as make_source_id
+    from ..models import Source, source_id as make_source_id
 
-    trace.set_run_id("selfcheck-link")      # own trace file, removed at the end
+    trace.set_run_id("selfcheck-link")
 
     answers: list = []          # scripted arbiter replies, consumed in order
     prompts: list[str] = []
@@ -347,8 +367,26 @@ if __name__ == "__main__":
                                 "failure_modes": ["encoder too weak -> semantics lost"]},
                 "vector": vec.tolist()}
 
+    # (g) issue #2: leaf count buys a place in the draw, not the top of it. `big` owns
+    # four of the five hits and the best rank; `small` owns one hit at rank 2. Before
+    # the normalization `big` came first on every thesis in the corpus and the arbiter
+    # linked to it, which is how one idea reached 92 leaves and 34% of the lake.
+    window = [("big", "tb1"), ("small", "ts1"), ("big", "tb2"), ("big", "tb3"), ("big", "tb4")]
+    assert _first_per_idea(window) == [("small", "ts1"), ("big", "tb1")], _first_per_idea(window)
+    # Same window without the volume: order follows rank, and the shown thesis is the
+    # idea's best one, not its last.
+    assert _first_per_idea(window[:2]) == [("big", "tb1"), ("small", "ts1")]
+    # Equal adjusted rank keeps the better raw rank in front (the sort is stable).
+    assert _first_per_idea([("a", "t1"), ("b", "t2"), ("a", "t3")]) == [("a", "t1"), ("b", "t2")]
+    print("ok (g) issue #2: 4 hits of one idea do not outrank a single closer hit")
+
     with tempfile.TemporaryDirectory() as tmp:
         stub_store._db_path = Path(tmp) / "lake.db"          # temp store, never data/lake.db
+        # Every graph call is @trace'd into TRACES_DIR/<run_id>.jsonl. Deleting that
+        # file afterwards was not enough: it still CREATED data/traces/, and an
+        # otherwise-absent data/ that exists but holds no file is what makes
+        # `vault.demo`'s leak guard refuse to run ("the leak guard measured nothing").
+        trace.TRACES_DIR = Path(tmp) / "traces"
         DB = Path(tmp) / "index.db"
         PENDING = Path(tmp) / "pending_link.jsonl"
 
@@ -460,5 +498,4 @@ if __name__ == "__main__":
 
         index._CONNS.pop(str(DB)).close()
 
-    (TRACES_DIR / "selfcheck-link.jsonl").unlink(missing_ok=True)
     print("link self-check OK")

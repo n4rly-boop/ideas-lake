@@ -41,6 +41,19 @@ def maybe_rederive(idea_id: str) -> bool:
     if len(leaves) - idea["rederived_at_leaf_count"] < REDERIVE_EVERY:
         return False
 
+    graph_client.update_idea(idea_id, derive(idea, leaves))
+    return True
+
+
+def derive(idea: dict, leaves: list[dict]) -> dict:
+    """The six fields of §4.6 restated over `leaves`, plus `vector` when `text` moved
+    and `rederived_at_leaf_count`. Ready for `update_idea`, written by nobody here.
+
+    Separate from `maybe_rederive` because `split` has to derive its parts BEFORE it
+    moves a single leaf: an LLM failure halfway through a split would otherwise leave
+    the children carrying a copy of the over-broad parent text — the very defect the
+    split exists to remove, now spread over more ideas than before.
+    """
     out = llm.complete(_render(idea, leaves), system=llm.load_prompt("rederive"),
                        schema=REDERIVE_SCHEMA, op="rederive",
                        max_tokens=MAX_TOKENS, timeout=TIMEOUT_S, model=llm.QWEN_9B)
@@ -51,8 +64,7 @@ def maybe_rederive(idea_id: str) -> bool:
         from .. import embed      # local: loading sentence-transformers costs seconds
         fields["vector"] = embed.embed_docs([fields["text"]])[0].tolist()
     fields["rederived_at_leaf_count"] = len(leaves)
-    graph_client.update_idea(idea_id, fields)
-    return True
+    return fields
 
 
 def _render(idea: dict, leaves: list[dict]) -> str:

@@ -3,7 +3,7 @@ the vault export of §11.6, which the spec asks for in the same shape, and the s
 of the Neo4j load (C1, `07-roles-and-contracts.md:72`).
 
     python3 -m lake.selfcheck             # 6.1 talks to both school servers
-    python3 -m lake.selfcheck --offline   # 20 of 21, no network, no key in the env
+    python3 -m lake.selfcheck --offline   # 21 of 22, no network, no key in the env
 
 Only `assert`, no framework. Every check gets its own temporary directory and the
 writers are pointed at it: the real `data/lake.db`, `data/index.db`,
@@ -26,6 +26,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -37,7 +38,7 @@ from pathlib import Path
 import numpy as np
 
 from . import graph_client, index, llm, neo4j_load, stub_store, trace, vault
-from .ingest import link, parse, rederive, run
+from .ingest import link, parse, rederive, run, split
 from .models import (CACHE_DIR, EMBED_DIM, GENERALIZE_SCHEMA, PARSE_SCHEMA,
                      SCHEMA_BINDINGS, DraftThesis, Idea, Section, Source, Thesis,
                      model_field_names, new_idea_id, new_thesis_id, schema_properties,
@@ -46,6 +47,39 @@ from .retrieve import api, rank, rewrite, search
 
 REPO = Path(__file__).resolve().parents[1]
 CHECKS: list[tuple[int, str, object]] = []
+
+# §6.9: every statement that updates the thesis table, and EVERY column it assigns.
+#
+# The table name is reached through anything that is not a statement separator, so
+# `UPDATE OR REPLACE thesis`, `UPDATE main.thesis` and `UPDATE thesis AS t` all count.
+# The SET list is captured whole and split into columns below — reading only the first
+# assignment let `SET idea_id=?, text=?` through green, which is exactly how a guard
+# narrowed to admit one statement stops holding the invariant it was narrowed for.
+# `ON CONFLICT ... DO UPDATE SET` is a thesis rewrite with no `UPDATE thesis` in it, so
+# it is matched separately.
+# Deliberately greedy: prose that puts "update" within 40 characters of a bare "thesis"
+# fails this check. It fails CLOSED, which is the right direction for a guard, and the
+# phrase was already forbidden outright before this was narrowed.
+_THESIS_UPDATE = re.compile(r"update\b[^;]{0,40}?\bthesis\b(?P<rest>[^;]{0,300})", re.IGNORECASE)
+_UPSERT_UPDATE = re.compile(r"on\s+conflict\b[^;]{0,80}?do\s+update\s+set\b(?P<rest>[^;]{0,300})",
+                            re.IGNORECASE)
+_SET_COLUMN = re.compile(r"(\w+)\s*=")
+
+
+def _thesis_update_columns(source: str) -> list[set[str]]:
+    """One entry per statement that updates the thesis table: the columns it assigns.
+
+    An `UPDATE` whose SET list this cannot parse yields an EMPTY set, which no caller
+    accepts — an unreadable variant fails the check rather than slipping past it.
+    """
+    out = []
+    for pattern in (_THESIS_UPDATE, _UPSERT_UPDATE):
+        for match in pattern.finditer(source):
+            if pattern is _UPSERT_UPDATE and "thesis" not in source[:match.start()][-200:].lower():
+                continue        # an upsert on some other table
+            head = re.split(r"\bwhere\b", match.group("rest"), maxsplit=1, flags=re.IGNORECASE)[0]
+            out.append(set(_SET_COLUMN.findall(head)))
+    return out
 
 
 def check(number: int, what: str):
@@ -232,6 +266,13 @@ def _phase2(tmp: Path, rows: list[dict], answers: list, *, limit: int | None = N
         stack.enter_context(_swap(index, "has", functools.partial(index.has, db=idx)))
         stack.enter_context(_swap(index, "index_rows",
                                   functools.partial(index.index_rows, db=idx)))
+        # `_reconcile_index`'s drift repair and `split.split_idea` reach for these two
+        # the same way. `reconcile` unbound does not add rows to the real index, it
+        # REBUILDS it from this fixture store.
+        stack.enter_context(_swap(index, "stale_links",
+                                  functools.partial(index.stale_links, db=idx)))
+        stack.enter_context(_swap(index, "reconcile",
+                                  functools.partial(index.reconcile, db=idx)))
         stack.enter_context(_swap(link, "link_batch",
                                   functools.partial(link.link_batch, index_db=idx,
                                                     pending_path=tmp / "pending_link.jsonl")))
@@ -502,12 +543,23 @@ def check_09(tmp: Path) -> None:
                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
         assert "update_thesis" not in defined, f"{module.__name__} grew an update_thesis"
         assert not hasattr(module, "update_thesis"), module.__name__
-    # A direct UPDATE would bypass the missing method; no module of block A carries one.
+    # A direct UPDATE would bypass the missing method. Exactly ONE is allowed in all of
+    # block A — `stub_store.split_idea` re-homing a leaf — and it may write exactly one
+    # column. §1.2 immutability is about what the source said (text, context, effect,
+    # locator, text_hash, source_id); `idea_id` is the arbiter's decision from §4.5 and
+    # has to be repairable, or a mislinked leaf can only be fixed by deleting it.
+    # `UPDATE thesis SET text=?` anywhere, including in that one function, still fails.
+    found = 0
     for path in sorted((REPO / "lake").rglob("*.py")):
-        if path.name == "selfcheck.py":
+        if path.name == "selfcheck.py" and path.parent.name == "lake":
             continue
-        body = path.read_text(encoding="utf-8").lower()
-        assert "update thesis" not in body and "update  thesis" not in body, path
+        for columns in _thesis_update_columns(path.read_text(encoding="utf-8")):
+            found += 1
+            assert path == REPO / "lake" / "stub_store.py", f"{path}: direct UPDATE on thesis"
+            assert columns == {"idea_id"}, \
+                f"{path}: UPDATE thesis assigns {sorted(columns) or '(unparsed)'} — " \
+                "only idea_id may move"
+    assert found == 1, f"the one allowed UPDATE on thesis is now {found}"
     # And the one update the store does expose refuses to touch anything but an idea.
     _open(tmp)
     sid = _write_source("s1")
@@ -776,6 +828,109 @@ def check_21(tmp: Path) -> None:
     neo4j_load.demo()
 
 
+@check(22, "an idea over the leaf ceiling is split by its leaf vectors, every part is "
+           "re-derived over its own leaves, and the split writes idea_id and nothing "
+           "else on a thesis (split.demo, issue #2)")
+def check_22(tmp: Path) -> None:
+    split.demo()
+
+
+@check(23, "phase 2 runs the split sweep and reports the ceiling off the STORE: an idea "
+           "over it is split even when staging is empty, and the alarm is not read off "
+           "the list of failed attempts (issue #2)")
+def check_23(tmp: Path) -> str:
+    idx = _open(tmp)
+    sid = _write_source("s1")
+    idea = Idea(id=new_idea_id(), text="the whole research area",
+                applicability_conditions="ac", limitations="lim", failure_modes=["fm"],
+                effect_claimed="lots of numbers", effect_observed="",
+                vector=_vec("the whole research area"))
+    leaves = [_thesis("s1", idea.id, f"leaf {n} about theme {n % 3}") for n in range(20)]
+    graph_client.create_idea_with_theses(idea, sid, leaves)
+    index.index_theses(leaves, db=idx)
+    assert split.due() == [idea.id], "the fixture is not over the ceiling"
+
+    # Empty staging on purpose. `split.due()` used to be called only inside the
+    # per-source loop, so a phase 2 with nothing left to ingest — the normal state
+    # after a finished run — processed no group, swept nothing, and reported a lake
+    # holding a 92-leaf node as healthy: `split_failed: []` reads as "no problem"
+    # when it actually means "never looked". This is the run that has to repair it.
+    report, ops, _ = _phase2(tmp, [], [])
+    assert report["sources_processed"] == 0 and report["theses_written"] == 0, report
+    assert "link" not in ops, ops
+
+    assert len(report["splits"]) == 1, report["splits"]
+    assert report["split_failed"] == [], report["split_failed"]
+    parts = report["splits"][0]["parts"]
+    assert len(parts) >= 2 and sum(n for _, n in parts) == 20, parts
+    assert parts[0][0] == idea.id, "the parent did not keep its id"
+
+    # The two report numbers that describe the defect, both read off the store.
+    assert report["ideas_over_ceiling"] == 0, report["ideas_over_ceiling"]
+    assert report["max_leaves_per_idea"] == max(n for _, n in parts) <= split.MAX_LEAVES, \
+        report["max_leaves_per_idea"]
+    assert split.due() == [] and report["ideas_without_leaves"] == 0, report
+
+    # The store moved and the index went with it — the drift is looked for by value.
+    assert index.stale_links(graph_client.all_theses(), db=idx) == [], "index left stale"
+    assert index.count(db=idx) == 20, index.count(db=idx)
+
+    # --- the sweep inside the loop, and why it runs BEFORE §4.6 ----------------------
+    # A second over-ceiling idea, this one due for re-derivation too (counter at 0).
+    # With one source in staging the per-source sweep splits it first and resets every
+    # part's counter to its own size, so §4.6 has nothing left to do. Without that
+    # sweep the split only happens after the loop, and §4.6 fires first — paying for a
+    # re-derivation over the whole over-broad set that the split then throws away.
+    # `rederived == 0` is what says the two ran in the right order.
+    second = Idea(id=new_idea_id(), text="another whole research area",
+                  applicability_conditions="ac", limitations="lim", failure_modes=["fm"],
+                  effect_claimed="numbers", effect_observed="",
+                  vector=_vec("another whole research area"))
+    more = [_thesis("s1", second.id, f"second leaf {n} on topic {n % 3}") for n in range(20)]
+    graph_client.create_idea_with_theses(second, sid, more)
+    index.index_theses(more, db=idx)
+    assert second.id in split.due() and _rederive_would_fire(second.id)
+
+    report2, ops2, _ = _phase2(tmp, [_row("s2", "a wholly unrelated mixed precision trick",
+                                          "train in mixed precision")], [-1])
+    assert report2["sources_processed"] == 1, report2
+    assert any(s["idea_id"] == second.id for s in report2["splits"]), report2["splits"]
+    assert report2["rederived"] == 0, \
+        "§4.6 ran before the split and re-derived the over-broad set it was about to lose"
+    assert report2["ideas_over_ceiling"] == 0 and report2["split_failed"] == [], report2
+
+    # --- a split that FAILS: the two numbers must disagree, and honestly -------------
+    third = Idea(id=new_idea_id(), text="a third research area", applicability_conditions="ac",
+                 limitations="lim", failure_modes=["fm"], effect_claimed="", effect_observed="",
+                 vector=_vec("a third research area"))
+    graph_client.create_idea_with_theses(
+        third, sid, [_thesis("s1", third.id, f"third leaf {n}") for n in range(20)])
+    boom = lambda idea_id, *a, **kw: (_ for _ in ()).throw(RuntimeError("clustering died"))
+    with _swap(split, "split_idea", boom):
+        # One source in staging, so the sweep runs twice: once in the loop and once
+        # after it. ONE idea is over the ceiling and the failure list has TWO entries —
+        # the two numbers have to disagree here, or `ideas_over_ceiling` could be read
+        # off `split_failed` and nobody would notice.
+        # Three rows because the cursor from the run above already covers line 1: two
+        # survive it and form one group, which is all this needs.
+        report3, _, _ = _phase2(tmp, [_row("s3", f"a third unrelated trick, number {n}",
+                                           "cache the intermediate results")
+                                      for n in range(3)], [-1] * 3)
+    assert {f["idea_id"] for f in report3["split_failed"]} == {third.id}, report3["split_failed"]
+    assert len(report3["split_failed"]) == 2, \
+        "the sweep must run per source AND after the loop, so this counts attempts"
+    assert report3["ideas_over_ceiling"] == 1, report3["ideas_over_ceiling"]
+    assert report3["max_leaves_per_idea"] == 20, report3["max_leaves_per_idea"]
+    assert "clustering died" in report3["split_failed"][0]["error"]
+    return (f"empty staging still split 20 leaves into {len(parts)} parts; the in-loop "
+            "sweep runs before §4.6; a failed split still reports the true ceiling")
+
+
+def _rederive_would_fire(idea_id: str, threshold: int = 3) -> bool:
+    body = graph_client.get_ideas([idea_id])[0]
+    return len(body["theses"]) - body["rederived_at_leaf_count"] >= threshold
+
+
 # ------------------------------------------------------------------- the runner
 
 def _fingerprint_real_data() -> dict[str, str]:
@@ -794,11 +949,12 @@ def _fingerprint_real_data() -> dict[str, str]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m lake.selfcheck",
-        description="The 19 assertions of spec 10 §6 plus §11.6 and the Neo4j load, "
+        description="The 19 assertions of spec 10 §6 plus §11.6, the Neo4j load and the "
+                    "leaf-ceiling split, "
                     "one run, only assert.")
     parser.add_argument("--offline", action="store_true",
                         help="skip 6.1, the only check that opens a socket; the other "
-                             "20 need neither the network nor a key")
+                             "21 need neither the network nor a key")
     args = parser.parse_args(argv)
 
     trace.set_run_id("selfcheck-" + uuid.uuid4().hex[:6])

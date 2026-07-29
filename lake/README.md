@@ -25,14 +25,14 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 | `python3 -m lake.api.app [--port 8077] [--host H] [--mock]` | FastAPI-сервер под uvicorn: граф, поиск, ингест, retrieve |
 | `uvicorn lake.api.app:app --port 8077` | то же штатным способом |
 | `python3 -m lake.api.selfcheck` | офлайн-проверка HTTP-слоя (она же `--selfcheck`) |
-| `python3 -m lake.selfcheck [--offline]` | 19 проверок §6. `--offline` пропускает канарейку (единственный сетевой пункт) |
+| `python3 -m lake.selfcheck [--offline]` | 23 проверки §6. `--offline` пропускает канарейку (единственный сетевой пункт) |
 | `python3 tools/gen_sources.py` | `09-raw/a11-sources.yaml` → `lake/sources.yaml` (84 записи) |
 
 Каждый модуль дополнительно исполняем: `python3 -m lake.index`, `python3 -m lake.embed`,
 `python3 -m lake.ingest.link` и т.д. — свой `__main__` self-check без сети.
 
 **Ключи** читаются из окружения в момент вызова, не на импорте: `LAKE_KEY_9B`, `LAKE_KEY_35B`.
-Без них модули импортируются и 18 из 19 проверок проходят. Локально: `set -a; . ./.env; set +a`
+Без них модули импортируются и 22 из 23 проверок проходит. Локально: `set -a; . ./.env; set +a`
 (`.env` в `.gitignore`, ключи в репозиторий не попадают).
 
 ---
@@ -48,12 +48,12 @@ lake/
   index.py          # индекс тезисов: FTS5 + numpy + RRF. Мой навсегда, на Neo4j не едет
   graph_client.py   # ЕДИНСТВЕННОЕ место, знающее формат B
   stub_store.py     # SQLite-бэкенд того же интерфейса — ВРЕМЕННЫЙ
-  selfcheck.py      # 20 assert-проверок, один запуск
+  selfcheck.py      # 23 assert-проверки, один запуск
   sources.yaml      # сгенерирован маппером
   ops.py            # составные операции: то же, что ручки, но вызываемо импортом
   vault.py          # выгрузка в Obsidian-vault (спека 11): граф рисует Obsidian, не мы
   neo4j_load.py     # односторонняя заливка в Neo4j блока B; уйдёт, когда B сдаст адаптер
-  ingest/  fetch parse generalize link rederive run
+  ingest/  fetch parse generalize link rederive split run
   retrieve/ rewrite search rank api        # api.py — ядро чтения, без транспорта
   api/     app routes schemas jobs selfcheck   # HTTP-слой на всё, единственный сервер
   prompts/{parse,generalize,link,rederive,rewrite}/system.txt
@@ -85,6 +85,8 @@ lake/
         [3] link | new; решение сразу в оверлей. Сбой → pending_link, тезис НЕ пишется
     → create_idea_with_theses одной транзакцией
     → index.index_theses тем же шагом (иначе индекс разъедется с графом)
+    → split идей, у которых листьев > 16 (issue #2): кластеризация векторов листьев,
+      каждая часть пере-выведена ДО единственной транзакции, потом реиндекс
     → rederive идей, у которых len(leaves) - rederived_at_leaf_count >= 3
     → курсор
 ```
@@ -214,6 +216,7 @@ write_theses(source_id, theses) -> list[str]
 create_idea(idea) -> str
 create_idea_with_theses(idea | None, source_id, theses) -> list[str]   # одна транзакция
 update_idea(idea_id, fields) -> None
+split_idea(parent_id, parent_fields, children) -> None   # одна транзакция, issue #2
 get_ideas(ids) -> list[dict]               # листья уже склеены с source.type/url/title
 get_leaves(idea_id) -> list[dict] ; leaf_count(idea_id) -> int
 neighbors(ids, hops=1, min_weight=None) -> list[dict]
@@ -221,7 +224,13 @@ all_theses() -> list[dict] ; ideas_without_leaves() -> list[str] ; trust_scale()
 get_source(id) ; list_sources(limit, offset) ; list_idea_ids(limit, offset)
 list_theses(idea_id, source_id, limit, offset) ; count_theses(idea_id, source_id) ; get_thesis(id)
 counts() -> {source, idea, thesis, edge}   # постраничное чтение для HTTP-слоя
-# update_thesis НЕТ и не будет: иммутабельность тезиса держится отсутствием метода (§3.4)
+# update_thesis НЕТ и не будет: иммутабельность тезиса держится отсутствием метода (§3.4).
+# `split_idea` — не он: §1.2 про то, что сказал ИСТОЧНИК (text, context, effect, locator,
+# text_hash, source_id), а `idea_id` — решение арбитра фазы 2, и оно обязано быть чинибельным,
+# иначе единственный ремонт неверной линковки — удалить лист. Это единственный во всём блоке A
+# `UPDATE` по таблице `thesis`, он пишет ровно одну колонку, и §6.9 проверяет ВЕСЬ список SET,
+# а не первую колонку: `SET idea_id=?, text=?` красит проверку. `INSERT OR REPLACE` по `thesis`
+# отказывает сам `_insert` — такой перезаписи никакой `UPDATE` в исходнике не видно.
 
 # write path
 ingest.fetch.fetch_source(entry) -> (Source, list[Section])
@@ -231,6 +240,9 @@ ingest.generalize.generalize(draft) -> IdeaFields
 ingest.generalize.leakage(draft, out) -> list[str]     # пусто = утечки конкретики нет
 ingest.link.link_batch(source_id, rows) -> list[dict]
 ingest.rederive.maybe_rederive(idea_id) -> bool
+ingest.rederive.derive(idea, leaves) -> dict          # шесть полей §4.6, ничего не пишет
+ingest.split.due(max_leaves=16) -> list[str] ; ingest.split.split_idea(idea_id) -> dict
+ingest.split.leaf_counts() -> dict[idea_id, int]      # распределение листьев, максимум в отчёт
 ingest.run.phase1(entries, workers=8) -> int ; ingest.run.phase2(staging_path, limit=None) -> dict
 
 # read path
@@ -285,7 +297,7 @@ api.jobs.exclusive(kind) -> ctx            # тот же слот для кор�
 | занятый слот отдаёт `500`, хотя OpenAPI обещает `409`: `jobs.Busy` — голый `RuntimeError`, и две ручки конвертировали его руками, а третья забыла | обработчик на `jobs.Busy` в `app.py` — забыть его нельзя |
 | обязательное поле модели не пришло от читателя — узел уезжает в Neo4j с дырой и молча: схемы там нет, возразить некому (так 60 тезисов уехали без `vector`) | `_row` требует каждое обязательное поле; правило «`None` → не писать» осталось только для полей, объявленных `\| None` |
 
-`python3 -m lake.selfcheck` — **21/21**, проверки прогнаны на мутациях: сломай любую из этих
+`python3 -m lake.selfcheck` — **23/23**, проверки прогнаны на мутациях: сломай любую из этих
 защит, и краснеет ровно её пункт.
 
 `python3 -m lake.api.selfcheck` — HTTP-слой, офлайн. Тоже прогнан на мутациях: 12 из 12 внесённых
@@ -330,8 +342,25 @@ HTTP-слой прогнан на этих же данных: `/healthz` и `/st
    нужно плечо min-max (`search(..., fuse="minmax")`) или отдельное поле сырого косинуса.
 2. **Арбитр переклеивает.** На первом прогоне у одной идеи 14 листьев, часть из них — результаты,
    а не приёмы. Ломается и правило 1 парсера, и гранулярность арбитра. Лечится приёмкой и правкой промпта.
-3. **Крен «богатые богатеют»** на отборе кандидатов (§4.5): у идеи с 20 листьями двадцать шансов
-   попасть в top-30, у идеи с одним — один. Измеряется, в MVP не устраняется.
+3. **Крен «богатые богатеют»** на отборе кандидатов (§4.5) — снят, но не бесплатно (issue #2).
+   На прогоне из 10 источников он успел схлопнуть 34% озера в одну идею: 92 листа из 9 источников,
+   текст расширился до исследовательской области, `effect_claimed` стал списком из 18 чисел от
+   несвязанных задач. Три правки, и каждая закрывает своё звено петли:
+   `link._first_per_idea` умножает лучший ранг идеи на число её попаданий в окно (идея, занявшая
+   `n` из 30 мест, по одному объёму стоит на ранге ~30/n — эта цена теперь вычитается);
+   правило 2 промпта арбитра отказывает кандидату, который называет область, а не приём;
+   `ingest/split.py` разрезает идею, перевалившую за `MAX_LEAVES = 16`, по векторам листьев и
+   пере-выводит каждую часть. Потолок — калибровочная ручка: настоящий приём, повторённый
+   16+ статьями, будет разрезан лишний раз, и это дешевле обратной ошибки.
+   Уже существующий узел на 92 листа этим не лечится задним числом: он режется при следующем
+   `phase2` — свип идёт и на каждый источник, и один раз после цикла, поэтому прогон с уже
+   вычерпанным staging (ноль источников) его тоже режет, а не отчитывается «всё чисто».
+   В отчёте два независимых числа: `split_failed` считает ПОПЫТКИ, `ideas_over_ceiling` и
+   `max_leaves_per_idea` читаются из стора. Путать их — и есть тот самый статус, который врёт.
+   Не закреплено проверкой: уточняющие итерации k-means в `_bisect`. На любой фикстуре, где
+   темы разделимы настолько, что можно утверждать ожидаемый разрез, его находит уже стартовая
+   пара, и `_KMEANS_ITERS = 0` остаётся зелёным. Закреплены детерминизм, непустота обеих
+   сторон, завершаемость и восстановление известных тем.
 4. **`rebuild_from(staging)` из §3.5 невозможен**: `idea_id` назначается в фазе 2, в staging его нет.
    Путь реконсиляции — `index.reset()` + `index.index_rows(graph_client.all_theses())`.
 5. **§4.1 врёт в одном числе**: evo_search = 26, не 27 (сумма 84 сходится, значит неверно слагаемое).
