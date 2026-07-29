@@ -27,6 +27,20 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 | `python3 -m lake.api.selfcheck` | офлайн-проверка HTTP-слоя (она же `--selfcheck`) |
 | `python3 -m lake.selfcheck [--offline]` | 19 проверок §6. `--offline` пропускает канарейку (единственный сетевой пункт) |
 | `python3 tools/gen_sources.py` | `09-raw/a11-sources.yaml` → `lake/sources.yaml` (84 записи) |
+| `docker compose --env-file .env.local up -d` | локально: соберёт образ сам. На сервере образ приезжает из GHCR, см. ниже |
+
+**CI/CD** — `.github/workflows/deploy.yml`, срабатывает на push в `main`, если тронуты
+`lake/**`, `Dockerfile`, `docker-compose.yml` или сам workflow. Порядок: собрать образ →
+**прогнать три офлайн-проверки внутри собранного образа** (не в окружении раннера: иначе
+зелёный прогон говорит про питон раннера, а не про то, что поедет) → выложить в
+`ghcr.io/n4rly-boop/ideas-lake` тегами `latest` и коротким sha → по ssh обновить сервер →
+**дождаться `healthy`**, иначе прогон красный. Без последнего шага CI зеленел бы над
+мёртвым сервисом: `up -d` возвращает 0, как только контейнер создан, а не когда отвечает.
+
+Сервер исходников не держит и не собирает: приезжает готовый образ плюс один
+`docker-compose.yml`. Логин в GHCR делается токеном самого прогона и живёт минуты —
+долгоживущего PAT на машине нет. `.env.local` в CI не приезжает никогда.
+Откат — `LAKE_TAG=<старый sha> docker compose --env-file .env.local up -d`, без пересборки.
 
 Каждый модуль дополнительно исполняем: `python3 -m lake.index`, `python3 -m lake.embed`,
 `python3 -m lake.ingest.link` и т.д. — свой `__main__` self-check без сети.

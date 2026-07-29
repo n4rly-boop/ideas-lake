@@ -19,6 +19,12 @@
 
 services:
   lake:
+    # Образ собирает CI и кладёт в GHCR (`.github/workflows/deploy.yml`); сервер
+    # его тянет и исходников не держит. `LAKE_TAG` деплой выставляет в короткий
+    # sha прогона — тогда откат это тот же up с другим тегом, а не пересборка.
+    # `build:` остаётся для локальной разработки: `docker compose build` собирает
+    # и метит тем же именем, `up` без pull возьмёт локальный образ.
+    image: ghcr.io/n4rly-boop/ideas-lake:${LAKE_TAG:-latest}
     build: .
     # Всё окружение отсюда: LAKE_KEY_9B, LAKE_KEY_35B, NEO4J_*.
     env_file: [.env.local]
