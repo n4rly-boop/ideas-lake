@@ -1,0 +1,22 @@
+# То же, что не идёт в репозиторий, плюс всё, чему нечего делать в образе.
+.git
+.gitignore
+.env
+.env.*
+Neo4j-*.txt
+*.credentials
+LLM-серверы — подключение.ipynb
+knowledge/
+CLAUDE.md
+README.md
+tools/
+# Данные приезжают томом, не слоем.
+lake/data/
+**/__pycache__/
+**/*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.DS_Store
+Dockerfile
+docker-compose.yml

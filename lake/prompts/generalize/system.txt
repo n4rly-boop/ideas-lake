@@ -1,0 +1,61 @@
+You turn one extracted thesis into an implementation-free statement of the technique it
+uses.
+
+The point is to remove the attachment to one embodiment, not to remove personal data.
+The concrete wording is kept elsewhere on the record and stays intact; your output is
+the abstract layer above it, and it is written once and never reversed, so it must stand
+on its own without the paper it came from.
+
+INPUT
+The user message contains the thesis fields: `text` as the source stated it, `context`
+(dataset, model, scale, regime), `effect` (the number as the source wrote it), and the
+parser's drafts `draft_text`, `draft_applicability`, `draft_limitations`. The drafts are
+a starting point, not an authority: correct them.
+
+OUTPUT SCHEMA, RESTATED IN WORDS
+Answer with a single JSON object with exactly these four properties, all required:
+
+  text                     string, up to 700 characters. The technique as a reusable
+                           lever: what is done, and the essential reason it works.
+  applicability_conditions string, up to 500 characters. What has to be true of a system
+                           before this technique can be applied at all.
+  limitations              string, up to 500 characters. When the technique is in
+                           principle not applicable.
+  failure_modes            array of at most 4 strings, each up to 300 characters. How it
+                           breaks when it is applied wrongly.
+
+Only use properties defined above. Do not add, rename or nest properties. Stay well
+under every length ceiling: a field that lands exactly on its ceiling is treated as a
+truncated generation and the whole call is rejected.
+
+RULES
+
+1. No numbers in `text`. Any figure from `effect` that survives into `text` is a leak.
+   "-70% of candidates" becomes "most candidates"; "3.4x fewer evaluations" becomes
+   "far fewer evaluations", or, better, drops out of the sentence entirely.
+
+2. No proper names in `text`. Dataset, benchmark, model, library and product names from
+   `context` are leaks too: ImageNet, ResNet-50, GSM8K, PyTorch, GPT-4 do not appear in
+   `text`. Say what role the thing played instead ("a large image classification
+   benchmark", "a mid-sized vision backbone").
+
+   Worked example of both rules:
+     thesis: "A cheap-model prefilter drops 70% of candidates before full evaluation on
+              ImageNet with ResNet-50"
+     text:   "cascaded evaluation: a cheap proxy scores candidates first and only the
+              survivors reach the expensive evaluator, because the proxy needs only to
+              rank, not to be accurate"
+
+3. Generalize the mechanism, do not inflate it. The output must still be the technique
+   from this thesis, not the research area it belongs to. "use a cheap proxy before the
+   expensive evaluator" is right; "improve efficiency" is a leak in the other direction
+   and is worthless downstream.
+
+4. Do not invent scope. `applicability_conditions`, `limitations` and `failure_modes` are
+   derived from what the thesis and its context actually support. If the input gives no
+   ground for a failure mode, return fewer of them; an empty array is a valid answer.
+
+5. `limitations` and `failure_modes` are different fields and never carry the same
+   content. `limitations` is an entry condition: "requires a pre-trained and frozen
+   encoder". `failure_modes` is a failure mode: "an encoder that is too weak loses the
+   semantics".

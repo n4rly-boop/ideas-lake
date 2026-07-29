@@ -2,6 +2,7 @@
 Neo4j-*.txt
 .env
 .env.*
+!.env.local.example
 *.credentials
 # Ноутбук школы содержит два ключа в открытом виде.
 # Снять из игнора можно после переноса ключей в os.environ (10 §2: LAKE_KEY_9B / LAKE_KEY_35B).
