@@ -58,7 +58,12 @@ AIRI Summer 2026, проект 28 «Озеро идей». Защита — **3 
 ## Секреты
 
 Ключи наружу — в issue, в чат, в репозиторий — не выносить. В коде только `os.environ`:
-`LAKE_KEY_9B`, `LAKE_KEY_35B`, `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, `NEO4J_DATABASE`.
+`LAKE_KEY_9B`, `LAKE_KEY_35B`, `LAKE_API_KEY`, `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`,
+`NEO4J_DATABASE`.
+
+`LAKE_API_KEY` — единственная аутентификация блока A, `Authorization: Bearer` на всех ручках
+кроме `/openapi.json` и `/docs`. Пустое значение — отказ на старте, а не «выключено».
+Доступы к серверам школы — `servers.credentials`, под игнором (`*.credentials`).
 
 **Ноутбук содержит два ключа в открытом виде и поэтому в `.gitignore`.** Вернуть в репозиторий можно только после переноса ключей в окружение.
 Файл кредов Aura (`Neo4j-*.txt`) — там же в игноре.

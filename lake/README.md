@@ -22,7 +22,7 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 | `python3 -m lake.ingest.run phase1 [--limit N] [--sources path]` | fetch → parse → generalize → `data/staging.jsonl`. 8 потоков. **В граф не пишет ничего** |
 | `python3 -m lake.ingest.run phase2 [--limit N]` | staging → линковка → граф + индекс → пере-вывод. Последовательно, курсор |
 | `python3 -m lake.ingest.run selfcheck` | офлайн end-to-end на фикстурах, временные БД |
-| `python3 -m lake.api.app [--port 8077] [--host H] [--mock]` | FastAPI-сервер под uvicorn: граф, поиск, ингест, retrieve |
+| `python3 -m lake.api.app [--port 8077] [--host H] [--mock] [--no-auth]` | FastAPI-сервер под uvicorn: граф, поиск, ингест, retrieve. Нужен `LAKE_API_KEY`, иначе не поднимется |
 | `uvicorn lake.api.app:app --port 8077` | то же штатным способом |
 | `python3 -m lake.api.selfcheck` | офлайн-проверка HTTP-слоя (она же `--selfcheck`) |
 | `python3 -m lake.selfcheck [--offline]` | 19 проверок §6. `--offline` пропускает канарейку (единственный сетевой пункт) |
@@ -152,6 +152,15 @@ POST /retrieve
 данными, не осталось — ингест, чтение графа, поиск и починка индекса ходят через HTTP.
 
 `GET /docs` — Swagger, `GET /openapi.json` — машинная схема (422 из неё убран: мы его не отдаём).
+
+**Ключ обязателен на всех ручках:** `Authorization: Bearer $LAKE_API_KEY`, иначе `401`
+(`{"error": ...}` + `WWW-Authenticate: Bearer`). Проверка — middleware в `app.py`, а не
+зависимость на маршруте: маршрут можно написать без зависимости, а эти маршруты пишут в
+граф и тратят GPU школы. Она стоит **до** роутинга, поэтому несуществующий путь тоже `401`:
+чтобы узнать, какие пути есть, ключ уже нужен. Без ключа в окружении сервер **не стартует** —
+пустая строка это отказ на старте, а не «аутентификация выключена»; выключается явно,
+флагом `--no-auth`, и он пишет об этом в лог. Открыты `/openapi.json` и `/docs` — контракт
+интеграции, данных озера в нём нет.
 
 | | |
 |---|---|

@@ -11,6 +11,7 @@ happened here once already, and the guard is cheaper than finding out later.
 """
 import functools
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -188,7 +189,9 @@ def _unexpected(what: str):
 
 def _run(tmp: Path, idx: Path) -> None:
     # ---------------------------------------------------------------- the mock
-    with TestClient(create_app(mock=True, warmup=False)) as client:
+    # `api_key=False` here and below: these two blocks check the shape of the API, and
+    # the key gets its own block at the end, against a server that has one.
+    with TestClient(create_app(mock=True, warmup=False, api_key=False)) as client:
         body = client.post("/retrieve", json={"query": "diversity", "k": 2}).json()
         assert sorted(body) == ["cost", "ideas", "log_id"], sorted(body)
         # Asserted against the CONSTANT, not the response: `response_model` reshapes
@@ -248,7 +251,7 @@ def _run(tmp: Path, idx: Path) -> None:
     # ------------------------------------------------------------- the real app
     made = _fixture(tmp)
     idea_a, idea_b = made["ideas"]
-    client = TestClient(create_app(mock=False, warmup=False))
+    client = TestClient(create_app(mock=False, warmup=False, api_key=False))
     with client:
         stats = client.get("/stats").json()
         assert (stats["sources"], stats["ideas"], stats["theses"]) == (1, 2, 3), stats
@@ -684,6 +687,89 @@ def _run(tmp: Path, idx: Path) -> None:
         assert broken["theses"] == 0 and broken["orphans"] == len(made["ideas"]), broken
         print("ok: a leaf is a thesis with a source — the pages, the counts, the "
               "invariant check and the vault export agree on it")
+
+    # ------------------------------------------------------------------- the key
+    # The only thing between this API and anyone who can reach the port: every route
+    # here writes to the graph or spends the school's GPUs, and there is no other
+    # authentication in block A.
+    key = "s3cret-" + "x" * 40
+    with TestClient(create_app(mock=True, warmup=False, api_key=key)) as guarded:
+        # One route per kind, because "the middleware covers everything" is exactly the
+        # claim that rots: a read, a write, the ops view, the ingest and a path that
+        # does not exist. The last one matters — routing happens AFTER the middleware,
+        # so an unknown path must not be able to say "no such route" to a stranger.
+        for method, path, body in (("get", "/healthz", None), ("get", "/stats", None),
+                                   ("get", "/sources", None), ("get", "/search?q=x", None),
+                                   ("post", "/retrieve", {"query": "x"}),
+                                   ("post", "/fetch", {"url": "https://arxiv.org/abs/2406.04824"}),
+                                   ("post", "/ingest/phase2", {}),
+                                   ("post", "/admin/reindex", None),
+                                   ("post", "/vault/export", None),
+                                   ("patch", "/ideas/whatever", {"text": "x"}),
+                                   ("get", "/no/such/path", None)):
+            call = getattr(guarded, method)
+            answer = call(path, json=body) if body is not None else call(path)
+            assert answer.status_code == 401, (path, answer.status_code, answer.text)
+            assert set(answer.json()) == {"error"}, answer.text
+            assert answer.headers.get("www-authenticate") == "Bearer", answer.headers
+            # A wrong key and a malformed header are the same refusal as no header.
+            for header in ({"Authorization": f"Bearer {key}x"}, {"Authorization": key},
+                           {"Authorization": "Basic " + key}, {"Authorization": "Bearer "},
+                           {"X-Lake-Key": key}):
+                wrong = call(path, json=body, headers=header) if body is not None \
+                    else call(path, headers=header)
+                assert wrong.status_code == 401, (path, header, wrong.status_code)
+        # ...and the same routes answer normally once the header is right, so that the
+        # block above cannot be passing because the server is simply broken.
+        good = {"Authorization": f"Bearer {key}"}
+        assert guarded.get("/healthz", headers=good).json()["mock"] is True
+        assert guarded.post("/retrieve", json={"query": "diversity", "k": 2},
+                            headers=good).status_code == 200
+        # Validation still runs after the key, and still answers 400, not 401.
+        assert guarded.post("/retrieve", json={"k": 1}, headers=good).status_code == 400
+        assert guarded.get("/no/such/path", headers=good).status_code == 404
+
+        # The schema is the integration contract and holds no lake data: C reads it
+        # before it has a key. Everything else stays shut.
+        schema = guarded.get("/openapi.json")
+        assert schema.status_code == 200, schema.status_code
+        assert guarded.get("/docs").status_code == 200
+        doc = schema.json()
+        assert doc["security"] == [{"bearerAuth": []}], doc.get("security")
+        assert doc["components"]["securitySchemes"]["bearerAuth"]["scheme"] == "bearer"
+        # A 401 the document does not mention is a branch C never writes, and it is the
+        # one it will hit first. Asserted over EVERY operation, not a sample.
+        for path, item in doc["paths"].items():
+            for method, operation in item.items():
+                assert "401" in operation.get("responses", {}), (path, method)
+        assert "ErrorResponse" in doc["components"]["schemas"], "the 401 body is a $ref"
+
+    # `--no-auth` is a choice somebody types; an EMPTY key is a server that thinks it
+    # is guarded and is not, so it must not start at all.
+    try:
+        with TestClient(create_app(mock=True, warmup=False, api_key="")):
+            raise AssertionError("a server with an empty LAKE_API_KEY started")
+    except RuntimeError as exc:
+        assert "LAKE_API_KEY is empty" in str(exc), exc
+    # The env is where the real one comes from, and `create_app` must read it there.
+    os.environ["LAKE_API_KEY"] = key
+    try:
+        with TestClient(create_app(mock=True, warmup=False)) as from_env:
+            assert from_env.get("/healthz").status_code == 401
+            assert from_env.get("/healthz", headers={"Authorization": f"Bearer {key}"}
+                                ).status_code == 200
+    finally:
+        os.environ.pop("LAKE_API_KEY", None)
+    # And with no variable set at all the server refuses to come up — the case that
+    # turns a forgotten line in `.env.local` into an open API on a public port.
+    try:
+        with TestClient(create_app(mock=True, warmup=False)):
+            raise AssertionError("a server started with no LAKE_API_KEY in the environment")
+    except RuntimeError as exc:
+        assert "LAKE_API_KEY is empty" in str(exc), exc
+    print("ok: the key — 401 on every route and on unknown paths, wrong key and wrong "
+          "scheme refused, 400 still 400, schema open and documents its 401, empty or "
+          "missing key refuses to start")
 
 
 def _await(client, job_id: str, timeout: float = 10.0) -> dict:
