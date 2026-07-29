@@ -61,15 +61,27 @@ EDGES = (
 
 
 def _row(model, node: dict) -> dict:
-    """One node -> one Neo4j property map, by the model's field list."""
+    """One node -> one Neo4j property map, by the model's field list.
+
+    A field the model marks required must arrive. Dropping it is not the
+    "absent is not empty" rule of the module docstring: that rule is about a
+    value the lake genuinely does not have (`run_success` on a paper), and the
+    model spells those `| None = None`. A required field missing means the
+    reader did not carry it — `list_theses` is a serving projection and has no
+    `vector` (`stub_store:277-283`) — and the node lands with a hole, silently,
+    because Neo4j has no schema to object. That is how 60 theses reached the
+    database without vectors on 2026-07-29.
+    """
     out = {}
-    for name in model.model_fields:
+    for name, field in model.model_fields.items():
         value = node.get(name)
-        if value is None:            # absent, not null — see the module docstring
-            continue
+        if value is None:
+            if field.is_required():
+                raise ValueError(f"{model.__name__} {node.get('id', '?')}: required field "
+                                 f"{name!r} did not arrive from the reader — a node with a "
+                                 f"hole, not a node with an absent value")
+            continue        # optional and absent — see the module docstring
         out[name] = json.dumps(value, ensure_ascii=False) if name in JSON_FIELDS else value
-    if "id" not in out:
-        raise ValueError(f"{model.__name__} without an id: {sorted(node)}")
     return out
 
 
@@ -86,6 +98,13 @@ def build() -> dict:
     """Read the whole lake and shape it for Cypher. No connection, no writes."""
     sources = _all(graph_client.list_sources)
     theses = _all(lambda limit, offset: graph_client.list_theses(None, None, limit, offset))
+    # `list_theses` is what `/theses` serves and it carries no vector — 384 floats
+    # per leaf on every page would be a listing nobody wants. `all_theses` is the
+    # reader that holds them (`stub_store:319-332`), the same one the index
+    # reconciles against. A leaf missing from it stays `None` and `_row` refuses.
+    vectors = {leaf["id"]: leaf["vector"] for leaf in graph_client.all_theses()}
+    for leaf in theses:
+        leaf["vector"] = vectors.get(leaf["id"])
     ideas = []
     idea_ids = _all(graph_client.list_idea_ids)
     for start in range(0, len(idea_ids), PAGE):
@@ -164,18 +183,32 @@ def demo() -> None:
     assert row["run_success"] is False, "False is a value; only None is absent"
     paper = _row(Source, {**src, "run_success": None, "run_meta": None})
     assert "run_success" not in paper and "run_meta" not in paper, paper
-    idea = _row(Idea, {"id": "i1", "text": "t", "failure_modes": ["a", "b"],
-                       "vector": [0.1] * 3, "differentiation": None})
+    full_idea = {"id": "i1", "text": "t", "applicability_conditions": "c",
+                 "limitations": "l", "failure_modes": ["a", "b"], "effect_claimed": "e",
+                 "effect_observed": "o", "vector": [0.1] * 3, "differentiation": None}
+    idea = _row(Idea, full_idea)
     assert idea["failure_modes"] == ["a", "b"], "a list of scalars stays a list"
     assert "differentiation" not in idea and idea["vector"] == [0.1] * 3, idea
     assert set(idea) <= set(Idea.model_fields), "a property the model does not have"
-    try:
-        _row(Thesis, {"text": "no id"})
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a node without an id would MERGE onto every id-less node")
-    print("ok: nested -> JSON, None dropped, False kept, id required")
+
+    def refuses(model, node, missing):
+        try:
+            _row(model, node)
+        except ValueError as exc:
+            assert missing in str(exc), f"refused, but not for {missing}: {exc}"
+        else:
+            raise AssertionError(f"{model.__name__} without {missing} was accepted")
+
+    refuses(Thesis, {"text": "no id"}, "id")   # would MERGE onto every id-less node
+    # The 2026-07-29 regression: `list_theses` carries no vector, `_row` dropped it,
+    # and 60 leaves landed in Neo4j without one. Optional-and-absent still passes.
+    full_leaf = {"id": "t1", "source_id": "s1", "idea_id": "i1", "text": "x",
+                 "context": "c", "effect": "e", "locator": "p.1", "text_hash": "h",
+                 "vector": [0.2] * 3, "created_at": "2026-07-28T10:00:00Z"}
+    assert _row(Thesis, full_leaf)["vector"] == [0.2] * 3
+    refuses(Thesis, {**full_leaf, "vector": None}, "vector")
+    refuses(Idea, {**full_idea, "vector": None}, "vector")
+    print("ok: nested -> JSON, None dropped, False kept, every required field demanded")
     print("neo4j_load self-check OK — nothing connected, nothing written")
 
 
