@@ -37,22 +37,31 @@ def phase1(entries: list[dict], workers: int = 8) -> int:
     Nothing here touches the graph (§4.7). A source that dies takes only itself down:
     it is named and counted in the report, which is the opposite of fail-open — the
     loss has a name and a number instead of a silently shorter corpus.
+
+    The corpus file is the only one this phase writes: a single url goes through
+    `ingest_one`, which drives `_one_source` over a staging file of its own.
     """
     llm.assert_grammar_works(llm.QWEN_9B)       # canary per model used, every run (§6.1)
     from . import fetch, generalize, parse      # local: phase 2 needs none of these
 
+    staging_path = Path(STAGING)                # module global: `selfcheck` rebinds it
+    # Derived from the file, not the `STAGING_CURSOR` constant, and for the same
+    # reason: `selfcheck` rebinds `STAGING` to a temp path and the constant would
+    # keep pointing at the real `data/staging.cursor` — a check that deletes the
+    # operator's cursor while proving it wrote nowhere near the real data.
+    cursor_path = _cursor_path(staging_path)
     written = leaked = dropped = 0
     failed: list[tuple[str, str]] = []
-    STAGING.parent.mkdir(parents=True, exist_ok=True)
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
     # Phase 1 rewrites lines of the sources it touches, so every line number after
     # them moves and a cursor left over from an earlier phase 2 points at the wrong
     # row. Dropping it costs nothing: on the replay, link step [0] skips everything
     # already stored without a single LLM call (§4.5, §4.8).
-    if STAGING_CURSOR.exists():
-        STAGING_CURSOR.unlink()
-        print(f"phase1: dropped {STAGING_CURSOR.name}, phase 2 will replay from the top")
+    if cursor_path.exists():
+        cursor_path.unlink()
+        print(f"phase1: dropped {cursor_path.name}, phase 2 will replay from the top")
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_one_source, entry, fetch, parse, generalize): entry
+        futures = {pool.submit(_one_source, entry, fetch, parse, generalize, staging_path): entry
                    for entry in entries}
         for future, entry in futures.items():
             name = entry.get("arxiv_id") or entry.get("url") or entry.get("title") or "?"
@@ -74,7 +83,7 @@ def phase1(entries: list[dict], workers: int = 8) -> int:
     return written
 
 
-def _one_source(entry: dict, fetch, parse, generalize) -> tuple[int, int, int]:
+def _one_source(entry: dict, fetch, parse, generalize, staging_path) -> tuple[int, int, int]:
     """One source end to end into staging lines. Returns (lines, leaks, dropped)."""
     from .. import embed
 
@@ -116,13 +125,13 @@ def _one_source(entry: dict, fetch, parse, generalize) -> tuple[int, int, int]:
     # linear cursor, and per-line appends from 8 threads would scatter a source
     # across the file.
     with _staging_lock:
-        _drop_source(src.id)
-        with STAGING.open("a", encoding="utf-8") as fh:
+        _drop_source(src.id, staging_path)
+        with staging_path.open("a", encoding="utf-8") as fh:
             fh.write("".join(line + "\n" for line in lines))
     return len(lines), leaks, report["dropped"]
 
 
-def _drop_source(source_id: str) -> None:
+def _drop_source(source_id: str, staging_path) -> None:
     """Remove any earlier lines of this source. Caller holds `_staging_lock`.
 
     §4.7 expects "fix the parse prompt, re-run phase 1" to be routine. A plain
@@ -131,13 +140,13 @@ def _drop_source(source_id: str) -> None:
     wording, so `(source_id, text_hash)` does not stop it. Re-running a source
     replaces it.
     """
-    if not STAGING.exists():
+    if not staging_path.exists():
         return
-    kept = [ln for ln in STAGING.read_text(encoding="utf-8").splitlines()
+    kept = [ln for ln in staging_path.read_text(encoding="utf-8").splitlines()
             if ln.strip() and json.loads(ln)["source"]["id"] != source_id]
-    tmp = STAGING.with_suffix(".jsonl.tmp")
+    tmp = staging_path.with_suffix(".jsonl.tmp")
     tmp.write_text("".join(ln + "\n" for ln in kept), encoding="utf-8")
-    tmp.replace(STAGING)
+    tmp.replace(staging_path)
 
 
 # ------------------------------------------------------------------------ phase 2
@@ -172,7 +181,7 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
     groups = _group_by_source(rows, done)
 
     processed: list[dict] = []
-    rederived = skipped = written = 0
+    rederived = skipped = refused = written = 0
     rederive_failed: list[dict] = []
 
     for group in groups[:limit]:
@@ -183,8 +192,17 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
         by_idea: dict[str, list] = {}
         new_ideas: dict[str, object] = {}
         for decision in decisions:
-            if decision["skipped"]:             # duplicate, or arbiter failure -> pending_link
-                skipped += 1
+            if decision["skipped"]:
+                # Two different things wear one flag, and they are opposites: a
+                # duplicate means the leaf is ALREADY in the lake, an arbiter refusal
+                # means it is nowhere and waiting in `pending_link` (§4.5). Counted
+                # together, a run where the arbiter refused everything reports the
+                # same numbers as a clean replay — see `ingest_one`, which refuses to
+                # call that `ok`. `link.py:79,93` is where the two prefixes are set.
+                if decision["reason"].startswith("pending_link:"):
+                    refused += 1
+                else:
+                    skipped += 1
                 continue
             thesis = decision["thesis"]
             by_idea.setdefault(thesis.idea_id, []).append(thesis)
@@ -227,10 +245,74 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
 
     report = _report(processed, generalize, cursor)
     report.update({"sources_processed": len(groups[:limit]), "theses_written": written,
-                   "theses_skipped": skipped, "rederived": rederived,
-                   "rederive_failed": rederive_failed})
+                   "theses_skipped": skipped, "theses_refused": refused,
+                   "rederived": rederived, "rederive_failed": rederive_failed})
     _print_report(report)
     return report
+
+
+# ------------------------------------------------------------------- one source
+
+def ingest_one(entry: dict, staging_path) -> dict:
+    """One source from `entry` all the way into the graph. Both phases, own staging.
+
+    This is /fetch: a caller hands over one url and expects the article to be in the
+    lake afterwards, so the acceptance file the corpus run stops at (§4.7) is not the
+    product here — the graph is.
+
+    It is deliberately NOT `phase1(...)` followed by `phase2()` on the corpus staging,
+    for two reasons, both of which would show up as a job that says `ok`:
+
+    * phase 1 drops the shared cursor, so the phase 2 after it replays the whole file
+      — one url would drag every other source waiting for acceptance into the graph
+      with it, and `limit=1` would ingest the corpus's first source instead of this one.
+    * `phase1` names a dead source in its report and returns a count. For a batch of 84
+      that is the right granularity; for one url it is a success over an empty lake.
+      `_one_source` raises, and the job carries the reason (`jobs._run`).
+
+    Returns the phase 2 report plus what this source cost in phase 1.
+    """
+    # BOTH canaries before the fetch (§6.1). The arbiter's is inside `phase2`, which
+    # for a corpus run is early enough — the staging file is in front of the operator
+    # either way. Here the same order would spend the whole fetch, parse, generalize
+    # and embed of an article before finding out that the 35B server is down.
+    llm.assert_grammar_works(llm.QWEN_9B)
+    llm.assert_grammar_works(llm.QWEN_35B)
+    from . import fetch, generalize, parse
+
+    name = entry.get("arxiv_id") or entry.get("url")
+    staging_path = Path(staging_path)
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
+    # The whole file, not just this source's lines. Re-fetching a url is routine and
+    # `_one_source` would only drop the lines of the id the arXiv API resolves to NOW;
+    # a group left by an earlier version of the same article would survive, and phase 2
+    # takes the file whole — one url would report `sources_processed: 2`. The cursor
+    # goes with it: it counts lines that are about to be rewritten.
+    staging_path.unlink(missing_ok=True)
+    _cursor_path(staging_path).unlink(missing_ok=True)
+    lines, leaks, dropped = _one_source(entry, fetch, parse, generalize, staging_path)
+    if not lines:
+        # An article the parser found no technique in. Fail-closed: a 0-line staging
+        # file makes phase 2 a no-op, and the job would report `ok` with every number
+        # at zero — indistinguishable from an article that was already in the lake.
+        raise ValueError(f"{name}: parse extracted no theses, nothing to ingest")
+    report = phase2(staging_path)
+    if report["theses_written"] == 0 and report["theses_refused"]:
+        # The other way this ends with an unchanged lake, and the one that looks most
+        # like success: the arbiter refused every thesis, so each is in `pending_link`
+        # and none is in the graph (§4.5). The counters alone cannot say so — a clean
+        # replay of an article already in the lake reports `theses_written: 0` too.
+        raise RuntimeError(
+            f"{name}: the linking arbiter refused all {report['theses_refused']} of "
+            f"{lines} theses, every one of them is queued in pending_link and nothing "
+            "reached the graph; re-post the url once the 35B server answers again")
+    # Ingested, so the staging file has nothing left to say — the graph is the record
+    # now. Kept only on failure, and that is what makes the directory readable: what
+    # sits in `data/fetch/` is exactly the articles that did NOT make it, and no ops
+    # view lists them (`/ingest/staging` reads the corpus file alone).
+    staging_path.unlink(missing_ok=True)
+    _cursor_path(staging_path).unlink(missing_ok=True)
+    return {**report, "staging_lines": lines, "leakage": leaks, "theses_dropped": dropped}
 
 
 def _report(processed: list[dict], generalize, cursor: int) -> dict:
@@ -427,9 +509,12 @@ def selfcheck() -> None:
 
     install(f"{root}.embed", embed_docs=embed_docs)
 
-    levers = {"s1-S1": ["0", "1"], "s1-S2": ["0", "1"], "s2-S1": ["0", "0"]}
+    # s3 is never in the phase 1 corpus below: it is what /fetch ingests on its own.
+    levers = {"s1-S1": ["0", "1"], "s1-S2": ["0", "1"], "s2-S1": ["0", "0"],
+              "s3-S1": ["2", "2"]}
     fixtures = {}
-    for tag, kind, ids in (("s1", "paper", ["s1-S1", "s1-S2"]), ("s2", "run", ["s2-S1"])):
+    for tag, kind, ids in (("s1", "paper", ["s1-S1", "s1-S2"]), ("s2", "run", ["s2-S1"]),
+                           ("s3", "paper", ["s3-S1"]), ("s4", "paper", ["s4-S1"])):
         url = f"https://arxiv.org/abs/{tag}"
         src = Source(id=make_source_id(url, "v1"), url=url, title=f"Paper {tag}", type=kind,
                      version="v1", retrieved_at="2026-07-28T10:00:00Z",
@@ -615,6 +700,72 @@ def selfcheck() -> None:
             assert again["leakage_share"] == 0.333, again
             assert index.count(db=idx) == 6
             print("ok: replay of the whole staging — 6 skipped, 0 new theses, 0 new ideas")
+
+            # --- /fetch: one source, own staging, corpus untouched -----------
+            corpus_before = STAGING.read_text(encoding="utf-8")
+            corpus_cursor = _read_cursor(cursor_path)
+            fetch_staging = Path(tmp) / "fetch" / "s3.jsonl"
+            one = ingest_one({"arxiv_id": "s3", "type": "paper"}, fetch_staging)
+            assert one["staging_lines"] == 2 and one["sources_processed"] == 1, one
+            assert one["theses_written"] == 2 and one["theses_skipped"] == 0, one
+            assert one["theses_refused"] == 0, one
+            assert one["theses"] == 8 and one["ideas"] == 3, one     # 6 + 2, a new lever
+            assert index.count(db=idx) == 8, index.count(db=idx)
+            # Ingested, so nothing is left behind: what stays in the directory is the
+            # articles that did NOT make it, and no ops view lists them.
+            assert not fetch_staging.exists() and not _cursor_path(fetch_staging).exists()
+            # The corpus staging is the acceptance point of §4.7 and /fetch is a
+            # different job: sharing the file would replay it and drag every source
+            # waiting for acceptance into the graph.
+            assert STAGING.read_text(encoding="utf-8") == corpus_before, "corpus staging moved"
+            assert _read_cursor(cursor_path) == corpus_cursor == 6, "the corpus cursor moved"
+            print("ok: /fetch — 1 source, 2 leaves, own staging and cursor, corpus file "
+                  "byte-identical")
+
+            # The same url twice is the normal case (a re-fetch), and it must not
+            # double the leaves: same Source.id, link step [0] skips what is stored.
+            again_one = ingest_one({"arxiv_id": "s3", "type": "paper"}, fetch_staging)
+            assert again_one["theses_written"] == 0 and again_one["theses_skipped"] == 2, again_one
+            assert again_one["theses_refused"] == 0, again_one
+            assert again_one["theses"] == 8 and again_one["ideas"] == 3, again_one
+            assert index.count(db=idx) == 8
+
+            # Three ways this ends with an unchanged lake, and all three must raise —
+            # a job that returns a report says `ok`. `phase1` counts a dead source as a
+            # named loss and lives on, which for a batch of 84 is right and for one url
+            # is a success over an untouched graph.
+            #
+            # The third is the one that looks most like success: the arbiter refuses
+            # every thesis, so each is queued in `pending_link` and none is written,
+            # and the counters alone read exactly like the legal replay just above.
+            refusing = types.SimpleNamespace(link_batch=lambda source_id, rows: [
+                {"thesis": None, "idea": None, "skipped": True,
+                 "reason": "pending_link: LLMError: server said no"} for _ in rows])
+            fake_link = sys.modules[f"{__package__}.link"]
+            refused_staging = Path(tmp) / "fetch" / "s3-refused.jsonl"
+            for entry, exc_type, path, arbiter in (
+                    ({"arxiv_id": "missing", "type": "paper"}, KeyError,
+                     Path(tmp) / "fetch" / "missing.jsonl", fake_link),
+                    ({"arxiv_id": "s4", "type": "paper"}, ValueError,
+                     Path(tmp) / "fetch" / "s4.jsonl", fake_link),
+                    ({"arxiv_id": "s3", "type": "paper"}, RuntimeError,
+                     refused_staging, refusing)):
+                setattr(sys.modules[__package__], "link", arbiter)   # phase2 imports by name
+                try:
+                    ingest_one(entry, path)
+                except exc_type as exc:
+                    assert exc_type is not RuntimeError or (
+                        "pending_link" in str(exc) and "refused all 2" in str(exc)), exc
+                else:
+                    raise AssertionError(f"{entry} returned a report instead of raising")
+                finally:
+                    setattr(sys.modules[__package__], "link", fake_link)
+            assert len(graph_client.all_theses()) == 8, "a failed /fetch wrote to the graph"
+            # The refused article is still on disk with its lines: that IS the record of
+            # work waiting, and re-posting the url replays it.
+            assert len(refused_staging.read_text(encoding="utf-8").splitlines()) == 2
+            print("ok: /fetch — a replay writes nothing; a dead url, an empty parse and "
+                  "an arbiter that refused every thesis all raise instead of reporting ok")
 
             # --- fail-closed: the arbiter of re-derivation dies ---------------
             third = "third leaf for the cold idea"

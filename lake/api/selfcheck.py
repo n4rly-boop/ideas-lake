@@ -47,6 +47,12 @@ def _fingerprint() -> dict:
             for p in sorted(DATA.rglob("*")) if p.is_file()}
 
 
+def _fetch_dir() -> list[str] | None:
+    """What is in the real `data/fetch/` right now — `None` if it does not exist."""
+    fetch_dir = DATA / "fetch"
+    return sorted(p.name for p in fetch_dir.iterdir()) if fetch_dir.exists() else None
+
+
 def _vec(text: str) -> np.ndarray:
     """Deterministic unit vector per text — the fake encoder."""
     rng = np.random.default_rng(int(text_hash(text)[:8], 16))
@@ -127,8 +133,15 @@ def main() -> None:
     # which `run.py` holds as its own module-level constants and this file cannot
     # rebind from outside.
     real_phase1, real_phase2 = run_mod.phase1, run_mod.phase2
+    real_ingest_one = run_mod.ingest_one
     run_mod.phase1 = lambda entries, workers=8: _unexpected("phase1")
-    run_mod.phase2 = lambda limit=None: _unexpected("phase2")
+    # `staging_path` first and positional: `ingest_one` calls `phase2(staging_path)`,
+    # and a stub shaped `(limit=None)` would take a Path as the limit the day the real
+    # `ingest_one` is let into this check.
+    run_mod.phase2 = lambda staging_path=None, limit=None: _unexpected("phase2")
+    # /fetch runs BOTH phases in one job, so it is the one route that would fetch from
+    # arXiv and write `data/fetch/` if it slipped past the stubs.
+    run_mod.ingest_one = lambda entry, staging_path: _unexpected("ingest_one")
 
     leaked: list[str] = []
     try:
@@ -137,6 +150,7 @@ def main() -> None:
         for (module, name), value in saved.items():
             setattr(module, name, value)
         run_mod.phase1, run_mod.phase2 = real_phase1, real_phase2
+        run_mod.ingest_one = real_ingest_one
         if real_embed_mod is None:
             sys.modules.pop("lake.embed", None)
             delattr(sys.modules["lake"], "embed")
@@ -467,7 +481,7 @@ def _run(tmp: Path, idx: Path) -> None:
         # --- the single ingest slot ----------------------------------------
         gate = threading.Event()
 
-        def blocking(limit=None):
+        def blocking(staging_path=None, limit=None):
             assert gate.wait(10), "the job was never released"
             return {"sources_processed": 0}
 
@@ -478,6 +492,7 @@ def _run(tmp: Path, idx: Path) -> None:
         assert started.json()["status"] == "running" and started.json()["args"] == {"limit": 1}
         for busy in (client.post("/ingest/phase2"),
                      client.post("/ingest/phase1", json={"sources": [{"arxiv_id": "x", "type": "paper"}]}),
+                     client.post("/fetch", json={"url": "https://arxiv.org/abs/2406.04824"}),
                      client.post("/admin/reindex")):
             assert busy.status_code == 409, (busy.url, busy.status_code)
             assert job_id in busy.json()["error"], busy.text
@@ -521,6 +536,59 @@ def _run(tmp: Path, idx: Path) -> None:
              "group": "evo_search", "year": 2024}]})
         assert skipped.status_code == 202, skipped.text
         assert _await(client, skipped.json()["id"])["report"]["staging_lines"] == 1
+
+        # --- /fetch: one url, both phases ----------------------------------
+        fetch_dir_before = _fetch_dir()
+        # The same door as /ingest/phase1 and for the same reason: this route starts a
+        # fetch and minutes of LLM spend, so a link that is not an arXiv article is a
+        # 400 now, not a job that discovers it later.
+        for bad in ({"url": "https://openreview.net/forum?id=x"}, {"url": "not a url"},
+                    {"url": "https://arxiv.org/list/cs.LG/2406"}, {"url": ""},
+                    {"url": "https://arxiv.org.evil.com/abs/2406.04824"},
+                    # arXiv's own listing links carry these, and the anchored regex is
+                    # the only thing between them and a cache key: 400, not a 500 from
+                    # somewhere inside the fetch.
+                    {"url": "https://arxiv.org/abs/2406.04824?context=cs.LG"},
+                    {"url": "https://arxiv.org/abs/2406.04824#S3"},
+                    # Old-style ids look like arXiv links and cannot be fetched at all.
+                    {"url": "https://arxiv.org/abs/hep-th/9901001"},
+                    {"arxiv_id": "2406.04824"},          # only `url` is the contract
+                    {"url": "https://arxiv.org/abs/2406.04824", "type": "paper"}):
+            answer = client.post("/fetch", json=bad)
+            assert answer.status_code == 400, (bad, answer.status_code, answer.text)
+            assert set(answer.json()) == {"error"}, answer.text
+        assert "Old-style" in client.post(
+            "/fetch", json={"url": "https://arxiv.org/abs/hep-th/9901001"}).json()["error"]
+        assert jobs.running() is None, "a refused /fetch took the slot"
+
+        seen: dict = {}
+
+        def one(entry, staging_path):
+            seen.update(entry=entry, staging=Path(staging_path))
+            return {"sources_processed": 1, "theses_written": 2, "staging_lines": 2}
+
+        run_mod.ingest_one = one
+        fetched = client.post("/fetch", json={"url": "https://arxiv.org/pdf/2406.04824v2.pdf"})
+        assert fetched.status_code == 202, fetched.text
+        assert fetched.json()["kind"] == "fetch", fetched.text
+        assert fetched.json()["args"] == {"url": "https://arxiv.org/pdf/2406.04824v2.pdf",
+                                          "arxiv_id": "2406.04824v2"}, fetched.text
+        job = _await(client, fetched.json()["id"])
+        assert job["status"] == "ok" and job["report"]["theses_written"] == 2, job
+        # The version in the link is the version fetched: `Source.id = sha1(url + version)`,
+        # so dropping it would file v2's theses under v1's source (§4.8).
+        assert seen["entry"] == {"arxiv_id": "2406.04824v2", "type": "paper"}, seen
+        # Its own staging file, not the corpus one — sharing it would replay every
+        # source still waiting for acceptance (§4.7, `run.ingest_one`).
+        assert seen["staging"] == DATA / "fetch" / "2406.04824v2.jsonl", seen
+        assert seen["staging"] != ops.STAGING and seen["staging"].parent != DATA, seen
+        run_mod.ingest_one = lambda entry, staging_path: _unexpected("ingest_one")
+        # Not asserted as "data/fetch is empty": a real /fetch that failed leaves its
+        # article there on purpose, and this check would then fail over somebody else's
+        # run. Compared as a delta instead — the same shape as `_fingerprint`.
+        assert _fetch_dir() == fetch_dir_before, "the stubbed /fetch touched data/fetch"
+        print("ok: /fetch — a non-arXiv link is 400 at the door, the version survives, "
+              "the article gets its own staging file")
 
         # --- what sits between the phases ----------------------------------
         rows = [{"source": {"id": "s1", "title": "One"}}, {"source": {"id": "s1", "title": "One"}},

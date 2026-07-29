@@ -57,7 +57,7 @@ lake/
   retrieve/ rewrite search rank api        # api.py — ядро чтения, без транспорта
   api/     app routes schemas jobs selfcheck   # HTTP-слой на всё, единственный сервер
   prompts/{parse,generalize,link,rederive,rewrite}/system.txt
-  data/             # gitignored: raw/ cache/ traces/ logs/ staging.jsonl index.db lake.db
+  data/             # gitignored: raw/ cache/ traces/ logs/ fetch/ staging.jsonl index.db lake.db
 ```
 
 ---
@@ -89,12 +89,35 @@ lake/
     → курсор
 ```
 
+**`POST /fetch` — те же две фазы для одной ссылки, в одном задании.** Приёмка глазами —
+свойство корпусного прогона, а не пути записи: кто прислал ссылку, тот ждёт статью в графе.
+Статья получает собственный `data/fetch/{id}.jsonl` и собственный курсор — на общем файле
+фаза 1 сбросила бы корпусный курсор, и следом идущая фаза 2 залила бы в граф все источники,
+которые ещё ждут приёмки. Слот, арбитр, `pending_link` и триггер пере-вывода — те же.
+Повторный `POST` той же ссылки идемпотентен: тот же `Source.id`, шаг [0] пропускает
+записанные листья.
+
+**Три способа кончить неизменившимся озером — все три `status: failed` с причиной, не `ok`:**
+мёртвая ссылка; статья, из которой парсер не достал ни тезиса; арбитр линковки, отказавший
+на **всех** тезисах (тогда каждый лежит в `pending_link`, в графе нет ничего). Третий отличим
+от легального повтора только потому, что отчёт фазы 2 считает отказы арбитра отдельно от
+дублей — `theses_refused` против `theses_skipped`; одним счётчиком эти два случая
+неразличимы побайтно. Канарейки **обеих** моделей — до фетча, чтобы мёртвый 35B не стоил
+полного разбора статьи.
+
+Свой `data/fetch/{id}.jsonl` удаляется после успешного залива: в каталоге остаются ровно те
+статьи, которые не доехали, — ни `/ingest/staging`, ни `/stats` их не показывают, они читают
+только корпусный файл.
+
 Порога косинуса на линковке **нет** — решает всегда арбитр, «дубля нет» говорит сентинелом `-1` (§0.6).
 Батч-оверлей — условие корректности, а не оптимизация: без него тезис №2 не видит идею,
 созданную тезисом №1, и одна статья заводит два дубля под один механизм (§0.1.13, `link.py`).
 
 Отчёт фазы 2: источники, тезисы, идеи, доля идей с ≥2 источниками, длина `pending_link`,
 доля утечек, **число идей без листьев (обязано быть 0)**, токены и время из трейсов.
+Пропуски разведены на два числа: `theses_skipped` — дубль, лист уже в озере;
+`theses_refused` — арбитр отказал, лист нигде и ждёт в `pending_link`. Это противоположные
+исходы, и одним счётчиком они читаются одинаково.
 
 ---
 
@@ -140,6 +163,7 @@ POST /retrieve
 | `PATCH /ideas/{id}` | правка полей. Меняешь `text` — сервер пересчитывает вектор (§1.3), порознь нельзя |
 | `GET /ideas/{id}/theses`, `/neighbors` | листья и рёбра. Рёбра пусты: это блок B |
 | `GET /theses?idea_id&source_id`, `GET /theses/{id}` | листья постранично |
+| `POST /fetch` | одна статья arXiv по ссылке: обе фазы в одном задании, `202` + задание. В теле только `url` (`/abs/`, `/pdf/`, `/html/`, версия уважается). Не-arXiv ссылка → `400` на входе, до фетча и трат на LLM; **старый формат id** (`hep-th/9901001`) тоже `400` и с указанием причины: `fetch_metadata` теряет класс архива, и все три пути фетча отвечают 404. Свой `data/fetch/{id}.jsonl`: корпусный файл приёмки не трогается |
 | `POST /ingest/phase1`, `POST /ingest/phase2` | `202` + задание; слот один на процесс, второй запуск → `409` |
 | `GET /ingest/jobs`, `/jobs/{id}` | статус задания: `running` \| `ok` + отчёт \| `failed` + текст ошибки |
 | `GET /ingest/staging` | что лежит между фазами: строк, курсор, разбивка по источникам |
@@ -231,7 +255,10 @@ ingest.generalize.generalize(draft) -> IdeaFields
 ingest.generalize.leakage(draft, out) -> list[str]     # пусто = утечки конкретики нет
 ingest.link.link_batch(source_id, rows) -> list[dict]
 ingest.rederive.maybe_rederive(idea_id) -> bool
-ingest.run.phase1(entries, workers=8) -> int ; ingest.run.phase2(staging_path, limit=None) -> dict
+ingest.fetch.arxiv_id_from_url(url) -> str             # ссылка arXiv → id, иначе FetchError
+ingest.run.phase1(entries, workers=8) -> int
+ingest.run.phase2(staging_path, limit=None) -> dict
+ingest.run.ingest_one(entry, staging_path) -> dict     # /fetch: обе фазы, один источник, свой staging
 
 # read path
 retrieve.rewrite.rewrite(query, budget=None) -> (query, failed)
