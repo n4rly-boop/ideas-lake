@@ -3,7 +3,7 @@ the vault export of §11.6, which the spec asks for in the same shape, and the s
 of the Neo4j load (C1, `07-roles-and-contracts.md:72`).
 
     python3 -m lake.selfcheck             # 6.1 talks to both school servers
-    python3 -m lake.selfcheck --offline   # 21 of 22, no network, no key in the env
+    python3 -m lake.selfcheck --offline   # 24 of 25, no network, no key in the env
 
 Only `assert`, no framework. Every check gets its own temporary directory and the
 writers are pointed at it: the real `data/lake.db`, `data/index.db`,
@@ -30,6 +30,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import threading
 import traceback
 import types
 import uuid
@@ -37,7 +38,9 @@ from pathlib import Path
 
 import numpy as np
 
-from . import graph_client, index, llm, neo4j_load, stub_store, trace, vault
+from . import (graph_client, index, llm, neo4j_load, queue, stub_store, trace, vault,
+               writer_lock)
+from .api import jobs, workers
 from .ingest import link, parse, rederive, run, split
 from .models import (CACHE_DIR, EMBED_DIM, GENERALIZE_SCHEMA, PARSE_SCHEMA,
                      SCHEMA_BINDINGS, DraftThesis, Idea, Section, Source, Thesis,
@@ -926,6 +929,392 @@ def check_23(tmp: Path) -> str:
             "sweep runs before §4.6; a failed split still reports the true ceiling")
 
 
+@check(24, "durable queue + writer: enqueue -> fetch_step -> staged -> write_step -> ok "
+           "with both phases in the report; exactly one phase-2 writer at a time, the "
+           "busy one loses no attempt; MAX_ATTEMPTS gives up on a transient failure and "
+           "one attempt on a permanent one; phase 2 refuses to run beside another process")
+def check_24(tmp: Path) -> str:
+    # The real workers.fetch_step/write_step, not copies. Only what they reach for is
+    # redirected: the queue's own db, the per-job staging directory, phase 1 (network
+    # and the 9B/35B models), and — inside phase 2 — the store, the index and the
+    # arbiter, the same way `_phase2` binds them for `run.phase2` above.
+    idx = _open(tmp)
+    fake, _ = _arbiter([])            # one leaf, no candidates: zero arbiter calls
+
+    def fixture_stage_one(entry: dict, staging_path) -> dict:
+        """Phase 1, faked: one staging line, no fetch, no parser, no LLM call."""
+        staging_path = Path(staging_path)
+        staging_path.parent.mkdir(parents=True, exist_ok=True)
+        rows = [_row("s1", "freezing the encoder before finetuning keeps 3.1 pp of "
+                          "accuracy", FREEZE)]
+        staging_path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                        for r in rows), encoding="utf-8")
+        return {"staging_lines": len(rows), "leakage": 0, "theses_dropped": 0,
+                "source": entry["arxiv_id"]}
+
+    jobs._reset_for_tests()
+    try:
+        with contextlib.ExitStack() as stack:
+            stack.callback(queue.close)
+            stack.enter_context(_swap(queue, "DB", tmp / "jobs.db"))
+            stack.enter_context(_swap(workers, "FETCH_DIR", tmp / "fetch"))
+            stack.enter_context(_swap(run, "stage_one", fixture_stage_one))
+            stack.enter_context(_swap(llm, "complete", fake))
+            stack.enter_context(_swap(llm, "assert_grammar_works", lambda model: None))
+            stack.enter_context(_swap(index, "index_theses",
+                                      functools.partial(index.index_theses, db=idx)))
+            stack.enter_context(_swap(index, "has", functools.partial(index.has, db=idx)))
+            stack.enter_context(_swap(index, "index_rows",
+                                      functools.partial(index.index_rows, db=idx)))
+            stack.enter_context(_swap(index, "stale_links",
+                                      functools.partial(index.stale_links, db=idx)))
+            stack.enter_context(_swap(index, "reconcile",
+                                      functools.partial(index.reconcile, db=idx)))
+            stack.enter_context(_swap(link, "link_batch",
+                                      functools.partial(link.link_batch, index_db=idx,
+                                                        pending_path=tmp / "pending_link.jsonl")))
+
+            # --- 1. the full path: queued -> staged -> ok, with a real report -------
+            job = queue.enqueue("fetch", {"arxiv_id": "s1"})
+            assert job["status"] == "queued" and job["attempts"] == 0, job
+            assert workers.fetch_step() is True, "one queued job must be taken"
+            staged = queue.get(job["id"])
+            assert staged["status"] == "staged", staged
+            assert staged["report"]["staging_lines"] == 1, staged["report"]
+            assert workers.write_step() is True, "one staged job must be taken"
+            done = queue.get(job["id"])
+            assert done["status"] == "ok", done
+            assert done["report"], "an ok job must carry a non-empty report"
+            assert done["report"]["theses_written"] == 1, done["report"]
+            # One claim, not two: `stage()` resets the counter, because the two phases
+            # are two pieces of work and an article that needed a second fetch would
+            # otherwise enter the writer's queue with one life left.
+            assert done["attempts"] == 1, done
+            # What phase 1 measured survives into the final report, and the cost is both
+            # halves summed. Dropping either one reports the linking as the whole article.
+            assert done["report"]["leakage"] == 0 and done["report"]["theses_dropped"] == 0, \
+                done["report"]
+            assert set(done["report"]["cost"]) == {"tokens_in", "tokens_out", "wall_ms"}, \
+                done["report"]["cost"]
+            assert index.count(db=idx) == 1, index.count(db=idx)
+            assert len(graph_client.all_theses()) == 1, graph_client.all_theses()
+
+            # --- 2. exactly one writer: the slot is held, the second write_step must
+            #        not enter phase 2, and the job it holds must not lose an attempt.
+            job2 = queue.enqueue("fetch", {"arxiv_id": "s5"})
+            assert workers.fetch_step() is True
+            before = queue.get(job2["id"])
+            assert before["status"] == "staged", before
+            with jobs.exclusive("fetch", {"who": "selfcheck"}):
+                took = workers.write_step()
+            assert took is False, "a busy phase-2 slot is not work done"
+            after = queue.get(job2["id"])
+            assert after["status"] == "staged", \
+                "a busy writer must put the job back to staged, not leave it running"
+            assert after["attempts"] == before["attempts"] == 0, \
+                "release() must not spend the attempt of a job that was never run"
+            assert after["stage"] == "phase1", \
+                "a released job must not keep the stage it was claimed for"
+            assert index.count(db=idx) == 1, "the busy writer must not have touched the graph"
+
+            # --- 3. a TRANSIENT phase-2 failure is retried, MAX_ATTEMPTS gives up ----
+            def boom_drain(staging_path, staged=None):
+                raise RuntimeError("boom: phase 2 exploded")
+
+            for expected in range(1, queue.MAX_ATTEMPTS):
+                with _swap(run, "drain_one", boom_drain):
+                    assert workers.write_step() is True
+                once = queue.get(job2["id"])
+                assert once["status"] == "staged", \
+                    "a failed phase 2 must return the job to staged, not lose it"
+                assert "boom" in (once["error"] or ""), once
+                assert once["attempts"] == expected, once    # retried, not given up
+
+            with _swap(run, "drain_one", boom_drain):
+                assert workers.write_step() is True
+            failed = queue.get(job2["id"])
+            assert failed["status"] == "failed", failed
+            assert failed["attempts"] == queue.MAX_ATTEMPTS, failed
+            assert "giving up" in failed["error"], failed["error"]
+            # A failed job is not queued work any more: claim() must not hand it out.
+            assert queue.claim("staged", "phase2") is None, \
+                "a failed job is still claimable — it disappeared without a trace"
+
+            # --- 3a. the terminal write itself fails (a full disk, a read-only mount).
+            #         The graph is already written at that point, so a job left `running`
+            #         says "in progress" forever and comes back from the next restart as
+            #         `failed` — for work that succeeded.
+            job_fin = queue.enqueue("fetch", {"arxiv_id": "s5b"})
+            assert workers.fetch_step() is True
+            calls: list[int] = []
+
+            def finish_once(*args, **kwargs):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise sqlite3.OperationalError("attempt to write a readonly database")
+                return queue_finish(*args, **kwargs)
+
+            queue_finish = queue.finish
+            with _swap(queue, "finish", finish_once):
+                assert workers.write_step() is True
+            after_fin = queue.get(job_fin["id"])
+            assert after_fin["status"] != "running", \
+                "a failed finish() left the job running: the article is in the lake and " \
+                "the row says work in progress until the process restarts"
+            # Terminal, and the message carries both facts. Not put back to `staged`:
+            # the staging file is gone, so a replay would burn three attempts on a
+            # missing file and blame that instead.
+            assert after_fin["status"] == "failed", after_fin
+            assert "the graph has this article" in after_fin["error"], after_fin
+            assert "readonly" in after_fin["error"], after_fin
+            assert len(calls) == 2, calls        # the failed write, then the honest one
+            # Phase 2 really did finish: `drain_one` deletes the staging file only after
+            # the ingest went through, and that deletion is why the row must not be put
+            # back as retryable work.
+            assert not (tmp / "fetch" / "s5b.jsonl").exists(), \
+                "phase 2 did not complete, so this proves nothing about a failed finish()"
+
+            # --- 3b. a PERMANENT failure fails once. Three fetch/parse rounds to
+            #         relearn "this article has no HTML" cost the pool three rounds and
+            #         bury the reason under "attempt 3 of 3".
+            from .ingest.fetch import FetchError
+
+            def dead_source(entry, staging_path):
+                raise FetchError(f"{entry['arxiv_id']}: no sections anywhere")
+
+            job3 = queue.enqueue("fetch", {"arxiv_id": "s6"})
+            with _swap(run, "stage_one", dead_source):
+                assert workers.fetch_step() is True
+            dead = queue.get(job3["id"])
+            assert dead["status"] == "failed", dead
+            assert dead["attempts"] == 1, f"a permanent error burned {dead['attempts']} attempts"
+            assert "permanent" in dead["error"] and "no sections" in dead["error"], dead
+            # --- 3d. the arbiter refuses every thesis, and the RETRY must not read as ok
+            # Attempt 1 raises: every thesis is in `pending_link` and the graph has
+            # nothing. But it also advanced the cursor over the whole group, so attempt 2
+            # processes no group at all and every counter is zero — which a guard reading
+            # this run's counters called success: staging file deleted, job `ok`, article
+            # nowhere. The store is what decides now.
+            def refusing(source_id, rows):
+                return [{"thesis": None, "idea": None, "skipped": True,
+                         "reason": "pending_link: LLMError: server said no"} for _ in rows]
+
+            def stage_s3(entry, staging_path) -> dict:
+                staging_path = Path(staging_path)
+                staging_path.parent.mkdir(parents=True, exist_ok=True)
+                row = _row("s3", "a replication run reproduces the 3.1 pp gain", FREEZE)
+                staging_path.write_text(json.dumps(row, ensure_ascii=False) + "\n",
+                                        encoding="utf-8")
+                return {"staging_lines": 1, "leakage": 0, "theses_dropped": 0,
+                        "source": entry["arxiv_id"]}
+
+            job_ref = queue.enqueue("fetch", {"arxiv_id": "s3ref"})
+            with _swap(link, "link_batch", refusing), _swap(run, "stage_one", stage_s3):
+                assert workers.fetch_step() is True
+                # Attempt 1 is caught by this run's counters ("refused all 1 of 1");
+                # attempt 2 has none — the cursor is spent, so it processes no group and
+                # every counter is zero — and only the store can still say no.
+                for attempt, expected in ((1, "refused all 1 of 1"),
+                                          (2, "no leaf for this source")):
+                    assert workers.write_step() is True
+                    row = queue.get(job_ref["id"])
+                    assert row["status"] != "ok", (
+                        f"attempt {attempt} answered ok for an article whose every thesis "
+                        f"the arbiter refused: {row}")
+                    assert expected in (row["error"] or ""), (attempt, row)
+            assert graph_client.count_theses(source_id=_sid("s3")) == 0, \
+                "a refused thesis reached the graph"
+            assert (tmp / "fetch" / "s3ref.jsonl").exists(), \
+                "the staging file of a refused article was deleted — that work is the " \
+                "only record of it and re-posting the url is what replays it"
+
+    finally:
+        jobs._reset_for_tests()
+
+    # --- 3c. zero work must not read as success, and cost is both halves -------------
+    empty = tmp / "fetch" / "empty.jsonl"
+    empty.parent.mkdir(parents=True, exist_ok=True)
+    empty.write_text("", encoding="utf-8")
+    try:
+        run.drain_one(empty)
+    except RuntimeError as exc:
+        assert "no staging lines" in str(exc), exc
+    else:
+        raise AssertionError("an empty staging file went through phase 2 and reported ok")
+    # Summed, not overwritten: the writer's counter starts at zero, so the phase-1 half
+    # (fetch, parse, generalize, embed) is the whole cost of an article minus the linking.
+    assert workers._merge_cost({"tokens_in": 3, "tokens_out": 4, "wall_ms": 1.5},
+                               {"tokens_in": 2, "tokens_out": 0, "wall_ms": 0.5}) == \
+        {"tokens_in": 5, "tokens_out": 4, "wall_ms": 2.0}, "phase 1 cost was dropped"
+
+    # --- 4. the writer lock is on the phase-2 PATH, and another process is refused ---
+    # In-process re-entry cannot prove this: `flock` is per open file description, so a
+    # second `open()` here is refused exactly like a neighbour would be — and the writer
+    # thread itself nests `phase2` inside a lock this process already holds. So: assert
+    # the lock is held when phase 2 runs, then let a real second process hold it.
+    import subprocess
+
+    seen_depth: list[int] = []
+    with _swap(writer_lock, "LOCK_PATH", tmp / "writer.lock"), \
+            _swap(run, "_phase2", lambda staging_path, limit: seen_depth.append(
+                writer_lock.depth()) or {"theses_written": 0}):
+        run.phase2(tmp / "nothing.jsonl")
+        assert seen_depth == [1], f"phase 2 ran outside the writer lock: {seen_depth}"
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl, sys\n"
+             "fh = open(sys.argv[1], 'a+')\n"
+             "fcntl.flock(fh.fileno(), fcntl.LOCK_EX)\n"
+             "print('held', flush=True)\n"
+             "sys.stdin.readline()\n", str(tmp / "writer.lock")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held", "the holder never locked"
+            try:
+                run.phase2(tmp / "nothing.jsonl")
+            except writer_lock.SecondWriter:
+                pass
+            else:
+                raise AssertionError("phase 2 ran while another PROCESS held the writer "
+                                     "lock — §4.5 says one writer per lake")
+            assert seen_depth == [1], "the refused run reached the body anyway"
+        finally:
+            holder.stdin.close()
+            holder.wait(timeout=30)
+
+    return ("enqueue -> fetch_step -> staged -> write_step -> ok with both phases in the "
+            "report and cost; a busy writer keeps the attempt and drops the stage; "
+            f"{queue.MAX_ATTEMPTS} transient failures give up, one permanent failure is "
+            "final; phase 2 runs under the writer lock and refuses a second process")
+
+
+@check(25, "the threads are really started and really loop: start() takes the writer "
+           "lock BEFORE it recovers, a queued article goes to ok with nobody driving "
+           "the steps, alive() answers for the threads that exist, and stop() keeps the "
+           "lock while the writer is still inside phase 2")
+def check_25(tmp: Path) -> str:
+    # Check 24 drives `fetch_step`/`write_step` by hand, which leaves the whole
+    # lifecycle — `start`, `stop`, `_loop`, `alive` — unexercised: `if False:` around
+    # the thread creation kept every check in this suite green. Here nothing is driven;
+    # the threads have to do it. Phase 1 and phase 2 are both faked, so this check is
+    # about the machinery and never opens the graph.
+    import subprocess
+    import time
+
+    done: list[str] = []
+    gate = threading.Event()
+    gate.set()
+
+    def fake_stage_one(entry: dict, staging_path) -> dict:
+        return {"staging_lines": 1, "leakage": 0, "theses_dropped": 0,
+                "source": entry["arxiv_id"]}
+
+    def fake_drain_one(staging_path, staged=None) -> dict:
+        assert gate.wait(30), "the writer was never let out of phase 2"
+        done.append(str(staging_path))
+        return {"sources_processed": 1, "theses_written": 1, "staging_lines": 1}
+
+    def wait_for(what, deadline: float = 20.0):
+        """Poll instead of sleeping a fixed time: a wrong guess is either a flaky check
+        or a slow one, and both are worse than a condition."""
+        until = time.monotonic() + deadline
+        while time.monotonic() < until:
+            value = what()
+            if value:
+                return value
+            time.sleep(0.05)
+        return None
+
+    jobs._reset_for_tests()
+    try:
+        with contextlib.ExitStack() as stack:
+            stack.callback(queue.close)
+            stack.callback(lambda: workers.stop(timeout=10))
+            stack.enter_context(_swap(queue, "DB", tmp / "jobs.db"))
+            stack.enter_context(_swap(workers, "FETCH_DIR", tmp / "fetch"))
+            stack.enter_context(_swap(workers, "POLL_S", 0.05))
+            stack.enter_context(_swap(writer_lock, "LOCK_PATH", tmp / "writer.lock"))
+            stack.enter_context(_swap(run, "stage_one", fake_stage_one))
+            stack.enter_context(_swap(run, "drain_one", fake_drain_one))
+
+            # --- 1. the order inside start(): the lock, and only then the queue -------
+            # `recover()` declares every `running` row dead. A second process doing that
+            # before it asks for the lock requeues the jobs the FIRST one is running —
+            # the same article ingested twice, and the duplicate is refused a lock it
+            # should have taken before touching anything.
+            mid_flight = queue.enqueue("fetch", {"arxiv_id": "s7"})
+            assert queue.claim("queued", "phase1")["id"] == mid_flight["id"]
+            holder = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl, sys\n"
+                 "fh = open(sys.argv[1], 'a+')\n"
+                 "fcntl.flock(fh.fileno(), fcntl.LOCK_EX)\n"
+                 "print('held', flush=True)\n"
+                 "sys.stdin.readline()\n", str(tmp / "writer.lock")],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                assert holder.stdout.readline().strip() == "held", "the holder never locked"
+                try:
+                    workers.start(fetch_workers=1)
+                except workers.SecondWriter:
+                    pass
+                else:
+                    raise AssertionError("start() came up beside another writer")
+                assert queue.get(mid_flight["id"])["status"] == "running", \
+                    "recover() ran before the lock was taken: a refused process requeued " \
+                    "work that the process holding the lock is running right now"
+                assert workers.alive() == {}, "the refused start left threads behind"
+            finally:
+                holder.stdin.close()
+                holder.wait(timeout=30)
+
+            # --- 2. now it starts, and recovery happens because the lock is ours ------
+            started = workers.start(fetch_workers=1)
+            assert sorted(started["threads"]) == ["fetch0", "writer"], started
+            assert started["recovered"]["queued"] == 1, started
+            assert workers.alive() == {"writer": True, "fetch0": True}, workers.alive()
+
+            # --- 3. the loops do the work: nothing below drives a step ---------------
+            queue.enqueue("fetch", {"arxiv_id": "s8"})
+            counts = wait_for(lambda: queue.counts()["ok"] == 2 and queue.counts())
+            assert counts, f"the threads never drained the queue: {queue.counts()}"
+            assert len(done) == 2, done
+            assert {Path(p).name for p in done} == {"s7.jsonl", "s8.jsonl"}, done
+            assert Path(done[0]).parent == tmp / "fetch", done
+
+            # --- 4. stop() while the writer is inside phase 2 ------------------------
+            gate.clear()
+            queue.enqueue("fetch", {"arxiv_id": "s9"})
+            # By STAGE, not by `running`: `counts()` counts a status, and the few
+            # microseconds s9 spends claimed by the fetch worker are `running` too. Waiting
+            # on that let `stop()` fire before the writer was inside phase 2, and the check
+            # then failed on the unmutated code about half the time — a check that is red
+            # for its own reasons cannot say anything about the guard it is aimed at.
+            assert wait_for(lambda: len(done) == 2 and any(
+                row["status"] == "running" and row["stage"] == "phase2"
+                for row in queue.listing())), \
+                f"the writer never entered phase 2: {queue.listing()[:3]}"
+            workers.stop(timeout=0.2)
+            assert workers.alive().get("writer") is True, \
+                "stop() dropped a writer that is still linking from alive(): /healthz " \
+                "then reports a stall for a live ingest"
+            assert writer_lock.depth() == 1, \
+                "stop() released the writer lock while the writer was still in phase 2 " \
+                "— the next process would come up as a second writer (§4.5)"
+            gate.set()
+            assert wait_for(lambda: not any(workers.alive().values())), \
+                f"the writer never finished after the gate opened: {workers.alive()}"
+            workers.stop(timeout=10)
+            assert writer_lock.depth() == 0, "the lock outlived the writer"
+            assert queue.get(queue.listing()[0]["id"])["status"] == "ok", queue.listing()[0]
+    finally:
+        jobs._reset_for_tests()
+
+    return ("a refused start() moves no row and starts no thread; the started pool takes "
+            "2 articles to ok on its own; alive() answers for both threads; stop() keeps "
+            "the lock and the writer visible until phase 2 ends")
+
+
 def _rederive_would_fire(idea_id: str, threshold: int = 3) -> bool:
     body = graph_client.get_ideas([idea_id])[0]
     return len(body["theses"]) - body["rederived_at_leaf_count"] >= threshold
@@ -938,8 +1327,13 @@ def _fingerprint_real_data() -> dict[str, str]:
     import hashlib
     from .models import DATA
     out = {}
+    # `jobs.db` and `writer.lock` are in the list for the same reason as the rest: a
+    # check that reached the module default instead of its bound temp path would enqueue
+    # fixture jobs into the operator's real queue, or take the lock the running API
+    # holds — and neither shows up as a failure anywhere else.
     for path in (DATA / "lake.db", DATA / "index.db", DATA / "staging.jsonl",
                  DATA / "staging.cursor", DATA / "pending_link.jsonl",
+                 DATA / "jobs.db", DATA / "writer.lock",
                  DATA / "logs" / "retrieve.jsonl"):
         out[path.name] = (hashlib.sha1(path.read_bytes()).hexdigest()
                           if path.exists() else "absent")
@@ -954,7 +1348,7 @@ def main(argv=None) -> int:
                     "one run, only assert.")
     parser.add_argument("--offline", action="store_true",
                         help="skip 6.1, the only check that opens a socket; the other "
-                             "21 need neither the network nor a key")
+                             "24 need neither the network nor a key")
     args = parser.parse_args(argv)
 
     trace.set_run_id("selfcheck-" + uuid.uuid4().hex[:6])
@@ -967,7 +1361,11 @@ def main(argv=None) -> int:
     guarded = _fingerprint_real_data()
     with tempfile.TemporaryDirectory(prefix="lake-selfcheck-") as root:
         # Traces of the check itself do not belong in data/traces with the real runs.
-        with _swap(trace, "TRACES_DIR", Path(root) / "traces"), _fake_embed():
+        # The writer lock goes to the temp dir for the whole suite and not per check:
+        # `run.phase2` takes it now (§4.5), so ANY check that reaches phase 2 would
+        # otherwise create `data/writer.lock` — and be refused by a live API that holds it.
+        with _swap(trace, "TRACES_DIR", Path(root) / "traces"), \
+                _swap(writer_lock, "LOCK_PATH", Path(root) / "writer.lock"), _fake_embed():
             for number, what, fn in CHECKS:
                 if number == 1 and args.offline:
                     skipped.append(number)

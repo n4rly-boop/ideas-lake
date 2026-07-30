@@ -28,6 +28,7 @@ PENDING_LINK = DATA / "pending_link.jsonl"
 INDEX_DB = DATA / "index.db"
 LAKE_DB = DATA / "lake.db"
 FETCH_DIR = DATA / "fetch"      # one staging file per single-url ingest, see run.ingest_one
+JOBS_DB = DATA / "jobs.db"      # the durable job queue, see queue.py — not format B
 RAW_DIR = DATA / "raw"
 CACHE_DIR = DATA / "cache"
 TRACES_DIR = DATA / "traces"

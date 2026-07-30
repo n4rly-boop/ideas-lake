@@ -169,24 +169,50 @@ def reindex() -> dict:
 def health() -> dict:
     """Liveness plus the one invariant that rots silently. Never raises: a health
     check that dies tells the caller less than one that says what is wrong."""
+    from . import queue
+    from .api import workers
     try:
         leaves = graph_client.counts()["theses"]
         indexed = index.count()
+        pending = queue.counts()
     except Exception as exc:
         return {"status": "degraded", "detail": f"{type(exc).__name__}: {exc}"}
-    ok = indexed == leaves
+    threads = workers.alive()
+    # A dead worker is invisible from every other angle: the queue keeps accepting, every
+    # job keeps its status, and nothing moves. Both halves can die on their own — a dead
+    # writer strands `staged` articles that are already parsed, a dead fetch pool strands
+    # `queued` ones that were never touched — and each is silent in the other's numbers.
+    # Only work actually waiting makes it degraded: a healthz that fails on an idle lake
+    # with no threads (the CLI, a self-check, `--mock`) would cry wolf.
+    stalled = []
+    if pending["staged"] and not threads.get("writer", False):
+        stalled.append(f"{pending['staged']} article(s) parsed and waiting while the "
+                       "phase-2 writer thread is not alive — nothing will reach the "
+                       "graph until the process restarts")
+    if pending["queued"] and not any(alive for name, alive in threads.items()
+                                     if name.startswith("fetch")):
+        stalled.append(f"{pending['queued']} article(s) queued while no fetch worker is "
+                       "alive — nothing will be parsed until the process restarts")
+    ok = indexed == leaves and not stalled
+    detail = None
+    if stalled:
+        detail = "; ".join(stalled)
+    elif indexed != leaves:
+        detail = "index and store disagree — POST /admin/reindex (§6.19)"
     return {"status": "ok" if ok else "degraded", "theses_indexed": indexed,
-            "leaves_in_store": leaves, "in_sync": ok,
-            "detail": None if ok else "index and store disagree — POST /admin/reindex (§6.19)"}
+            "leaves_in_store": leaves, "in_sync": indexed == leaves, "detail": detail}
 
 
 def stats() -> dict:
     """The §4.7 numbers over the whole lake. Raises `Broken` on a corrupt cursor:
     a number that cannot be computed is absent, never guessed."""
+    from . import queue
+    from .api import workers
     counts = graph_client.counts()
     indexed = index.count()
     running = jobs.running()
-    return {**counts, "theses_indexed": indexed,
+    return {**counts, "queue": queue.counts(), "workers": workers.alive(),
+            "theses_indexed": indexed,
             "in_sync": indexed == counts["theses"],
             "ideas_without_leaves": graph_client.ideas_without_leaves(),
             "trust_scale": graph_client.trust_scale(),

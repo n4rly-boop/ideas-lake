@@ -351,21 +351,43 @@ class Phase2Request(BaseModel):
 
 
 class JobOut(BaseModel):
-    """One ingest run. Jobs live in this process only: a restart loses the history,
-    the graph and `staging.cursor` are what actually carry the state (§4.7)."""
+    """One ingest run.
+
+    `/fetch` jobs live in `data/jobs.db` and survive a restart (`queue.py`); the
+    operator-triggered ones (`phase1`, `phase2`, `reindex`, `vault-export`) still live
+    in the process that serves them and disappear with it. The work is restartable
+    either way — the staging cursor is what carries it (§4.7).
+    """
     id: str
-    # Every string ever passed to `jobs.exclusive`/`jobs.start` must be listed here.
-    # A missing one does not fail where it is used: the job is claimed and served, and
-    # `/ingest/jobs` dies later on response validation — a 500 on the only operator view
-    # of an ingest that is in fact healthy, for every record until the slot log evicts it.
+    # Every string ever passed to `jobs.exclusive`/`jobs.start`/`queue.enqueue` must be
+    # listed here. A missing one does not fail where it is used: the job is claimed and
+    # served, and `/ingest/jobs` dies later on response validation — a 500 on the only
+    # operator view of an ingest that is in fact healthy, for every record until the
+    # slot log evicts it.
     kind: Literal["fetch", "phase1", "phase2", "reindex", "vault-export"]
-    status: Literal["running", "ok", "failed"]
+    # `queued` and `staged` are `/fetch`'s, and they are separate statuses rather than
+    # one "running" with a note: queued means no worker has taken it, staged means
+    # phase 1 is done and the article is parsed but the single writer has not linked it
+    # yet (§4.5). "running" for an hour while nothing runs is the status that lies.
+    status: Literal["queued", "running", "staged", "ok", "failed"]
     created_at: str
     finished_at: str | None = None
     args: dict = {}
-    report: dict | None = Field(None, description="The §4.7 report, on status=ok.")
+    stage: str | None = Field(None, description="phase1 | phase2 — which half a queued "
+                                                "job is in. Absent for the in-process "
+                                                "kinds.")
+    attempts: int = Field(0, description="Claims so far IN THE CURRENT PHASE — the "
+                                         "counter resets when phase 1 hands the article "
+                                         "over, so each half gets its own lives. A job "
+                                         "that died mid-run comes back; past "
+                                         "queue.MAX_ATTEMPTS it stays failed. A "
+                                         "permanent failure (no HTML anywhere, nothing "
+                                         "parsed) is final after one.")
+    report: dict | None = Field(None, description="The §4.7 report, on status=ok. On "
+                                                  "status=staged, what phase 1 measured.")
     error: str | None = Field(None, description="Type and message, on status=failed. "
-                                                "Never empty when status=failed.")
+                                                "Never empty when status=failed. On a "
+                                                "requeued job, why the last attempt died.")
 
 
 class StagingOut(BaseModel):
@@ -413,3 +435,8 @@ class Stats(BaseModel):
     staging_cursor: int
     pending_link: int
     job_running: str | None = None
+    queue: dict = Field({}, description="Jobs per status in `data/jobs.db`: queued, "
+                                        "running, staged, ok, failed.")
+    workers: dict = Field({}, description="Which ingest threads are alive. A dead "
+                                          "writer with jobs in `staged` is the one "
+                                          "failure that is otherwise invisible.")

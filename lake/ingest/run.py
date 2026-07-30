@@ -21,7 +21,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .. import graph_client, index, llm, trace
+from .. import graph_client, index, llm, trace, writer_lock
 from ..models import (PENDING_LINK, STAGING, STAGING_CURSOR, DraftThesis, IdeaFields,
                       Source, text_hash)
 
@@ -162,6 +162,18 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
     papers. Restart is free: the cursor is written after every source and stage [0]
     of the link cascade skips already-written theses without a single LLM call.
     """
+    # The OS-level writer lock, on EVERY entry into phase 2 and not only on the writer
+    # thread: this function is also the CLI (`python3 -m lake.ingest.run phase2`) and
+    # `/ingest/phase2`, and a CLI run on the host beside a container's writer is two
+    # processes linking one lake — the §4.5 violation `jobs.exclusive` cannot see,
+    # because it is one slot per process. Re-entrant, so the writer that already holds
+    # it (`workers.start`) counts one level deeper instead of deadlocking on itself.
+    with writer_lock.held():
+        return _phase2(staging_path, limit)
+
+
+def _phase2(staging_path, limit: int | None) -> dict:
+    """The body of `phase2`, under the writer lock. Not an entry point — call `phase2`."""
     llm.assert_grammar_works(llm.QWEN_9B)       # rederive
     llm.assert_grammar_works(llm.QWEN_35B)      # link arbiter
     from . import generalize, link, rederive, split
@@ -312,10 +324,21 @@ def ingest_one(entry: dict, staging_path) -> dict:
 
     Returns the phase 2 report plus what this source cost in phase 1.
     """
-    # BOTH canaries before the fetch (§6.1). The arbiter's is inside `phase2`, which
-    # for a corpus run is early enough — the staging file is in front of the operator
-    # either way. Here the same order would spend the whole fetch, parse, generalize
-    # and embed of an article before finding out that the 35B server is down.
+    staged = stage_one(entry, staging_path)
+    return drain_one(staging_path, staged)
+
+
+def stage_one(entry: dict, staging_path) -> dict:
+    """Phase 1 for one source into its own staging file. The graph is not opened.
+
+    Split out of `ingest_one` so the two halves can be held by different threads: the
+    fetch pool runs many of these at once (nothing here writes the graph), and one
+    writer runs `drain_one` after them (§4.5 allows exactly one). Called back to back
+    they are `ingest_one`, which is still the CLI and self-check path.
+    """
+    # BOTH canaries before the fetch (§6.1), including the arbiter's, which this half
+    # never calls: finding the 35B server down AFTER a full fetch/parse/generalize/
+    # embed costs the whole article to learn it.
     llm.assert_grammar_works(llm.QWEN_9B)
     llm.assert_grammar_works(llm.QWEN_35B)
     from . import fetch, generalize, parse
@@ -336,23 +359,67 @@ def ingest_one(entry: dict, staging_path) -> dict:
         # file makes phase 2 a no-op, and the job would report `ok` with every number
         # at zero — indistinguishable from an article that was already in the lake.
         raise ValueError(f"{name}: parse extracted no theses, nothing to ingest")
+    return {"staging_lines": lines, "leakage": leaks, "theses_dropped": dropped,
+            "source": name}
+
+
+def drain_one(staging_path, staged: dict | None = None) -> dict:
+    """Phase 2 over one `/fetch` staging file, plus the two guards that keep an
+    unchanged lake from reading as success. ONE caller at a time (§4.5)."""
+    staging_path = Path(staging_path)
+    staged = staged or {}
+    name = staged.get("source") or staging_path.stem
+    # Counted off the FILE, not off what phase 1 said it wrote: this is the half that
+    # runs in the writer, possibly in another process, over a file it did not create.
+    # A staging file that is empty or gone is zero work, and zero work through phase 2
+    # reports every counter at zero and finishes `ok` — a job that says the article is
+    # in the lake for an article that never reached it. `_read_staging` raises on a
+    # missing file, which is the same refusal one step earlier.
+    rows = _read_staging(staging_path)
+    if not rows:
+        raise RuntimeError(f"{name}: {staging_path} holds no staging lines, so there is "
+                           "nothing for phase 2 to ingest; re-post the url to run phase 1 "
+                           "again")
+    source_id = rows[0][1]["source"]["id"]
+    lines = staged.get("staging_lines") or len(rows)
     report = phase2(staging_path)
+    # Two guards, because they catch two different lies and neither sees the other's.
+    #
+    # This run's counters: the arbiter refused every thesis it was given, so each one is
+    # queued in `pending_link` and none was linked (§4.5). That is a failed run even when
+    # the article itself is already in the lake from an earlier ingest — the work this run
+    # was asked to do did not happen, and nothing else would ever say so.
     if report["theses_written"] == 0 and report["theses_refused"]:
-        # The other way this ends with an unchanged lake, and the one that looks most
-        # like success: the arbiter refused every thesis, so each is in `pending_link`
-        # and none is in the graph (§4.5). The counters alone cannot say so — a clean
-        # replay of an article already in the lake reports `theses_written: 0` too.
         raise RuntimeError(
             f"{name}: the linking arbiter refused all {report['theses_refused']} of "
             f"{lines} theses, every one of them is queued in pending_link and nothing "
             "reached the graph; re-post the url once the 35B server answers again")
+    # The store: no leaf for this source means no ingest, whatever the counters say. This
+    # is the half that catches the retry, and the counters cannot: attempt 1 refuses
+    # everything, advances the cursor over the group anyway (`_phase2`, unconditionally)
+    # and raises; attempt 2 finds the cursor spent, processes no group at all and reports
+    # `written: 0, refused: 0` — which the guard above reads as a clean replay. It then
+    # deleted the staging file and answered `ok` for an article that never reached the
+    # graph. A replay of an article that IS in the lake has leaves; this one has none.
+    if not graph_client.count_theses(source_id=source_id):
+        raise RuntimeError(
+            f"{name}: phase 2 left nothing in the graph for {source_id} — of {lines} "
+            f"staging lines, {report['theses_written']} were written, "
+            f"{report['theses_refused']} refused and {report['theses_skipped']} skipped, "
+            "and the store holds no leaf for this source at all. Anything refused is "
+            "queued in pending_link; re-post the url once the 35B server answers again")
     # Ingested, so the staging file has nothing left to say — the graph is the record
     # now. Kept only on failure, and that is what makes the directory readable: what
     # sits in `data/fetch/` is exactly the articles that did NOT make it, and no ops
     # view lists them (`/ingest/staging` reads the corpus file alone).
     staging_path.unlink(missing_ok=True)
     _cursor_path(staging_path).unlink(missing_ok=True)
-    return {**report, "staging_lines": lines, "leakage": leaks, "theses_dropped": dropped}
+    # `staged` is what phase 1 measured. Absent (a writer that picked up a staging
+    # file left by an earlier process), the phase-1-only numbers are absent too —
+    # `leakage: 0` on a run that never measured it is a number that lies.
+    return {**report, "staging_lines": lines,
+            **({"leakage": staged["leakage"], "theses_dropped": staged["theses_dropped"]}
+               if "leakage" in staged else {})}
 
 
 def _report(processed: list[dict], generalize, cursor: int) -> dict:
@@ -547,6 +614,7 @@ def selfcheck() -> None:
     real_has, real_index_rows = index.has, index.index_rows
     real_stale_links, real_reconcile = index.stale_links, index.reconcile
     real_traces = trace.TRACES_DIR
+    real_lock_path = writer_lock.LOCK_PATH
     trace.set_run_id("selfcheck-" + uuid.uuid4().hex[:6])
     root = __package__.split(".")[0]
 
@@ -680,6 +748,10 @@ def selfcheck() -> None:
             # refuse to run. This check promises to touch no real path; a directory is
             # a real path.
             trace.TRACES_DIR = Path(tmp) / "traces"
+            # `phase2` takes the writer lock, and the real path is `data/writer.lock` —
+            # a check that promises to touch no real path must not create it, and must
+            # not be refused by an API process that legitimately holds it.
+            writer_lock.LOCK_PATH = Path(tmp) / "writer.lock"
             index.index_theses = functools.partial(real_index_theses, db=idx)
             # `_reconcile_index` uses these two, also without a db argument; unbound
             # they wrote fixture rows straight into the real data/index.db.
@@ -889,6 +961,7 @@ def selfcheck() -> None:
             else:
                 setattr(sys.modules[parent], leaf, prev_attr)
         trace.TRACES_DIR = real_traces
+        writer_lock.LOCK_PATH = real_lock_path
 
     print("run self-check OK")
 

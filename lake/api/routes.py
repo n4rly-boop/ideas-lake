@@ -49,7 +49,19 @@ _BAD = {400: {"model": ErrorResponse, "description":
 _NOT_FOUND = {404: {"model": ErrorResponse, "description": "No such row."}}
 _BUSY = {409: {"model": ErrorResponse, "description":
                "Another ingest or repair holds the single slot. Ingest is sequential by "
-               "design (§4.5); this is a refusal, not a queue."}}
+               "design (§4.5); this is a refusal, not a queue. `/fetch` is the exception "
+               "— it has a queue and answers 202."}}
+_QUEUE_FULL = {429: {"model": ErrorResponse, "description":
+                     "The ingest backlog is at `LAKE_QUEUE_MAX`. Carries `Retry-After`. "
+                     "Accepting past the ceiling would hand out a `queued` status that "
+                     "nothing reaches for hours."}}
+# The queue is a file (`data/jobs.db`), so these three routes can fail the way the store
+# can: a read-only mount, a full disk, a locked database. Documented per route rather
+# than inherited — the handler over `graph_client.STORE_ERRORS` (`sqlite3.Error`) already
+# answers 503 for them, and an undocumented status is a branch C never wrote.
+_QUEUE_DOWN = {503: {"model": ErrorResponse, "description":
+                     "`data/jobs.db` is unreachable or raised. The job was NOT accepted "
+                     "(or, on a read, cannot be listed) — this is not an empty queue."}}
 # One status, two refusals, so one entry: the slot is taken, or the destination is not
 # ours to rewrite. Splitting them would need two 409 keys, which OpenAPI has no room for.
 _VAULT_REFUSED = {409: {"model": ErrorResponse, "description":
@@ -228,30 +240,50 @@ fetch_router = APIRouter(tags=["ingest"])
 
 
 @fetch_router.post("/fetch", response_model=JobOut, status_code=202,
-                   responses={**_BAD, **_BUSY},
+                   responses={**_BAD, **_QUEUE_FULL, 503: {
+                       "model": ErrorResponse,
+                       "description": "Either `data/jobs.db` raised — the job was NOT "
+                                      "accepted, which is not the same as an empty queue "
+                                      "— or the server runs in `--mock`, where this route "
+                                      "would be the one thing that fetches and writes."}},
                    summary="Одна статья с arXiv по ссылке: fetch → тезисы → идеи в графе")
-def fetch_article(body: FetchRequest):
-    """Both phases for one url, as a background job (202 + `JobOut`, poll /ingest/jobs).
+def fetch_article(body: FetchRequest, request: Request):
+    """Both phases for one url, as a queued job (202 + `JobOut`, poll /ingest/jobs).
 
-    The acceptance stop between the phases (§4.7) is what the corpus run is for; here
-    the caller named one article and wants it in the lake, so phase 2 follows phase 1
-    in the same job. Everything else is unchanged: the single slot, so this cannot race
-    an ingest (§4.5), the arbiter, `pending_link`, the re-derivation trigger.
+    Never 409. The job goes into `data/jobs.db` (`queue.py`), a fetch worker runs
+    phase 1 on it, and the single writer links it into the graph when its turn comes —
+    so a caller may post ten urls in a row without waiting or retrying. What the single
+    slot used to buy is still bought, by the writer being one thread holding
+    `jobs.exclusive` (§4.5, `api/workers.py`).
 
     The article gets its own staging file under `data/fetch/` rather than a line in the
     corpus staging — see `run.ingest_one` for why sharing it would ingest other people's
-    sources. Re-posting the same url is idempotent: same `Source.id`, and link step [0]
-    skips leaves already stored (§4.8).
+    sources. Re-posting the same url is idempotent twice over: a url already queued or
+    running returns THAT job rather than opening a second one, and a url already in the
+    lake is skipped leaf by leaf at link step [0] (§4.8).
+
+    429 when the backlog is at `LAKE_QUEUE_MAX`: a status of `queued` that no worker
+    will reach for hours is a polite way of dropping the request.
     """
-    from ..ingest import run
-    arxiv_id = body.arxiv_id
-    # No sanitizing, because there is nothing to sanitize: `fetch._ARXIV_ID` admits
-    # digits, one dot and an optional `vN`, and nothing else reaches this line.
-    # Stripping separators here would read as a guard and hide that the door is one.
-    staging = FETCH_DIR / f"{arxiv_id}.jsonl"
-    return _start("fetch", lambda: run.ingest_one({"arxiv_id": arxiv_id, "type": "paper"},
-                                                  staging),
-                  {"url": body.url, "arxiv_id": arxiv_id})
+    from .. import queue
+    from . import workers
+    if request.app.state.mock:
+        # `--mock` starts no workers (`app.lifespan`) and promises "no store touched"
+        # on /healthz. Accepting here would write a row into the real `data/jobs.db`
+        # that nothing in this process will ever claim: a 202 for work silently
+        # dropped, which is exactly the shape the mock is supposed to be free of.
+        raise HTTPException(503, "mock mode: /fetch is the one route that fetches an "
+                                 "article and writes the graph, and a mock server "
+                                 "touches neither — start without --mock")
+    # No sanitizing of `arxiv_id`, because there is nothing to sanitize:
+    # `fetch._ARXIV_ID` admits digits, one dot and an optional `vN`, and nothing else
+    # reaches this line. Stripping separators here would read as a guard and hide that
+    # the door is one.
+    try:
+        return queue.enqueue("fetch", {"url": body.url, "arxiv_id": body.arxiv_id},
+                             dedup_key=body.arxiv_id, ceiling=workers.QUEUE_MAX)
+    except queue.Full as full:
+        raise HTTPException(429, str(full), headers={"Retry-After": "60"})
 
 
 @ingest.post("/phase1", response_model=JobOut, status_code=202, responses={**_BUSY, 400:
@@ -290,16 +322,44 @@ def start_phase2(body: Phase2Request | None = None):
     return _start("phase2", lambda: run.phase2(limit=body.limit), {"limit": body.limit})
 
 
-@ingest.get("/jobs", response_model=list[JobOut], summary="Задания этого процесса, новые сверху")
-def list_jobs():
-    return jobs.listing()
+@ingest.get("/jobs", response_model=list[JobOut], responses={**_BAD, **_QUEUE_DOWN},
+            summary="Задания: очередь /fetch с диска плюс ручные из этого процесса")
+def list_jobs(limit: int = Query(50, gt=0, le=MAX_PAGE)):
+    """Two registers, one list, newest first.
+
+    `/fetch` jobs come from `data/jobs.db` and outlive the process; the manual kinds
+    (`phase1`, `phase2`, `reindex`, `vault-export`) come from `jobs.py` and do not.
+    Merged rather than kept apart because a caller asking "what is the lake doing"
+    means both, and a queued fetch behind a manual phase 2 is exactly the pair that
+    explains a wait.
+
+    `limit` bounds each register and therefore the answer: the durable side is a file
+    that keeps `queue.KEEP_FINISHED` rows, and slicing it inside `queue.listing()` while
+    the route promised "all jobs" is how a caller reads a truncated list as the whole
+    state of the lake.
+    """
+    from .. import queue
+    durable = queue.listing(limit)
+    # By id, durable first: while the writer holds a fetch job it also holds the
+    # in-process slot under the SAME id (`workers.write_step`), and listing both
+    # copies would show one article twice, once with a status that is a snapshot of
+    # the slot rather than of the work.
+    seen = {job["id"] for job in durable}
+    both = durable + [job for job in jobs.listing() if job["id"] not in seen]
+    return sorted(both, key=lambda job: job["created_at"], reverse=True)[:limit]
 
 
-@ingest.get("/jobs/{job_id}", response_model=JobOut, responses=_NOT_FOUND)
+@ingest.get("/jobs/{job_id}", response_model=JobOut,
+            responses={**_NOT_FOUND, **_QUEUE_DOWN})
 def get_job(job_id: str):
-    job = jobs.get(job_id)
+    from .. import queue
+    # The durable register first: after a restart it is the only one that still has
+    # the row, and the in-process dict is empty rather than wrong.
+    job = queue.get(job_id) or jobs.get(job_id)
     if job is None:
-        raise HTTPException(404, f"job {job_id} not found (jobs live in this process only)")
+        raise HTTPException(404, f"job {job_id} not found (a /fetch job survives a "
+                                 "restart; phase1/phase2/reindex/vault-export do not, "
+                                 "and older ones fall off the ring)")
     return job
 
 

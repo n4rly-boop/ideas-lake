@@ -105,13 +105,32 @@ async def lifespan(app: FastAPI):
     if app.state.warmup and not app.state.mock:
         from .. import embed
         embed.embed_query("warm up")
-    yield
+    # The ingest threads: a pool for phase 1 and exactly one writer for phase 2
+    # (`workers.py`). Started here and not at import, because importing this module is
+    # what every self-check does and a thread pool that ingests on import would be a
+    # trap. `--mock` starts none: a mock app answers frozen rows and must not open the
+    # graph at all.
+    if app.state.workers and not app.state.mock:
+        from . import workers
+        started = workers.start()
+        print(f"lake.api: ingest threads {started['threads']}, recovered from the "
+              f"last process: {started['recovered']}")
+    try:
+        yield
+    finally:
+        if app.state.workers and not app.state.mock:
+            from . import workers
+            workers.stop()
 
 
-def create_app(mock: bool = False, warmup: bool = True, api_key=None) -> FastAPI:
+def create_app(mock: bool = False, warmup: bool = True, api_key=None,
+               workers: bool = True) -> FastAPI:
     """`api_key`: `None` reads `LAKE_API_KEY` from the environment (the normal path),
     a string is the key itself, and `False` turns the check off — which is a choice
-    somebody has to type, on the command line as `--no-auth` or here in a check."""
+    somebody has to type, on the command line as `--no-auth` or here in a check.
+
+    `workers=False` builds the same app without the ingest threads: the HTTP contract
+    can then be checked without an article ever being fetched for real."""
     app = FastAPI(
         title="Ideas Lake — block A",
         version="0.2.0",
@@ -121,6 +140,7 @@ def create_app(mock: bool = False, warmup: bool = True, api_key=None) -> FastAPI
     )
     app.state.mock = mock
     app.state.warmup = warmup
+    app.state.workers = workers
     # Read here, not per request: a key that changes under a running server would make
     # "it works on my machine" depend on when the request landed.
     app.state.api_key = os.environ.get("LAKE_API_KEY", "") if api_key is None else api_key

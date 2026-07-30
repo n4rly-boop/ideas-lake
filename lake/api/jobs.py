@@ -36,14 +36,21 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _claim(kind: str, args: dict | None) -> dict:
+def _claim(kind: str, args: dict | None, job_id: str | None = None) -> dict:
     """Take the single slot or raise `Busy`. The check and the take are one step —
-    two callers a microsecond apart must not both believe the lake is free."""
+    two callers a microsecond apart must not both believe the lake is free.
+
+    `job_id` lets a caller that already has a record — the phase-2 writer, whose job
+    lives in `queue.py` — reuse its id instead of minting a second one. Two ids for
+    one piece of work would show up twice in `/ingest/jobs` and make `job_running`
+    name an id the caller polling `/fetch` has never seen.
+    """
     global _current
     with _lock:
         if _current is not None:
             raise Busy(_jobs[_current])
-        job = {"id": f"job_{uuid.uuid4().hex[:12]}", "kind": kind, "status": "running",
+        job = {"id": job_id or f"job_{uuid.uuid4().hex[:12]}", "kind": kind,
+               "status": "running",
                "created_at": _now(), "finished_at": None, "args": args or {},
                "report": None, "error": None}
         _jobs[job["id"]] = job
@@ -78,13 +85,13 @@ def start(kind: str, fn, args: dict | None = None) -> dict:
 
 
 @contextlib.contextmanager
-def exclusive(kind: str, args: dict | None = None):
+def exclusive(kind: str, args: dict | None = None, job_id: str | None = None):
     """The same slot, for work short enough to answer inside the request (a reindex).
 
     Claiming it is what keeps a repair and an ingest off the store at the same time;
     checking `running()` and then working would leave the window open between the two.
     """
-    job = _claim(kind, args)
+    job = _claim(kind, args, job_id)
     try:
         yield job
         job["status"] = "ok"

@@ -24,12 +24,13 @@ from pathlib import Path
 import numpy as np
 from fastapi.testclient import TestClient
 
-from .. import graph_client, index, ops, stub_store, trace, vault as vault_mod
+from .. import (graph_client, index, ops, queue, stub_store, trace, vault as vault_mod,
+                writer_lock)
 from ..ingest import run as run_mod
 from ..models import (DATA, EMBED_DIM, Idea, Source, Thesis, new_idea_id, new_thesis_id,
                       source_id as make_source_id, text_hash)
 from ..retrieve import api as retrieve_api, rank as rank_mod, search as search_mod
-from . import jobs, schemas
+from . import jobs, schemas, workers
 from .app import create_app
 from .schemas import MAX_K, MAX_PAGE, MAX_QUERY_CHARS, IdeaOut, ThesisOut
 
@@ -111,6 +112,15 @@ def main() -> None:
     bind(ops, "STAGING", tmp / "staging.jsonl")
     bind(ops, "STAGING_CURSOR", tmp / "staging.cursor")
     bind(ops, "PENDING_LINK", tmp / "pending_link.jsonl")
+    # `queue.py`'s own db, not a table in `stub_store`'s (queue.py:1-30) — bound the
+    # same way, or `_fingerprint()` catches this check writing to the real
+    # `data/jobs.db` the moment any test touches `/fetch` or the durable queue.
+    bind(queue, "DB", tmp / "jobs.db")
+    # `run.phase2` takes the writer lock now (§4.5). Phase 2 is stubbed out in this
+    # check, so nothing should reach it — bound anyway, because "should" is what
+    # `_fingerprint` exists to distrust, and taking the real lock would also refuse a
+    # live API process its writer.
+    bind(writer_lock, "LOCK_PATH", tmp / "writer.lock")
     bind(retrieve_api, "RETRIEVE_LOG", tmp / "retrieve.jsonl")
     # `export(dest=DATA / "vault")` binds the real folder as a DEFAULT ARGUMENT at def
     # time — the same trap as `search.search` above, and here the blast radius is a
@@ -135,6 +145,7 @@ def main() -> None:
     # rebind from outside.
     real_phase1, real_phase2 = run_mod.phase1, run_mod.phase2
     real_ingest_one = run_mod.ingest_one
+    real_stage_one, real_drain_one = run_mod.stage_one, run_mod.drain_one
     run_mod.phase1 = lambda entries, workers=8: _unexpected("phase1")
     # `staging_path` first and positional: `ingest_one` calls `phase2(staging_path)`,
     # and a stub shaped `(limit=None)` would take a Path as the limit the day the real
@@ -143,6 +154,12 @@ def main() -> None:
     # /fetch runs BOTH phases in one job, so it is the one route that would fetch from
     # arXiv and write `data/fetch/` if it slipped past the stubs.
     run_mod.ingest_one = lambda entry, staging_path: _unexpected("ingest_one")
+    # `/fetch` now runs through these two instead of `ingest_one` — `api/workers.py`'s
+    # `fetch_step`/`write_step`, which `_run` drives by hand once the fakes it wants
+    # are installed. Stubbed here too so no path through the durable queue can reach
+    # a real fetch before that point.
+    run_mod.stage_one = lambda entry, staging_path: _unexpected("stage_one")
+    run_mod.drain_one = lambda staging_path, staged=None: _unexpected("drain_one")
 
     leaked: list[str] = []
     try:
@@ -152,6 +169,7 @@ def main() -> None:
             setattr(module, name, value)
         run_mod.phase1, run_mod.phase2 = real_phase1, real_phase2
         run_mod.ingest_one = real_ingest_one
+        run_mod.stage_one, run_mod.drain_one = real_stage_one, real_drain_one
         if real_embed_mod is None:
             sys.modules.pop("lake.embed", None)
             delattr(sys.modules["lake"], "embed")
@@ -166,6 +184,7 @@ def main() -> None:
             stub_store._conn.close()
         stub_store._db_path, stub_store._conn = real_db, None
         jobs._reset_for_tests()
+        queue.close()          # drop the cached handle on the temp db before it is rmtree'd
         # Compared in the `finally`, not after it. Outside, a failing assertion
         # skipped the comparison entirely — so the run that leaked and the run that
         # was being debugged were usually the same run, and it never said so.
@@ -191,7 +210,7 @@ def _run(tmp: Path, idx: Path) -> None:
     # ---------------------------------------------------------------- the mock
     # `api_key=False` here and below: these two blocks check the shape of the API, and
     # the key gets its own block at the end, against a server that has one.
-    with TestClient(create_app(mock=True, warmup=False, api_key=False)) as client:
+    with TestClient(create_app(mock=True, warmup=False, api_key=False, workers=False)) as client:
         body = client.post("/retrieve", json={"query": "diversity", "k": 2}).json()
         assert sorted(body) == ["cost", "ideas", "log_id"], sorted(body)
         # Asserted against the CONSTANT, not the response: `response_model` reshapes
@@ -210,6 +229,14 @@ def _run(tmp: Path, idx: Path) -> None:
                 # and make the answer unusable.
                 assert leaf["url"].startswith("http") and leaf["title"] and leaf["locator"], leaf
         assert client.get("/healthz").json()["mock"] is True
+        # The mock says "no store touched" and starts no workers. `/fetch` is the one
+        # route that would make both claims false: accepted, it writes a row into the
+        # real `data/jobs.db` that nothing in this process will ever claim — a 202 for
+        # work silently dropped.
+        mock_fetch = client.post("/fetch", json={"url": "https://arxiv.org/abs/2406.04824"})
+        assert mock_fetch.status_code == 503, mock_fetch.text
+        assert "mock" in mock_fetch.json()["error"], mock_fetch.text
+        assert queue.counts()["queued"] == 0, "the mock /fetch enqueued a job"
         for payload in ({"k": 3}, {"query": "  "}, {"query": "a", "k": 0}, {"query": "a", "k": -1},
                         {"query": "a", "budget": 0}, {"query": "a", "allow_web": True},
                         {"query": "a", "unknown_field": 1},
@@ -251,7 +278,7 @@ def _run(tmp: Path, idx: Path) -> None:
     # ------------------------------------------------------------- the real app
     made = _fixture(tmp)
     idea_a, idea_b = made["ideas"]
-    client = TestClient(create_app(mock=False, warmup=False, api_key=False))
+    client = TestClient(create_app(mock=False, warmup=False, api_key=False, workers=False))
     with client:
         stats = client.get("/stats").json()
         assert (stats["sources"], stats["ideas"], stats["theses"]) == (1, 2, 3), stats
@@ -495,10 +522,21 @@ def _run(tmp: Path, idx: Path) -> None:
         assert started.json()["status"] == "running" and started.json()["args"] == {"limit": 1}
         for busy in (client.post("/ingest/phase2"),
                      client.post("/ingest/phase1", json={"sources": [{"arxiv_id": "x", "type": "paper"}]}),
-                     client.post("/fetch", json={"url": "https://arxiv.org/abs/2406.04824"}),
                      client.post("/admin/reindex")):
             assert busy.status_code == 409, (busy.url, busy.status_code)
             assert job_id in busy.json()["error"], busy.text
+        # /fetch no longer shares this slot at all (§4.5's own exception,
+        # `routes.fetch_article`): it has a queue behind it, so it answers 202 while
+        # the slot above is busy, and the article waits its turn for a fetch worker.
+        queued_while_busy = client.post("/fetch", json={"url": "https://arxiv.org/abs/2406.04824"})
+        assert queued_while_busy.status_code == 202, queued_while_busy.text
+        assert queued_while_busy.json()["status"] == "queued", queued_while_busy.json()
+        # Removed rather than left to drain: the queue is durable and FIFO, and a row
+        # left here would be the OLDEST queued job by the time `fetch_step` is driven
+        # by hand in the /fetch section below, jumping ahead of that section's own job.
+        with queue._LOCK:
+            queue._con().execute("DELETE FROM job WHERE id = ?",
+                                 (queued_while_busy.json()["id"],))
         assert client.get("/stats").json()["job_running"] == job_id
         gate.set()
         job = _await(client, job_id)
@@ -564,34 +602,164 @@ def _run(tmp: Path, idx: Path) -> None:
             "/fetch", json={"url": "https://arxiv.org/abs/hep-th/9901001"}).json()["error"]
         assert jobs.running() is None, "a refused /fetch took the slot"
 
+        # This app was built with workers=False (task item 4): nothing claims a queued
+        # job on its own, so both halves are driven by hand — `fetch_step`/`write_step`
+        # are exactly what the real fetch pool and the writer thread call in a loop
+        # (`api/workers.py`), one claim each.
         seen: dict = {}
 
-        def one(entry, staging_path):
-            seen.update(entry=entry, staging=Path(staging_path))
+        def fake_stage_one(entry, staging_path):
+            seen.update(entry=entry, stage_staging=Path(staging_path))
+            return {"staging_lines": 2, "leakage": 0, "theses_dropped": 0,
+                    "source": entry["arxiv_id"]}
+
+        def fake_drain_one(staging_path, staged=None):
+            seen.update(drain_staging=Path(staging_path), staged=staged)
             return {"sources_processed": 1, "theses_written": 2, "staging_lines": 2}
 
-        run_mod.ingest_one = one
+        run_mod.stage_one = fake_stage_one
+        run_mod.drain_one = fake_drain_one
         fetched = client.post("/fetch", json={"url": "https://arxiv.org/pdf/2406.04824v2.pdf"})
         assert fetched.status_code == 202, fetched.text
-        assert fetched.json()["kind"] == "fetch", fetched.text
+        assert fetched.json()["kind"] == "fetch" and fetched.json()["status"] == "queued", \
+            fetched.text
         assert fetched.json()["args"] == {"url": "https://arxiv.org/pdf/2406.04824v2.pdf",
                                           "arxiv_id": "2406.04824v2"}, fetched.text
-        job = _await(client, fetched.json()["id"])
+        job_id = fetched.json()["id"]
+
+        assert workers.fetch_step() is True, "phase 1 step found nothing queued to claim"
+        staged = client.get(f"/ingest/jobs/{job_id}").json()
+        assert staged["status"] == "staged" and staged["stage"] == "phase1", staged
+        assert workers.write_step() is True, "phase 2 step found nothing staged to claim"
+        job = client.get(f"/ingest/jobs/{job_id}").json()
         assert job["status"] == "ok" and job["report"]["theses_written"] == 2, job
+        # Phase 1's own report reaches phase 2 across the queue row: `leakage` and
+        # `theses_dropped` are measured by the half that parsed the article and cannot be
+        # recomputed by the half that links it, so a writer that dropped them would
+        # report the linking as the whole article (and `cost` as ~1/50 of it).
+        assert seen["staged"]["staging_lines"] == 2 and seen["staged"]["leakage"] == 0, seen
+        assert seen["staged"]["source"] == "2406.04824v2", seen
+        assert job["attempts"] == 1, job        # `stage()` gives phase 2 its own lives
         # The version in the link is the version fetched: `Source.id = sha1(url + version)`,
         # so dropping it would file v2's theses under v1's source (§4.8).
         assert seen["entry"] == {"arxiv_id": "2406.04824v2", "type": "paper"}, seen
         # Its own staging file, not the corpus one — sharing it would replay every
-        # source still waiting for acceptance (§4.7, `run.ingest_one`).
-        assert seen["staging"] == DATA / "fetch" / "2406.04824v2.jsonl", seen
-        assert seen["staging"] != ops.STAGING and seen["staging"].parent != DATA, seen
-        run_mod.ingest_one = lambda entry, staging_path: _unexpected("ingest_one")
+        # source still waiting for acceptance (§4.7, `run.stage_one`/`run.drain_one`).
+        assert seen["stage_staging"] == DATA / "fetch" / "2406.04824v2.jsonl", seen
+        assert seen["stage_staging"] != ops.STAGING and seen["stage_staging"].parent != DATA, seen
+        assert seen["drain_staging"] == seen["stage_staging"], seen
+        run_mod.stage_one = lambda entry, staging_path: _unexpected("stage_one")
+        run_mod.drain_one = lambda staging_path, staged=None: _unexpected("drain_one")
         # Not asserted as "data/fetch is empty": a real /fetch that failed leaves its
         # article there on purpose, and this check would then fail over somebody else's
         # run. Compared as a delta instead — the same shape as `_fingerprint`.
         assert _fetch_dir() == fetch_dir_before, "the stubbed /fetch touched data/fetch"
         print("ok: /fetch — a non-arXiv link is 400 at the door, the version survives, "
-              "the article gets its own staging file")
+              "the article gets its own staging file, fetch_step/write_step drain the "
+              "queue exactly as the real fetch pool and writer would")
+
+        # --- the durable queue: dedup, ceiling, restart, merged listing, health ---
+        # (a) dedup: the same url twice must not open a second job.
+        dedup_url = "https://arxiv.org/abs/2411.00001"
+        one_fetch = client.post("/fetch", json={"url": dedup_url})
+        again_fetch = client.post("/fetch", json={"url": dedup_url})
+        assert one_fetch.status_code == again_fetch.status_code == 202
+        assert one_fetch.json()["id"] == again_fetch.json()["id"], \
+            "the same url twice must not open a second job"
+        dedup_job_id = one_fetch.json()["id"]
+        stats = client.get("/stats").json()
+        assert stats["queue"]["queued"] >= 1, stats
+        assert stats["workers"] == {}, "workers=False started no thread, so none is alive"
+
+        # (b) 429 at the ceiling, with Retry-After — the polite way to drop a request:
+        # a `queued` status nothing reaches for hours is the impolite one.
+        real_queue_max = workers.QUEUE_MAX
+        workers.QUEUE_MAX = queue.counts()["queued"]      # already at the ceiling
+        try:
+            over = client.post("/fetch", json={"url": "https://arxiv.org/abs/2411.00002"})
+            assert over.status_code == 429, over.text
+            assert over.headers.get("retry-after"), over.headers
+            assert "error" in over.json(), over.text
+        finally:
+            workers.QUEUE_MAX = real_queue_max
+
+        # (c) durability: a "restart" — a second create_app/TestClient over the same
+        # jobs.db, with queue.close() between — must still answer the job's status.
+        # This is the entire reason the queue is its own database and not the dict in
+        # `api/jobs.py`: a caller polling a job id must not see 404 for work that is
+        # still on disk (`queue.py:1-6`).
+        queue.close()
+        with TestClient(create_app(mock=False, warmup=False, api_key=False,
+                                   workers=False)) as restarted:
+            reread = restarted.get(f"/ingest/jobs/{dedup_job_id}")
+            assert reread.status_code == 200, reread.text
+            assert reread.json()["status"] == "queued", reread.text
+
+        # (d) the merged listing carries both registers: the durable queue (the
+        # dedup'd fetch above) and the in-process one (a fresh manual job).
+        manual = client.post("/admin/reindex")
+        assert manual.status_code == 200, manual.text
+        merged = client.get("/ingest/jobs").json()
+        assert dedup_job_id in {j["id"] for j in merged}, "the queued job is missing"
+        assert "reindex" in {j["kind"] for j in merged}, "the in-process job is missing"
+        # `limit` bounds the ANSWER, both registers together. Bounding only the durable
+        # side inside `queue.listing()` is how a caller reads a truncated list as the
+        # whole state of the lake.
+        assert len(merged) > 1, merged
+        assert len(client.get("/ingest/jobs", params={"limit": 1}).json()) == 1, merged
+        assert client.get("/ingest/jobs", params={"limit": 0}).status_code == 400
+
+        # One piece of work is one row. While the writer is in phase 2 the same id lives
+        # in BOTH registers — `workers.write_step` claims the in-process slot with
+        # `job_id=` the durable row's id — and without the de-duplication in
+        # `routes.list_jobs` the operator sees one article twice, with two different
+        # statuses, one of which is a snapshot of the slot rather than of the work.
+        with jobs.exclusive("fetch", {"who": "the writer"}, job_id=dedup_job_id):
+            twice = client.get("/ingest/jobs").json()
+            same = [job for job in twice if job["id"] == dedup_job_id]
+            assert len(same) == 1, f"one job listed {len(same)} times: {same}"
+            # And the durable row wins: it is the state of the WORK, not of the slot.
+            assert same[0]["kind"] == "fetch" and same[0]["status"] == "queued", same
+
+        # `limit` must bound the answer without truncating a register at its own default:
+        # `queue.listing()` defaults to 50 while the file keeps `KEEP_FINISHED` = 200, so
+        # a caller asking for more than 50 used to get 50 durable rows and no sign of it.
+        padding = [queue.enqueue("fetch", {"url": f"https://arxiv.org/abs/2500.{n:05d}"},
+                                 dedup_key=f"pad{n}")["id"] for n in range(51)]
+        try:
+            wide = client.get("/ingest/jobs", params={"limit": MAX_PAGE}).json()
+            durable_ids = {job["id"] for job in queue.listing(MAX_PAGE)}
+            assert durable_ids <= {job["id"] for job in wide}, \
+                f"the durable register was truncated: {len(durable_ids)} rows on disk, " \
+                f"{len([j for j in wide if j['id'] in durable_ids])} in the answer"
+        finally:
+            with queue._LOCK:
+                for job_id in padding:
+                    queue._con().execute("DELETE FROM job WHERE id = ?", (job_id,))
+
+        # (e) /healthz turns degraded when a job is staged (phase 1 done, article
+        # waiting) and no writer thread is alive to drain it — the one failure of this
+        # design that is otherwise invisible (`ops.health`). `workers.alive()` is empty
+        # because every app in this check was built with workers=False: no writer
+        # exists to be alive, which is exactly the state this check has to prove is
+        # visible from the outside.
+        claimed = queue.claim("queued", "phase1")
+        assert claimed is not None, "nothing queued left to stage for the degraded check"
+        queue.stage(claimed["id"], {"staging_lines": 2})
+        sick = client.get("/healthz").json()
+        assert sick["status"] == "degraded" and "writer" in sick["detail"], sick
+        assert client.get("/stats").json()["queue"]["staged"] >= 1
+        # The other half dies on its own and is just as invisible: a `queued` article
+        # with no fetch worker alive is never parsed, and the writer being fine says
+        # nothing about it.
+        client.post("/fetch", json={"url": "https://arxiv.org/abs/2411.00003"})
+        starved = client.get("/healthz").json()
+        assert starved["status"] == "degraded", starved
+        assert "fetch worker" in starved["detail"], starved
+        print("ok: the durable queue — dedup by url, 429 at the ceiling with "
+              "Retry-After, a job survives a simulated restart, /ingest/jobs merges "
+              "both registers, a staged job with no writer thread turns /healthz "
+              "degraded")
 
         # --- what sits between the phases ----------------------------------
         rows = [{"source": {"id": "s1", "title": "One"}}, {"source": {"id": "s1", "title": "One"}},
@@ -693,7 +861,7 @@ def _run(tmp: Path, idx: Path) -> None:
     # here writes to the graph or spends the school's GPUs, and there is no other
     # authentication in block A.
     key = "s3cret-" + "x" * 40
-    with TestClient(create_app(mock=True, warmup=False, api_key=key)) as guarded:
+    with TestClient(create_app(mock=True, warmup=False, api_key=key, workers=False)) as guarded:
         # One route per kind, because "the middleware covers everything" is exactly the
         # claim that rots: a read, a write, the ops view, the ingest and a path that
         # does not exist. The last one matters — routing happens AFTER the middleware,
@@ -747,14 +915,14 @@ def _run(tmp: Path, idx: Path) -> None:
     # `--no-auth` is a choice somebody types; an EMPTY key is a server that thinks it
     # is guarded and is not, so it must not start at all.
     try:
-        with TestClient(create_app(mock=True, warmup=False, api_key="")):
+        with TestClient(create_app(mock=True, warmup=False, api_key="", workers=False)):
             raise AssertionError("a server with an empty LAKE_API_KEY started")
     except RuntimeError as exc:
         assert "LAKE_API_KEY is empty" in str(exc), exc
     # The env is where the real one comes from, and `create_app` must read it there.
     os.environ["LAKE_API_KEY"] = key
     try:
-        with TestClient(create_app(mock=True, warmup=False)) as from_env:
+        with TestClient(create_app(mock=True, warmup=False, workers=False)) as from_env:
             assert from_env.get("/healthz").status_code == 401
             assert from_env.get("/healthz", headers={"Authorization": f"Bearer {key}"}
                                 ).status_code == 200
@@ -763,7 +931,7 @@ def _run(tmp: Path, idx: Path) -> None:
     # And with no variable set at all the server refuses to come up — the case that
     # turns a forgotten line in `.env.local` into an open API on a public port.
     try:
-        with TestClient(create_app(mock=True, warmup=False)):
+        with TestClient(create_app(mock=True, warmup=False, workers=False)):
             raise AssertionError("a server started with no LAKE_API_KEY in the environment")
     except RuntimeError as exc:
         assert "LAKE_API_KEY is empty" in str(exc), exc
