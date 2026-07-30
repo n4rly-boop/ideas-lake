@@ -18,8 +18,18 @@ from .models import CANARY_SCHEMA, PROMPTS
 
 # (base_url, name of the env var holding the key). The key is read per call, not
 # at import: the module must import in an environment with no keys at all.
-QWEN_9B = ("http://82.202.157.243:8080", "LAKE_KEY_9B")     # parse/generalize/rederive/rewrite
-QWEN_35B = ("http://82.202.156.206:8080", "LAKE_KEY_35B")   # link arbiter, eval judge
+#
+# Адрес переопределяется окружением: пул 9B школы делится со всеми, и когда в нём
+# висит очередь (`requests_deferred` под две сотни, генерации по 10 минут), любой
+# шаг падает по таймауту ещё на канарейке. Тогда массовые шаги временно уводятся
+# на свободный сервер — правкой `.env.local` и перезапуском, без пересборки.
+#
+# Ключ при этом НЕ переопределяется: `LAKE_KEY_9B` — это «ключ к тому серверу,
+# куда смотрит 9B». Увёл адрес на 35B — положи в ту же переменную ключ 35B.
+QWEN_9B = (os.environ.get("LAKE_URL_9B") or "http://82.202.157.243:8080",
+           "LAKE_KEY_9B")                                   # parse/generalize/rederive/rewrite
+QWEN_35B = (os.environ.get("LAKE_URL_35B") or "http://82.202.156.206:8080",
+            "LAKE_KEY_35B")                                 # link arbiter, eval judge
 
 ATTEMPTS = 2                # §8: 2 attempts, 2 s pause, network/timeout/5xx only
 RETRY_PAUSE_S = 2.0
@@ -205,4 +215,20 @@ if __name__ == "__main__":
     else:
         raise AssertionError("a missing key must raise before any socket is opened")
 
-    print("ok: maxLength truncation detector (nested + arrays) and missing-key guard")
+    # Переезд массовых шагов на свободный сервер — это правка окружения, и она
+    # должна быть видна в паре, которую получают шаги, а не только в комментарии.
+    import importlib
+    saved = os.environ.get("LAKE_URL_9B")
+    os.environ["LAKE_URL_9B"] = "http://example.invalid:9999"
+    try:
+        moved = importlib.reload(importlib.import_module(__spec__.name))
+        assert moved.QWEN_9B == ("http://example.invalid:9999", "LAKE_KEY_9B"), moved.QWEN_9B
+        assert moved.QWEN_35B[0] == "http://82.202.156.206:8080", moved.QWEN_35B
+    finally:
+        if saved is None:
+            del os.environ["LAKE_URL_9B"]
+        else:
+            os.environ["LAKE_URL_9B"] = saved
+        importlib.reload(importlib.import_module(__spec__.name))
+
+    print("ok: maxLength truncation detector, missing-key guard, LAKE_URL_9B override")
