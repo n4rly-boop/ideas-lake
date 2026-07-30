@@ -204,6 +204,25 @@ def search_theses(query: str, k: int, query_vec=None, db=INDEX_DB) -> list[dict]
         return out
 
 
+def stale_links(rows: list[dict], db=INDEX_DB) -> list[str]:
+    """Thesis ids this index maps to a different idea than `rows` does.
+
+    `has()` answers "is it indexed" and nothing else, so a leaf that MOVED between
+    ideas is present and wrong and a presence check calls the index healthy. Moving a
+    leaf is exactly what `ingest.split` does, and it commits the store and rebuilds the
+    index as two steps — if the second one does not happen, every count-based check
+    still passes (the row count did not change) while the arbiter keeps being offered a
+    candidate whose leaves have left it. This is the only thing that sees that.
+
+    `rows` is `graph_client.all_theses()`. Ids the index does not hold are `has()`'s
+    business, not this one's.
+    """
+    with _LOCK:
+        indexed = dict(_con(db).execute("SELECT thesis_id, idea_id FROM idx_thesis").fetchall())
+    return [r["id"] for r in rows
+            if r["id"] in indexed and indexed[r["id"]] != r["idea_id"]]
+
+
 def has(thesis_id: str, db=INDEX_DB) -> bool:
     with _LOCK:
         return _con(db).execute(

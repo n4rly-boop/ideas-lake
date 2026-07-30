@@ -56,6 +56,18 @@ def update_idea(idea_id: str, fields: dict) -> None:
     return stub_store.update_idea(idea_id, fields)
 
 
+@trace(component="graph", op="split_idea")
+def split_idea(parent_id: str, parent_fields: dict, children: list) -> None:
+    """Move part of `parent_id`'s leaves onto new ideas, one transaction (§3.4).
+
+    `children` is [(Idea, [thesis_id, ...])]. This is the only call that writes a
+    thesis row after phase 2 and it writes exactly one column, `idea_id`; thesis
+    immutability (§1.2) is about what the source said, and none of that is touched.
+    Still not `update_thesis`, and there is still no `update_thesis` (§6.9).
+    """
+    return stub_store.split_idea(parent_id, parent_fields, children)
+
+
 @trace(component="graph", op="get_ideas")
 def get_ideas(ids: list[str]) -> list[dict]:
     """Ideas with leaves already joined to source.type/url/title (§3.4)."""

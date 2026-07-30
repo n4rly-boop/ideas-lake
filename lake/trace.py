@@ -131,7 +131,17 @@ def log_llm(op: str, model: str, usage: dict, wall_ms: float,
 
 
 if __name__ == "__main__":
+    import pathlib
+    import tempfile
+
     set_run_id("selfcheck-" + uuid.uuid4().hex[:6], log_id="log-1")
+    # Into a temp dir, not into data/traces/. Unlinking the file afterwards was not
+    # enough: `_write` mkdirs the directory, and an otherwise-absent `data/` that exists
+    # while holding no file is what makes `vault.demo`'s leak guard refuse to run
+    # ("the leak guard measured nothing"). README §1 tells the reader to run every
+    # module's `__main__`, so this one has to leave nothing behind either.
+    _tmp = tempfile.TemporaryDirectory(prefix="lake-trace-selfcheck-")
+    TRACES_DIR = pathlib.Path(_tmp.name)
     path = TRACES_DIR / f"{current_run_id()}.jsonl"
 
     @trace(component="ingest", op="parse")

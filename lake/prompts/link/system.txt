@@ -33,24 +33,34 @@ RULES
    share the same broad task, benchmark, or domain. Compare the actual mechanism: what
    is done, to what, and why that works.
 
-2. Different numbers, same mechanism, ONE idea. A candidate that uses the same mechanism
+2. A candidate that is a RESEARCH AREA and not a mechanism is -1. Some candidates have
+   drifted upwards and now name the field the thesis belongs to rather than one lever
+   inside it: "iterative refinement via evolutionary search where a model proposes
+   candidates that an evaluator selects" is the subject of a whole literature, and the
+   thesis in front of you is one technique inside it. Such a candidate matches almost
+   every thesis, which is exactly why it is not evidence. Ask: does the candidate name
+   ONE thing a practitioner does, or the family the thesis is a member of? A family is
+   -1, however well it fits. A new idea stated at the right altitude is the correct
+   outcome here; the broad candidate keeps the leaves it already has.
+
+3. Different numbers, same mechanism, ONE idea. A candidate that uses the same mechanism
    with a different threshold, a different budget, a different model size or a different
    measured gain is the SAME idea. The ideas here are stated without numbers on purpose;
    the numbers live on the leaves, and a parameter difference is never a reason to
    create a second idea.
 
-3. NEVER fabricate a relationship, and NEVER mark distinct techniques as duplicates.
+4. NEVER fabricate a relationship, and NEVER mark distinct techniques as duplicates.
    Two mechanisms that merely resemble each other, or share a name, or appear in the
    same kind of system, are distinct. When no candidate carries the same mechanism,
    answer -1 rather than link on partial resemblance.
 
-4. Shared vocabulary is not evidence. "Java the programming language" and "Java the
+5. Shared vocabulary is not evidence. "Java the programming language" and "Java the
    island" share a name and nothing else. The same trap in this corpus reads:
    "temperature schedule in simulated annealing" and "temperature scaling of logits for
    calibration" share a word and a research area, yet one controls acceptance of worse
    solutions during search and the other rescales a probability distribution after
    training. That is -1, not a link.
 
-5. One mechanism, one answer. If two candidates both look like the same technique, pick
+6. One mechanism, one answer. If two candidates both look like the same technique, pick
    the single closest one; the leaves of the other are somebody else's problem, not
    grounds for a second answer or for -1.

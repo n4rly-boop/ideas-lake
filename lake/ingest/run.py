@@ -164,15 +164,18 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
     """
     llm.assert_grammar_works(llm.QWEN_9B)       # rederive
     llm.assert_grammar_works(llm.QWEN_35B)      # link arbiter
-    from . import generalize, link, rederive
+    from . import generalize, link, rederive, split
 
     # Before a single arbiter call: an index that is empty while the store is not
     # makes step [1] return zero candidates for every thesis, and zero candidates
     # reads as "no duplicate" — so a stale index would quietly re-create every idea
     # in the lake, with no LLM call and no pending_link line to show for it.
-    repaired = _reconcile_index()
+    repaired, undrifted = _reconcile_index()
     if repaired:
         print(f"phase2: index was missing {repaired} leaf/leaves, re-indexed before linking")
+    if undrifted:
+        print(f"phase2: {undrifted} leaf/leaves were indexed under the idea they were "
+              "split away from, index rebuilt before linking")
 
     cursor_path = _cursor_path(staging_path)
     rows = _read_staging(staging_path)
@@ -183,6 +186,32 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
     processed: list[dict] = []
     rederived = skipped = refused = written = 0
     rederive_failed: list[dict] = []
+    splits: list[dict] = []
+    split_failed: list[dict] = []
+
+    def split_sweep() -> None:
+        """Split every idea over the leaf ceiling (issue #2).
+
+        Called per source AND once after the loop. Per source because an over-broad idea
+        keeps absorbing the next source's theses, and because leaving it whole makes the
+        §4.6 sweep below pay for a re-derivation over the whole over-broad set that the
+        split then throws away — so this runs BEFORE that sweep, not after.
+
+        After the loop because `groups` can be empty: a phase2 whose staging is already
+        consumed, or `limit=0`, processes no group at all, and an idea that crossed the
+        ceiling on the previous run would otherwise never be looked at again. The split
+        is what repairs the existing 92-leaf node, and "run phase2 again" has to actually
+        mean it.
+
+        Same granularity as the §4.6 sweep: one idea failing is named and counted, and it
+        is retried, because nothing about the idea changed.
+        """
+        for idea_id in split.due():
+            try:
+                splits.append(split.split_idea(idea_id))
+            except Exception as exc:
+                split_failed.append({"idea_id": idea_id,
+                                     "error": f"{type(exc).__name__}: {exc}"})
 
     for group in groups[:limit]:
         src = Source(**group[0][1]["source"])
@@ -223,6 +252,8 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
 
         _reconcile_index()
 
+        split_sweep()
+
         # Every idea that is over the trigger, not only the ones this batch touched
         # (§4.6). An idea whose third leaf landed in a source whose loop then died
         # is never in `by_idea` again — the restart skips its theses at link step
@@ -243,10 +274,19 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
         cursor = _advance(cursor, done)
         _write_cursor(cursor_path, cursor)
 
+    split_sweep()       # see the docstring: `groups` can be empty and the node stays
+
     report = _report(processed, generalize, cursor)
     report.update({"sources_processed": len(groups[:limit]), "theses_written": written,
                    "theses_skipped": skipped, "theses_refused": refused,
-                   "rederived": rederived, "rederive_failed": rederive_failed})
+                   "rederived": rederived, "rederive_failed": rederive_failed,
+                   "splits": splits, "split_failed": split_failed,
+                   # Read off the STORE, not off `split_failed`. The failure list counts
+                   # attempts — one idea failing under ten sources is ten entries, and an
+                   # idea nobody attempted is zero — so it answers "did a call raise",
+                   # never "is the lake still collapsing into one node" (issue #2).
+                   "ideas_over_ceiling": len(split.due()),
+                   "max_leaves_per_idea": max(split.leaf_counts().values(), default=0)})
     _print_report(report)
     return report
 
@@ -339,6 +379,19 @@ def _print_report(report: dict) -> None:
     if report["ideas_without_leaves"]:
         # IDEA ||--|{ THESIS (`06:85`). Loud, not a number nobody reads.
         print(f"  INVARIANT BROKEN: {report['ideas_without_leaves']} ideas have no leaves")
+    # Two independent facts, each from its own source of truth. A split can fail with
+    # nothing left over the ceiling (the store commit went through and only the index
+    # rebuild raised), and an idea can be over the ceiling with nothing in `split_failed`
+    # (a run that processed no source never attempted it). Reporting one as the other is
+    # how a lake collapsing into one node reads as healthy — which is issue #2.
+    if report.get("split_failed"):
+        print(f"  split attempts that failed: {len(report['split_failed'])}")
+        for failure in report["split_failed"]:
+            print(f"    {failure['idea_id']}: {failure['error']}")
+    if report.get("ideas_over_ceiling"):
+        from .split import MAX_LEAVES
+        print(f"  STILL OVER THE CEILING: {report['ideas_over_ceiling']} idea(s) above "
+              f"{MAX_LEAVES} leaves, max is {report['max_leaves_per_idea']} (issue #2)")
 
 
 def _draft_of(row: dict) -> DraftThesis:
@@ -368,19 +421,30 @@ def _group_by_source(rows: list[tuple[int, dict]], done: set[int]) -> list[list]
     return list(groups.values())
 
 
-def _reconcile_index() -> int:
-    """Re-index whatever the store has and the index does not. Returns the count.
+def _reconcile_index() -> tuple[int, int]:
+    """Repair the index against the store. Returns (re-indexed, un-drifted).
 
     `index_theses` runs after `create_idea_with_theses` has already committed, so
     an index write that fails leaves leaves in the graph that the index will never
     see: the restart skips them at link step [0] as already stored. One pass per
     source closes that window, and it is the §6.19 reconciliation path
     (`index.index_rows` over `graph_client.all_theses()`), not a second mechanism.
+
+    The presence pass is not enough since `ingest.split` exists. A split MOVES a leaf
+    between ideas and commits that before rebuilding the index; if the rebuild does not
+    happen, every leaf is still indexed — so `has()` repairs nothing — and every
+    count-based check still agrees, while the arbiter is offered the pre-split parent
+    for leaves that left it. That is the issue #2 loop reopening inside the module built
+    to close it, so the drift is looked for by value and repaired here too.
     """
-    missing = [row for row in graph_client.all_theses() if not index.has(row["id"])]
+    rows = graph_client.all_theses()
+    missing = [row for row in rows if not index.has(row["id"])]
     if missing:
         index.index_rows(missing)
-    return len(missing)
+    stale = index.stale_links(rows)
+    if stale:
+        index.reconcile(rows)
+    return len(missing), len(stale)
 
 
 def _rederive_due(threshold: int = 3) -> list[str]:
@@ -473,7 +537,7 @@ def selfcheck() -> None:
     import numpy as np
 
     from .. import stub_store
-    from ..models import (EMBED_DIM, Idea, Section, Thesis, TRACES_DIR, new_idea_id,
+    from ..models import (EMBED_DIM, Idea, Section, Thesis, new_idea_id,
                           new_thesis_id, source_id as make_source_id)
 
     global STAGING
@@ -481,6 +545,8 @@ def selfcheck() -> None:
     real_index_theses, real_complete, real_canary = (index.index_theses, llm.complete,
                                                      llm.assert_grammar_works)
     real_has, real_index_rows = index.has, index.index_rows
+    real_stale_links, real_reconcile = index.stale_links, index.reconcile
+    real_traces = trace.TRACES_DIR
     trace.set_run_id("selfcheck-" + uuid.uuid4().hex[:6])
     root = __package__.split(".")[0]
 
@@ -608,11 +674,23 @@ def selfcheck() -> None:
             cursor_path = _cursor_path(STAGING)
             idx = Path(tmp) / "index.db"
             stub_store._db_path = Path(tmp) / "lake.db"
+            # Every graph call is @trace'd into TRACES_DIR/<run_id>.jsonl. Deleting the
+            # file afterwards was not enough: `_write` mkdirs the directory, and a data/
+            # that exists while holding no file is what makes `vault.demo`'s leak guard
+            # refuse to run. This check promises to touch no real path; a directory is
+            # a real path.
+            trace.TRACES_DIR = Path(tmp) / "traces"
             index.index_theses = functools.partial(real_index_theses, db=idx)
             # `_reconcile_index` uses these two, also without a db argument; unbound
             # they wrote fixture rows straight into the real data/index.db.
             index.has = functools.partial(real_has, db=idx)
             index.index_rows = functools.partial(real_index_rows, db=idx)
+            # And these two, reached through `_reconcile_index`'s drift repair and
+            # through `split.split_idea`. Unbound, `reconcile` REBUILDS the operator's
+            # real data/index.db from this fixture store — the same hazard as above,
+            # with a destructive rather than an additive ending.
+            index.stale_links = functools.partial(real_stale_links, db=idx)
+            index.reconcile = functools.partial(real_reconcile, db=idx)
 
             assert _cursor_path(real_staging) == STAGING_CURSOR, _cursor_path(real_staging)
 
@@ -798,6 +876,7 @@ def selfcheck() -> None:
         STAGING = real_staging
         index.index_theses, llm.complete = real_index_theses, real_complete
         index.has, index.index_rows = real_has, real_index_rows
+        index.stale_links, index.reconcile = real_stale_links, real_reconcile
         llm.assert_grammar_works = real_canary
         for full_name, prev_mod, prev_attr in reversed(installed):
             parent, _, leaf = full_name.rpartition(".")   # a fake left behind is a trap
@@ -809,7 +888,7 @@ def selfcheck() -> None:
                 delattr(sys.modules[parent], leaf)
             else:
                 setattr(sys.modules[parent], leaf, prev_attr)
-        (TRACES_DIR / f"{trace.current_run_id()}.jsonl").unlink(missing_ok=True)
+        trace.TRACES_DIR = real_traces
 
     print("run self-check OK")
 
