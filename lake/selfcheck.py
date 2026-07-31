@@ -2884,6 +2884,112 @@ def check_38(tmp: Path) -> None:
         f"on {step_model!r} — a passing canary said nothing about the real step")
 
 
+@check(39, "an unreachable Neo4j that accepts TCP but never completes the Bolt "
+           "handshake (the real shape of a stopped container on a docker network, "
+           "not a locally-refused port) still answers /retrieve's 503 in single-digit "
+           "seconds, not the 120+s the driver's own defaults cost — measured live, "
+           "2026-07-31 finding. A status-only check does not catch a reintroduced "
+           "default: the 503 is correct either way, only the clock tells them apart")
+def check_39(tmp: Path) -> str:
+    import socket
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from .api.app import create_app
+
+    # A TCP listener that accepts and then goes silent: `bolt://127.0.0.1:1` (check
+    # 32) has nothing bound at all, so the OS answers ECONNREFUSED immediately no
+    # matter what neo4j_store's timeouts are set to — that path could never catch a
+    # timeout regression. This one reproduces the actual failure (connect succeeds,
+    # the Bolt handshake response never arrives) so the driver has to hit an actual
+    # deadline to give up, the same deadline `READ_CONNECTION_ACQUISITION_TIMEOUT` /
+    # `READ_MAX_TRANSACTION_RETRY_TIME` are supposed to keep short.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(8)
+    srv.settimeout(0.5)
+    stop = threading.Event()
+
+    def _serve() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            conn.settimeout(30)
+            try:
+                conn.recv(4)  # read the handshake preamble, then never answer it
+            except OSError:
+                pass
+
+    server_thread = threading.Thread(target=_serve, daemon=True)
+    server_thread.start()
+
+    # NOT `neo4j_store.close()`: that also resets `_schema_ready`, and the ONE-TIME
+    # constraint-check branch in `_get_driver()` that then runs is a plain
+    # auto-commit `session.run()` with no retry loop at all — it cannot exercise
+    # `READ_MAX_TRANSACTION_RETRY_TIME`, and a check that only ever hits it would
+    # never catch that constant being reverted. The 2026-07-31 measurement was a
+    # process that had been running fine and only then lost the graph — schema
+    # already validated — so `execute_read`/`execute_write`'s retry loop is what
+    # actually ran into the 120+s. Force that same shape: keep `_schema_ready`
+    # True, drop only the driver, so the very next call goes straight to a
+    # managed transaction against the new (unreachable) address.
+    if neo4j_store._driver is not None:
+        neo4j_store._driver.close()
+    neo4j_store._driver = None
+    neo4j_store._schema_ready = True
+    neo4j_store._uri = None
+    old_uri = os.environ.get("NEO4J_URI")
+    os.environ["NEO4J_URI"] = f"bolt://127.0.0.1:{port}"
+
+    def _restore() -> None:
+        neo4j_store.close()
+        stop.set()
+        server_thread.join(timeout=2)
+        srv.close()
+        if old_uri is None:
+            os.environ.pop("NEO4J_URI", None)
+        else:
+            os.environ["NEO4J_URI"] = old_uri
+
+    with contextlib.ExitStack() as stack:
+        stack.callback(_restore)
+
+        with TestClient(create_app(mock=False, warmup=False, api_key=False,
+                                   workers=False)) as client:
+            log_path = tmp / "retrieve.jsonl"
+            with _swap(index, "count", functools.partial(index.count, db=tmp / "index.db")), \
+                    _swap(api, "RETRIEVE_LOG", log_path), \
+                    _swap(rank, "search", lambda q, qv, top_k=50:
+                          [{"idea_id": "idea_dead0000001", "score": 0.5}]):
+                started = time.perf_counter()
+                resp = client.post("/retrieve", json={
+                    "query": "keep accuracy while finetuning", "rewrite": False})
+                elapsed = time.perf_counter() - started
+            assert resp.status_code == 503, (resp.status_code, resp.text)
+
+    # Threshold with room for a slow CI box (the fix's own worst case measured
+    # ~5s live) but nowhere near the ~60s ONE attempt costs at the driver's default
+    # `connection_acquisition_timeout`, let alone the ~120s two attempts cost at the
+    # driver's default `max_transaction_retry_time` (both measured live, 2026-07-31
+    # — see `neo4j_store`'s timeouts section) — a reverted timeout does not hide
+    # under this much slack.
+    threshold_s = 20.0
+    assert elapsed < threshold_s, (
+        f"/retrieve took {elapsed:.1f}s against an unreachable-but-TCP-accepting "
+        f"Neo4j — over the {threshold_s:.0f}s budget; neo4j_store's read timeout "
+        "profile (READ_CONNECTION_ACQUISITION_TIMEOUT / READ_MAX_TRANSACTION_"
+        "RETRY_TIME) looks reverted, removed, or no longer applied to this session")
+
+    return (f"/retrieve on an unreachable-but-connectable Neo4j answered 503 in "
+            f"{elapsed:.1f}s, under the {threshold_s:.0f}s budget (120+s measured "
+            "live before the fix)")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m lake.selfcheck",
