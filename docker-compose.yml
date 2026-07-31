@@ -99,6 +99,17 @@ services:
     depends_on:
       neo4j:
         condition: service_healthy
+      # SearXNG/Docling/Crawl4AI здесь НЕ перечислены и не описаны сервисами: они
+      # уже работают на school10 отдельным проектом `research_stack`
+      # (`~/gigaevo-core-memory/tools/research_stack/compose.yaml`), и `lake` ходит
+      # к ним через внешнюю сеть — см. `networks:` ниже. Поднимать свои копии
+      # значило бы держать второй Docling с его моделями рядом с уже живым.
+    networks:
+      # `default` — своя сеть проекта, в ней `neo4j`. `research` — чужая, уже
+      # существующая: в ней у сервисов есть алиасы `searxng`, `docling`,
+      # `crawl4ai`, и `.env.local` адресует их по этим именам.
+      - default
+      - research
 
   neo4j:
     image: neo4j:5-community
@@ -136,3 +147,31 @@ services:
 
 volumes:
   neo4j-data:
+
+networks:
+  default:
+
+  # --- Веб-исследование: чужая сеть, не свои сервисы -----------------------------
+  #
+  # SearXNG, Docling и Crawl4AI уже работают на school10 проектом `research_stack`
+  # (`~/gigaevo-core-memory/tools/research_stack/compose.yaml`), с алиасами
+  # `searxng`, `docling`, `crawl4ai` в сети `research_stack_default`. `lake`
+  # подключается к ней вторым интерфейсом и ходит по этим именам
+  # (`LAKE_SEARXNG_URL` и соседи в `.env.local`) — свои копии не поднимаем: второй
+  # Docling с его моделями рядом с уже живым это память впустую, а второй SearXNG
+  # ещё и второй открытый прокси в интернет.
+  #
+  # `external: true` намеренно жёсткое: если `research_stack` не поднят, `docker
+  # compose up` падает на отсутствующей сети — громко, до старта `lake`. Тихая
+  # альтернатива (создать пустую сеть и получить ConnectError на каждом запросе)
+  # выглядела бы как «агент работает, просто ничего не находит».
+  #
+  # Локально вне school10 сеть нужна ВСЕГДА, даже в graph-only режиме: compose
+  # разрешает сети до конфигурации сервисов, `lake` подключён к `research`
+  # безусловно, и `up` падает раньше, чем кто-либо прочитает `LAKE_RESEARCH_WEB`.
+  # Порядок: `docker network create research_stack_default`, и дальше либо поднять
+  # сервисы в ней самому, либо `LAKE_RESEARCH_WEB=0` — пустая сеть безвредна,
+  # `search_client is None` и никто в неё не звонит.
+  research:
+    name: research_stack_default
+    external: true

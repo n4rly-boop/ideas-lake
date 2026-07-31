@@ -6,12 +6,13 @@ evidence; callers decide how (or whether) to consume the report.
 """
 
 from .agent import DeepResearchAgent, ResearchError, build_default_agent
-from .models import ResearchRequest, ResearchResponse, ResearchSource
+from .models import ResearchIngest, ResearchRequest, ResearchResponse, ResearchSource
 from .web import SelfHostedResearchClient
 
 __all__ = [
     "DeepResearchAgent",
     "ResearchError",
+    "ResearchIngest",
     "ResearchRequest",
     "ResearchResponse",
     "ResearchSource",

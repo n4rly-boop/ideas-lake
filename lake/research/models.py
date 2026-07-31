@@ -30,6 +30,32 @@ class ResearchSource(BaseModel):
     _url = field_validator("url")(_http_url)
 
 
+class ResearchIngest(BaseModel):
+    """One `/fetch`-shaped queue attempt for a source found during research.
+
+    Only arXiv sources reach here (`/fetch`'s own door, §2.1 of the spec): `url` is
+    the original hit url as found, never the Docling-normalized PDF url — it is the
+    address research actually read, reported back unchanged. It does NOT predict the
+    graph node: the fetch worker reads only `args["arxiv_id"]` (`api/workers.py:176`)
+    and `Source.id` hashes the arXiv API's own versioned abs url
+    (`ingest/fetch.py:423`), which this url need not equal. Use `arxiv_id` to correlate
+    with the graph, not `url`. `status` mirrors the
+    queue row's status on success (`queued`/`running`/`staged`/…) and one of
+    `queue_full` / `conflict` / `error` on a refusal — never silently absent, so a
+    caller can tell "not sent, not arXiv" (missing from this list) from "sent, and
+    it failed" (present, with a status that says how).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    url: str
+    arxiv_id: str = Field(min_length=1, max_length=64)
+    job_id: str | None = None
+    status: str = Field(min_length=1, max_length=32)
+
+    _url = field_validator("url")(_http_url)
+
+
 class ResearchRequest(BaseModel):
     """Natural-language mission accepted by the Lake research service."""
 
@@ -82,6 +108,10 @@ class ResearchResponse(BaseModel):
     report: str = Field(min_length=1, max_length=50_000)
     queries: list[str] = Field(max_length=5)
     sources: list[ResearchSource] = Field(max_length=12)
+    # default_factory, not a bare default: every existing call that built a
+    # ResearchResponse before ingest existed omits this field, and a mutable-looking
+    # default without the factory would be one shared list across every response.
+    ingested: list[ResearchIngest] = Field(default_factory=list, max_length=12)
     rag_status: Literal["ok", "empty", "degraded", "disabled"]
     rag_log_id: str | None = None
     rag_ideas: int = Field(ge=0)
