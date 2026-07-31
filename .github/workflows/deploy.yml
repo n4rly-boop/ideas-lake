@@ -221,7 +221,20 @@ jobs:
           ssh "$TARGET" bash -s -- "$TAG" <<'EOF'
             set -euo pipefail
             cd ~/ideas-lake
-            export LAKE_TAG="$1"
+            TAG="$1"
+            # Persist the tag into .env.local (idempotent: replace the line if
+            # present, append otherwise) so that ANY later `docker compose`
+            # here — not just this run's `up -d` below — resolves the same
+            # image (see the `image:` comment in docker-compose.yml). Without
+            # this a manual `docker compose up`/`run` on the server silently
+            # fell back to the mutable `:latest` tag instead of what's actually
+            # deployed.
+            if grep -q '^LAKE_TAG=' .env.local; then
+              sed -i "s/^LAKE_TAG=.*/LAKE_TAG=$TAG/" .env.local
+            else
+              printf 'LAKE_TAG=%s\n' "$TAG" >> .env.local
+            fi
+            export LAKE_TAG="$TAG"
             docker compose --env-file .env.local pull lake
             docker compose --env-file .env.local up -d
             docker logout ghcr.io

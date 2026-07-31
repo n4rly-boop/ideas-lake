@@ -44,6 +44,18 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 долгоживущего PAT на машине нет. `.env.local` в CI не приезжает никогда.
 Откат — `LAKE_TAG=<старый sha> docker compose --env-file .env.local up -d`, без пересборки.
 
+Шаг `pull & up` (`deploy.yml`) пишет `LAKE_TAG=<sha>` в серверный `.env.local` —
+идемпотентно (заменяет строку `sed`, не плодит дубли), правкой на месте, не
+перезаписью файла с секретами целиком. Поэтому и ручной `docker compose up`/`run`
+на сервере без флагов резолвит тот же образ, что и последний деплой, а не то, что
+подставит переменная по умолчанию. Дефолт в `docker-compose.yml` — `${LAKE_TAG:-local}`,
+не `:latest`: `latest` в GHCR двигает сам CI при каждой сборке, и если `LAKE_TAG`
+когда-нибудь пропадёт из `.env.local`, `pull` на несуществующий тег `:local` упадёт
+явно, а не подставит образ неизвестной свежести молча. Разобрано на живом сервере
+2026-07-31: контейнер бежал на `f9ebcd10efc9`, а `docker compose run` без `LAKE_TAG`
+тянул `:latest` и падал `No module named lake.idea_edges` — старый образ, писавший
+граф в SQLite, поверх данных, которые уже в Neo4j.
+
 Каждый модуль дополнительно исполняем: `python3 -m lake.index`, `python3 -m lake.embed`,
 `python3 -m lake.ingest.link`, `python3 -m lake.ingest.trust`, `python3 -m lake.ingest.runlog`,
 `python3 -m lake.neo4j_store`, `python3 -m lake.graph_client`, `python3 -m lake.retrieve.rank`
