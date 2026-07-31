@@ -56,9 +56,14 @@ POST /retrieve
 предупреждения явно возвращаются; если одновременно нет рабочего RAG и
 independent web evidence, ответ — `503`, а не выдуманный пустой успех.
 
+Планирование и synthesis в `POST /research` используют Qwen3.6-35B-A3B.
+Механические parse/generalize/retrieve-rewrite шаги остаются на Qwen3.5-9B,
+а существующие link/trust judgement уже используют 35B.
+
 Эволюционный `EvolutionResearchAgent` пока остаётся копией в
-`gigaevo-core-runtime/` для совместимости текущих прогонов. Будущие прогоны Core
-могут вызывать `/research` из фонового research worker; Core сам решает, какие
+`gigaevo-core-runtime/` для совместимости текущих прогонов. Активная
+интеграционная ветка Core вызывает `/research` из фонового research worker;
+Core сам решает, какие
 гипотезы передать в task-local memory. Ручка не вызывается из `select_cards`,
 `pre_step_hook` или `post_step_hook`.
 
@@ -99,7 +104,8 @@ LAKE_KEY_35B     ключ к Qwen3.6-35B-A3B
 LAKE_SEARXNG_URL  адрес локального SearXNG (по умолчанию http://127.0.0.1:8080)
 LAKE_CRAWL4AI_URL адрес локального Crawl4AI (по умолчанию http://127.0.0.1:11235)
 LAKE_DOCLING_URL  адрес локального Docling (по умолчанию http://127.0.0.1:5001)
-LAKE_RESEARCH_TIMEOUT_S таймаут одной операции research (по умолчанию 30)
+LAKE_RESEARCH_TIMEOUT_S таймаут web/PDF-операции research (по умолчанию 30)
+LAKE_RESEARCH_LLM_TIMEOUT_S таймаут одного 35B planning/synthesis-вызова (по умолчанию 90)
 NEO4J_URI        neo4j+s://…
 NEO4J_USERNAME
 NEO4J_PASSWORD

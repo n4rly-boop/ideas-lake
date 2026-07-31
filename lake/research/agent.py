@@ -47,6 +47,13 @@ and `synthesis_failed:LLMError`. `selfcheck` asserts the ceiling so a schema can
 quietly reacquire it.
 """
 
+# The 35B pool took 32.5 seconds for a four-token canary under measured
+# contention. Planning and synthesis must therefore not inherit the 30-second
+# page/PDF client timeout: a busy but healthy model is not a failed research
+# round. This is per model call; the API's overall request bound is owned by its
+# caller.
+DEFAULT_RESEARCH_LLM_TIMEOUT_S = 90.0
+
 SYNTHESIS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -173,8 +180,8 @@ class DeepResearchAgent:
         model_complete: ModelCall | None = None,
         rag_retrieve: Callable[..., tuple[int, dict]] | None = None,
         ingest: Callable[[str, str], dict] | None = None,
-        model=llm.QWEN_9B,
-        timeout_s: float = 30.0,
+        model=llm.QWEN_35B,
+        timeout_s: float = DEFAULT_RESEARCH_LLM_TIMEOUT_S,
     ) -> None:
         # None is graph-only mode (Изменение 1): no web search, no web extraction,
         # no independent evidence at all this round — just the Lake's own priors.
@@ -522,4 +529,13 @@ def build_default_agent() -> DeepResearchAgent:
             docling_url=os.environ.get("LAKE_DOCLING_URL", "http://127.0.0.1:5001"),
             timeout_s=float(os.environ.get("LAKE_RESEARCH_TIMEOUT_S", "30")),
         )
-    return DeepResearchAgent(search_client=search_client)
+    return DeepResearchAgent(
+        search_client=search_client,
+        model=llm.QWEN_35B,
+        timeout_s=float(
+            os.environ.get(
+                "LAKE_RESEARCH_LLM_TIMEOUT_S",
+                str(DEFAULT_RESEARCH_LLM_TIMEOUT_S),
+            )
+        ),
+    )

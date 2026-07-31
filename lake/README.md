@@ -364,14 +364,22 @@ C пишет ветку, которая никогда не сработает.
 4. возвращает language report, `queries`, independently fetched `sources` и
    per-round token/latency cost.
 
+Планирование запросов и synthesis в `lake/research/agent.py` работают на
+`Qwen3.6-35B-A3B` (`llm.QWEN_35B`) с таймаутом одного вызова
+`LAKE_RESEARCH_LLM_TIMEOUT_S=90` по умолчанию. Механические parse/generalize/
+retrieve-rewrite шаги остаются на 9B; существующие link/trust judgement уже
+используют 35B. Это отдельная модельная роль, а не изменение ранжирования или
+схемы API.
+
 RAG-приоры не копируются в task-local memory и не считаются доказательством.
 Отсутствие RAG явно помечается `rag_status=empty|degraded`; отсутствие web
 evidence при сломанном RAG даёт `503`. Модель не выносит verdict о feasibility,
 fitness, usefulness или promotion — это ответственность Core и evaluator.
 
-Для текущих запусков копия агента остаётся в `gigaevo-core-runtime/`.
-Интеграция Core с `/research` будет отдельной веткой: вызов должен оставаться
-в фоне, а EvolutionResearchAgent — выбирать task-local hypotheses из отчёта.
+Совместимая копия агента остаётся в `gigaevo-core-runtime/` для старых запусков.
+Активная интеграционная ветка Core вызывает `/research` в фоне; его
+`EvolutionResearchAgent` формирует и выбирает task-local hypotheses из отчёта,
+а не инжектирует карточки Lake напрямую.
 
 ```
 POST /retrieve
