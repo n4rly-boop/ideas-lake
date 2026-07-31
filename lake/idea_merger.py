@@ -16,10 +16,12 @@ serving path cannot read.
 
 A hypothesis is not a bare Idea node. `13` §5-§6:
 
-- `origin="synthesized"` on the idea itself. Without it a leafless idea with
-  `trust_score=0` is indistinguishable from a write that died between `create_idea` and
-  `write_theses`, which is exactly what selfcheck 6.30 (`selfcheck.py:2097-2127`) reads
-  it as.
+- `origin="synthesized"` on the idea itself — `13` §5's «признак живёт на самой идее».
+  It is what tells "a model built this out of two other ideas" from "this came out of
+  papers", which are otherwise the same row; it is what 6.31's orphan-origin parity
+  compares across backends (`selfcheck.py:2365-2372`); and it is what keeps a
+  hypothesis out of the parent pool below. (Not, strictly, what saves it from 6.30:
+  that check only inspects LEAFLESS ideas, and `write_hypothesis` never leaves one.)
 - one **synthetic leaf**, or the hypothesis cannot be found at all: `/retrieve` searches
   theses, not ideas (§6 p.1). `Source(type="synthesis", url="lake://synthesis/<idea_id>")`
   + a `Thesis` whose `locator` names the parents is the whole provenance mechanism —
@@ -49,8 +51,35 @@ Pipeline per pair:
 The `DERIVED_FROM` edge to the two parents is **not** written here. A writes no
 Idea—Idea edges at all (`13` §3.1) and `graph_client` has no method for one; the edge is
 block B's side and lives in `idea_edges.py --derived-from`, which reads the parentage
-back off the leaf's `locator`. Nothing is lost by the split — the parentage reaches the
-graph either way — and this module keeps one write path instead of two.
+back off the leaf's `locator`, so this module keeps one write path instead of two.
+
+Two deliberate gaps, both worth knowing before reading a run's output as complete:
+
+- **`--derived-from` speaks Cypher only.** Under `LAKE_STORE=stub` the hypothesis
+  lands in SQLite, and that pass — which never touches `stub_store`'s `edge` table —
+  finds nothing to convert. The parentage still exists, on the leaf's `locator`, but it
+  never becomes an edge and `stub_store.neighbors` never returns it. Edges on the stub
+  backend need Neo4j, or they need a stub writer nobody has asked for yet.
+- **No dedup.** `13` §6 п.2 has the synthetic leaf go through the arbiter
+  (`link.py:46-109`) so a repeated synthesis attaches to the existing idea instead of
+  creating a second node; that is deferred by decision, not overlooked. `create_idea_
+  with_theses` is called directly, and the storage layer cannot dedup either: every
+  hypothesis gets its own `source_id` (the url carries the NEW idea id), so
+  `UNIQUE(source_id, text_hash)` never collides. Synthesizing the same pair twice
+  yields two ideas, two sources, two indexed leaves. `12-decisions-meetings.md:146`
+  stays open.
+
+One place where `13` disagrees with itself, recorded rather than silently resolved:
+§5-§6 define a hypothesis as «идея с `trust_score = 0` и без доказательств», but §3.2
+has `create_idea_with_theses` raise `dirty`, and §3.3 has the judge score every dirty
+idea. A hypothesis has exactly one leaf (§6 requires it), so `trust.refresh`'s
+leafless exemption (`ingest/trust.py:119-124`) does not apply and the judge writes a
+non-zero score — measured at 0.2 on the first live corpus, correctly low, since the
+leaf it reads says `effect="не проверено"`. Nothing here forces the score back to 0:
+picking a side would be resolving a spec contradiction in code, and the judge's own
+answer is the better-grounded one. Live effect today is nil — `TRUST_WEIGHT = 0.0`
+(`retrieve/rank.py:29`) — but §6's ranking argument rests on the premise that a
+hypothesis scores 0, and it does not.
 
 Every pair, accepted or not, is logged to `data/logs/idea_merger.jsonl` (append, same
 shape as `retrieve/api.py`'s own log) for manual audit of the classifier. A classifier
@@ -110,8 +139,21 @@ def sample_idea_pairs(num_pairs: int, min_trust: float | None = None) -> list[tu
     and runs.
     """
     ids = graph_client.list_idea_ids(limit=POOL_LIMIT)
+    if len(ids) == POOL_LIMIT:
+        # `list_idea_ids` is `ORDER BY seq SKIP/LIMIT` (`neo4j_store.py:485-490`), so a
+        # lake past the ceiling hands back its OLDEST POOL_LIMIT ideas and the newest
+        # are never eligible as parents. Silent truncation reads as completeness
+        # (`13` §9.3) — the docstring says "at random out of the lake", and this line
+        # is what keeps that from quietly becoming a lie.
+        print(f"WARNING: pool hit POOL_LIMIT={POOL_LIMIT}; parents are sampled from the "
+              f"oldest {POOL_LIMIT} ideas only, not from the whole lake")
+    # `!= "synthesized"`, not `== "extracted"`: the invariant is "a hypothesis is not a
+    # parent", and a whitelist also drops anything whose `origin` is absent. On Neo4j a
+    # node written by B without the property reads back as `origin=None`
+    # (`neo4j_store.py:196-200`), and `07:87-89` documents B's own nodes living in this
+    # same instance — a whitelist would exclude them from the pool without a word.
     pool = [body for body in graph_client.get_ideas(ids)
-            if body["origin"] == "extracted"
+            if body["origin"] != "synthesized"
             and (min_trust is None or body["trust_score"] >= min_trust)]
     random.shuffle(pool)
     picked = pool[:num_pairs * 2]
@@ -210,6 +252,14 @@ def write_hypothesis(idea: Idea, parent_ids: list[str]) -> Thesis:
     in the same order as the ingest loop (`run.py:246-280`). Indexing after the commit,
     never before: an indexed thesis no graph write backs is a search hit into a hole,
     and `_reconcile_index` only ever repairs the other direction."""
+    # ponytail: a failure between `write_source` and `create_idea_with_theses` leaves a
+    # Source with no leaves, and unlike the ingest loop this one cannot self-heal — the
+    # cursor there is not advanced and `source_id` is stable, so a retry MERGEs the same
+    # node, while here `source_id` hashes a url containing a FRESH idea id, so no rerun
+    # ever addresses the orphan again (review). Nothing reads it either, so it costs one
+    # row in `/stats.sources`. Upgrade path if it stops being cosmetic: pass the Source
+    # into the same transaction as the idea, which needs a `graph_client` method that
+    # takes both — not worth a store-API change for a hand-run exploratory tool.
     src, thesis = synthesis_records(idea, parent_ids)
     graph_client.write_source(src)
     graph_client.create_idea_with_theses(idea, src.id, [thesis])
@@ -221,11 +271,17 @@ def write_hypothesis(idea: Idea, parent_ids: list[str]) -> Thesis:
 # Audit log (data/logs/idea_merger.jsonl, gitignored runtime data)
 # ============================================================
 
-def log_pair(idea_a: dict, idea_b: dict, result: Idea | None, *, log_path=MERGE_LOG) -> None:
+def log_pair(idea_a: dict, idea_b: dict, result: Idea | None, *, persisted: bool,
+             log_path=MERGE_LOG) -> None:
+    """`persisted` is not decoration. Without it a `--persist` run whose write then
+    raised and a plain dry run produce byte-identical lines, and a log the docstring
+    sells as "for manual audit" cannot answer the one question an audit asks: is this
+    hypothesis in the lake? (review)"""
     record = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
               "run_id": trace.current_run_id(),
               "idea_a_id": idea_a["id"], "idea_b_id": idea_b["id"],
               "decision": "combine" if result is not None else "reject",
+              "persisted": persisted,
               "new_idea": result.model_dump() if result is not None else None}
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as fh:
@@ -246,15 +302,24 @@ def run(num_pairs: int, persist: bool, min_trust: float | None = None,
     results: list[Idea | None] = []
     for idea_a, idea_b in pairs:
         result = try_combine_ideas(idea_a, idea_b)
-        log_pair(idea_a, idea_b, result, log_path=log_path)
-        if result is not None:
-            print(f"combined {idea_a['id']} + {idea_b['id']} -> {result.id}: {result.text}")
-            if persist:
-                thesis = write_hypothesis(result, [idea_a["id"], idea_b["id"]])
-                print(f"   written via {graph_client.backend_name()}, "
-                      f"synthetic leaf {thesis.id} indexed")
-        else:
-            print(f"rejected {idea_a['id']} + {idea_b['id']}")
+        written = False
+        # Logged AFTER the write, with its outcome, and in a `finally` so a raising
+        # write still leaves a line saying `persisted: false` before it propagates.
+        # Logging first could only ever record the classifier's decision, never what
+        # reached the lake; logging after without the `finally` would lose the pair
+        # entirely on the one run where knowing about it matters most.
+        try:
+            if result is not None:
+                print(f"combined {idea_a['id']} + {idea_b['id']} -> {result.id}: {result.text}")
+                if persist:
+                    thesis = write_hypothesis(result, [idea_a["id"], idea_b["id"]])
+                    written = True
+                    print(f"   written via {graph_client.backend_name()}, "
+                          f"synthetic leaf {thesis.id} indexed")
+            else:
+                print(f"rejected {idea_a['id']} + {idea_b['id']}")
+        finally:
+            log_pair(idea_a, idea_b, result, persisted=written, log_path=log_path)
         results.append(result)
     return results
 
@@ -373,9 +438,26 @@ def demo() -> None:
         vec[0] = 1.0
         return np.stack([vec for _ in texts])
 
-    llm.complete = fake_complete
     from . import embed
+    # Restored at the end. Harmless while `--self-check` owns the process, but the
+    # moment this `demo()` is called in-process — which is exactly what CLAUDE.md's
+    # "проверка в selfcheck.py" invites — an unrestored `llm.complete` makes every
+    # later LLM check run against the fake and pass (review). `selfcheck.py` runs it
+    # as a subprocess for that reason; this makes it safe either way.
+    _real_complete, _real_embed = llm.complete, embed.embed_docs
+    llm.complete = fake_complete
     embed.embed_docs = fake_embed_docs
+    try:
+        _demo_body(idea_a, idea_b, calls, _body)
+    finally:
+        llm.complete, embed.embed_docs = _real_complete, _real_embed
+
+
+def _demo_body(idea_a, idea_b, calls, _body) -> None:
+    """The checks themselves. Split out so `demo()` can restore the patched module
+    functions in a `finally` without indenting every assert below into a try block."""
+    import tempfile
+    from pathlib import Path
 
     # (a) classifier says no -> None, generator never called.
     global _ANSWERS
@@ -400,14 +482,19 @@ def demo() -> None:
     # (c) the synthetic leaf: §6's shape, field by field, parents in the locator.
     src, thesis = synthesis_records(result, [idea_a["id"], idea_b["id"]])
     parents = f"{idea_a['id']}+{idea_b['id']}"
+    # Every value here is the LITERAL `13` §6 spells out, never the module constant that
+    # produced it: `assert thesis.effect == UNVERIFIED` compares a constant to itself and
+    # stayed green with `UNVERIFIED = "measured"` (review, verified by mutation). Same
+    # reason the title is pinned whole rather than by `parents in src.title`, which a
+    # title of just "idea_a+idea_b" — no "синтез: " prefix — also satisfies.
     assert src.type == "synthesis", src.type
     assert src.url == f"lake://synthesis/{result.id}", src.url
     assert src.id == make_source_id(src.url, result.created_at), src.id
-    assert parents in src.title, src.title
+    assert src.title == f"синтез: {parents}", src.title
     assert thesis.idea_id == result.id and thesis.source_id == src.id
     assert thesis.locator == f"synthesis/{parents}", thesis.locator
     assert thesis.context == f"синтез из {parents}", thesis.context
-    assert thesis.effect == UNVERIFIED, thesis.effect
+    assert thesis.effect == "не проверено", thesis.effect
     assert result.text in thesis.text and result.applicability_conditions in thesis.text
     assert thesis.text_hash == text_hash(thesis.text) and len(thesis.vector) == 384
     print("ok (c): synthetic leaf = Source(type='synthesis') + Thesis(locator=parents)")
@@ -429,28 +516,71 @@ def demo() -> None:
 
     # (e) sampling refuses hypotheses as parents: compounding unverified content leaves
     # nothing in the chain that ever grounds it (`sample_idea_pairs`).
+    # The fixture carries FOUR ideas, three of them hypotheses, and the assert is on the
+    # pair COUNT. With one hypothesis among three bodies the mutant (filter removed)
+    # still produced exactly one pair and went green whenever the unseeded shuffle put
+    # the two extracted ideas first — measured at 33% (review). Here removing the filter
+    # makes the pool 4 and the pair count 2, which no shuffle can hide. `random.seed` is
+    # set anyway so the identity assert below is not a coin flip either.
+    random.seed(0)
     hypo = _body("idea_cccccccccccc", "a hypothesis", origin="synthesized", trust_score=0.0)
-    globals()["graph_client"] = _FakeGraph([idea_a, idea_b, hypo])
+    hypo2 = _body("idea_dddddddddddd", "another hypothesis", origin="synthesized",
+                  trust_score=0.0)
+    globals()["graph_client"] = _FakeGraph([idea_a, idea_b, hypo, hypo2])
     try:
         pairs = sample_idea_pairs(5)
-        assert len(pairs) == 1, pairs
+        assert len(pairs) == 1, pairs      # 2 eligible -> 1 pair; 4 eligible -> 2 pairs
         assert {p["id"] for p in pairs[0]} == {idea_a["id"], idea_b["id"]}, pairs
         assert sample_idea_pairs(5, min_trust=9.0) == []      # min_trust, same read
+        # `origin` absent (a node B wrote without the property) must stay eligible: the
+        # rule is "not a hypothesis", not "explicitly extracted".
+        unlabelled = _body("idea_eeeeeeeeeeee", "from block B", origin=None)
+        globals()["graph_client"] = _FakeGraph([idea_a, unlabelled])
+        assert len(sample_idea_pairs(5)) == 1, "origin=None is not a hypothesis"
     finally:
         globals()["graph_client"] = real_graph
-    print("ok (e): origin='synthesized' is never a parent; min_trust filters")
+    print("ok (e): origin='synthesized' is never a parent; origin=None still is; min_trust filters")
 
-    # (f) log_pair: reject and combine both produce one JSONL line, decision named.
+    # (f) log_pair: reject and combine both produce one JSONL line, decision named, and
+    # `persisted` tells a combine that reached the lake from one that did not.
     with tempfile.TemporaryDirectory() as tmp:
         log_path = Path(tmp) / "idea_merger.jsonl"
-        log_pair(idea_a, idea_b, None, log_path=log_path)
-        log_pair(idea_a, idea_b, result, log_path=log_path)
+        log_pair(idea_a, idea_b, None, persisted=False, log_path=log_path)
+        log_pair(idea_a, idea_b, result, persisted=True, log_path=log_path)
+        log_pair(idea_a, idea_b, result, persisted=False, log_path=log_path)
         lines = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines()]
-        assert len(lines) == 2, lines
+        assert len(lines) == 3, lines
         assert lines[0]["decision"] == "reject" and lines[0]["new_idea"] is None
         assert lines[1]["decision"] == "combine" and lines[1]["new_idea"]["id"] == result.id
         assert lines[1]["new_idea"]["origin"] == "synthesized", lines[1]
-    print("ok (f): log_pair -> one JSONL line per pair, reject and combine both carried")
+        # The two combine lines differ ONLY in `persisted`; without the field they are
+        # the same bytes, and the audit cannot tell a written hypothesis from a lost one.
+        assert lines[1]["persisted"] is True and lines[2]["persisted"] is False, lines
+        assert {k: v for k, v in lines[1].items() if k not in ("ts", "persisted")} == \
+               {k: v for k, v in lines[2].items() if k not in ("ts", "persisted")}
+    print("ok (f): log_pair -> one JSONL line per pair, `persisted` separates written from lost")
+
+    # (g) a raising write still leaves an audited line, saying it was not persisted —
+    # the run where the log matters most is the one where the write failed.
+    class _Exploding(_FakeGraph):
+        def create_idea_with_theses(self, idea, source_id, theses):
+            raise RuntimeError("store died mid-write")
+
+    _ANSWERS = [True]
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "idea_merger.jsonl"
+        globals()["graph_client"], globals()["index"] = _Exploding([idea_a, idea_b]), _FakeGraph()
+        try:
+            run(1, persist=True, log_path=log_path)
+        except RuntimeError as exc:
+            assert "store died mid-write" in str(exc)
+        else:
+            raise AssertionError("a store failure must propagate, not be swallowed")
+        finally:
+            globals()["graph_client"], globals()["index"] = real_graph, real_index
+        lines = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines()]
+        assert len(lines) == 1 and lines[0]["persisted"] is False, lines
+    print("ok (g): a write that raised still logs the pair, as persisted=false, then propagates")
 
     print("idea_merger self-check OK")
 

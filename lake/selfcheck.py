@@ -2675,6 +2675,46 @@ def _fingerprint_real_data() -> dict[str, str]:
     return out
 
 
+@check(34, "the Idea-synthesis pair (`lake/idea_merger.py`, `lake/idea_edges.py`) has "
+           "its own self-check RUN here, as a subprocess: hypothesis shape (`13` §6 "
+           "field by field), origin/trust, the write order through graph_client, the "
+           "indexed synthetic leaf, `persisted` in the audit log, and on the edge side "
+           "the `:RELATED` label both readers match plus the accumulate/MERGE/MATCH "
+           "semantics of the upsert. Offline, no store and no network")
+def check_34(tmp: Path) -> str:
+    """Both modules used to live entirely behind their own `--self-check`, reached by
+    neither this suite nor CI (`.github/workflows/deploy.yml` runs `lake.ingest.run
+    selfcheck`, `lake.api.selfcheck` and `lake.selfcheck --offline`, and nothing else)
+    — against CLAUDE.md's «нетривиальная логика оставляет проверку в `selfcheck.py`».
+    A check that exists but is never invoked is the same as no check.
+
+    Subprocess, not `demo()` in-process, for the reason 6.31a already gives: `demo()`
+    monkey-patches `llm.complete` and `embed.embed_docs`, and although both are now
+    restored in a `finally`, a fake LLM leaking into the rest of THIS suite would make
+    every later check pass for free. Process isolation makes that structurally
+    impossible rather than merely unlikely.
+    """
+    import subprocess
+
+    notes = []
+    for module, final_line in (("lake.idea_merger", "idea_merger self-check OK"),
+                               ("lake.idea_edges", "idea_edges self-check OK")):
+        result = subprocess.run([sys.executable, "-B", "-m", module, "--self-check"],
+                                cwd=REPO, capture_output=True, text=True, timeout=180)
+        # The module's own final line, not only the exit code: a run that died before
+        # reaching a live assertion (import error, hang) must not read as green
+        # because something downstream defaulted to 0.
+        assert final_line in result.stdout, (
+            f"{module}'s self-check did not reach its final line (exit "
+            f"{result.returncode}):\n--- stdout ---\n{result.stdout}\n"
+            f"--- stderr ---\n{result.stderr}")
+        assert result.returncode == 0, (
+            f"{module}'s self-check printed its ok line but exited "
+            f"{result.returncode}:\n{result.stdout}\n{result.stderr}")
+        notes.append(f"{module}: {result.stdout.count('ok (')} checks")
+    return "; ".join(notes) + " — both ran to completion as subprocesses"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m lake.selfcheck",
