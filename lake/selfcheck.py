@@ -453,6 +453,14 @@ def check_05(tmp: Path) -> None:
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(_swap(api, "RETRIEVE_LOG", log_path))
+        # `index.count` takes `db=INDEX_DB` as a DEFAULT ARGUMENT, bound at def
+        # time (the same trap `search.search` has, api/selfcheck.py:109-112, and
+        # check_19 already patches around) — left unpatched, `retrieve.api.retrieve`'s
+        # own §6.19 divergence guard reads the real `data/index.db` (empty in a
+        # fresh image) against this check's temp store (5 leaves) and answers 503
+        # instead of 200, and on a host whose real index.db is non-empty it silently
+        # reads the operator's real index on every run instead of failing loud.
+        stack.enter_context(_swap(index, "count", functools.partial(index.count, db=idx)))
         # The whole read path is real except the two edges that would need a server:
         # the query embedding and the rewrite call. `main()` already wraps the whole
         # suite in `_fake_embed()`, which is what keeps `rank.rank`'s own embed call
@@ -2530,7 +2538,13 @@ def check_32(tmp: Path) -> str:
                 assert set(body) == {"error"}, (path, body)
 
             log_path = tmp / "retrieve.jsonl"
-            with _swap(api, "RETRIEVE_LOG", log_path), \
+            # `index.count` takes `db=INDEX_DB` as a DEFAULT ARGUMENT, bound at def
+            # time (same trap as check_05/check_19) — the §6.19 divergence guard
+            # runs it FIRST, before `graph_client.counts()` gets a chance to raise
+            # on the killed Neo4j below, so an unpatched call here reaches the real
+            # `data/index.db` even though this check never builds a fixture index.
+            with _swap(index, "count", functools.partial(index.count, db=tmp / "index.db")), \
+                    _swap(api, "RETRIEVE_LOG", log_path), \
                     _swap(rank, "search", lambda q, qv, top_k=50:
                           [{"idea_id": "idea_dead0000001", "score": 0.5}]):
                 resp = client.post("/retrieve", json={

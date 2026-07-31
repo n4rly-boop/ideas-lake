@@ -27,7 +27,7 @@ import tokenize
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import graph_client, llm
+from .. import graph_client, llm, trace
 from ..models import RUN_DIR, DraftThesis, Source, source_id as make_source_id, text_hash
 
 # The marker a failed validation run leaves in `metric_fitness` (README.md:37-52,
@@ -597,6 +597,15 @@ if __name__ == "__main__":
     import numpy as np
 
     from ..models import EMBED_DIM
+
+    # `generalize()` (called through `from_csv` below) is `@trace`d (ingest/generalize.py:39),
+    # and `trace._write` mkdirs and appends to the module-global `trace.TRACES_DIR` — left
+    # unbound, every `from_csv` call in this self-check (the synthetic CSV below and the
+    # optional real ground-truth CSVs further down) wrote its trace rows into the real
+    # `data/traces/<pid-random>.jsonl` (found: a plain self-check run left ~900 lines
+    # behind). One process, one run id, so one bind for the whole script is enough — there
+    # is no next check after this to leave dirty.
+    trace.TRACES_DIR = Path(tempfile.mkdtemp(prefix="lake-runlog-selfcheck-"))
 
     real_complete, real_canary = llm.complete, llm.assert_grammar_works
 
