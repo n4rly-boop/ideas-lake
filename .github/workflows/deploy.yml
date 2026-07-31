@@ -181,15 +181,23 @@ jobs:
               [ -n "$neo4j_count" ] && neo4j_ok=1
             fi
 
-            if [ "$has_sqlite" = 1 ]; then
-              echo "REFUSED: $sqlite_path still present on the server — migrate it to Neo4j first (D11), then remove it"
-              exit 1
-            fi
+            # What this gate is for: the image being deployed cannot read SQLite at
+            # all (D11), so shipping it onto a server whose lake never reached Neo4j
+            # serves an empty graph that looks healthy. The evidence that rules that
+            # out is DATA IN NEO4J — not the absence of a file. An earlier version of
+            # this step refused on `lake.db` existing and told the operator to delete
+            # it to unblock: that turns a gate meant to protect the data into an
+            # instruction to destroy it, and `rm lake.db` satisfied it whether or not
+            # a single node had ever landed. Presence of the old file is now a
+            # warning; only an empty or unreachable graph refuses.
             if [ "$neo4j_ok" != 1 ] || [ "$neo4j_count" -eq 0 ]; then
-              echo "REFUSED: no $sqlite_path AND Neo4j (NEO4J_URI=${NEO4J_URI:-<unset>}) is unreachable or empty (nodes: ${neo4j_count:-unreachable}) — this looks uninitialized, not migrated. Refusing to deploy over it (D11)."
+              echo "REFUSED: Neo4j (NEO4J_URI=${NEO4J_URI:-<unset>}) is unreachable or empty (nodes: ${neo4j_count:-unreachable}) — the deployed image reads no SQLite (D11), so this would serve an empty lake as if it were healthy. Migrate with the OLD image first: docker compose run --rm -e NEO4J_TARGET_URI=... lake python -m lake.neo4j_load"
               exit 1
             fi
-            echo "ok: no $sqlite_path, Neo4j has $neo4j_count node(s) — data landed, deploy may proceed"
+            if [ "$has_sqlite" = 1 ]; then
+              echo "note: $sqlite_path is still on disk — the deployed image never reads it (D11); kept as the pre-migration copy. Neo4j has $neo4j_count node(s), which is what this gate checks."
+            fi
+            echo "ok: Neo4j has $neo4j_count node(s) — data landed, deploy may proceed"
           EOF
 
       # Один файл, не исходники: всё остальное внутри образа.
