@@ -132,6 +132,20 @@ API держит озеро в SQLite, а в Neo4j ходит только `lake
 граф-вью переживает пере-экспорт. Раскрасить узлы по типу — три группы в настройках графа:
 `path:"ideas/"`, `path:"theses/"`, `path:"sources/"`.
 
+### Демо-страница под защиту
+
+```bash
+python3 demo/build.py        # snapshot.json -> demo/index.html, один файл, без JS
+python3 demo/shoot.py        # PNG всей страницы и по секции, 2x; --light для светлой темы
+```
+
+`demo/snapshot.json` — тела ответов живого прода (`/stats`, `/healthz`, `/sources`, `/ideas`,
+`/ideas/{id}/neighbors`, `/search`, восемь `/retrieve`), `retrieve_log.jsonl` — хвост
+`data/logs/retrieve.jsonl`, откуда берётся `cut_off` (в ответе его нет). `build.py` падает
+на assert, если число на странице расходится с `/stats` или у вызова нет строки в логе:
+страница не считает ничего сама. Снять новый слепок — прогнать те же ручки и заменить
+файлы; ключ при этом не должен покидать сервер.
+
 ## Состояние
 
 Write path и read path проходят end-to-end на живых серверах школы. Последний прогон:

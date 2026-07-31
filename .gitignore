@@ -11,6 +11,9 @@ LLM-серверы — подключение.ipynb
 # Runtime data (10-implementation-spec.md §2)
 data/
 
+# Скриншоты демо-страницы — пересобираются из index.html за секунды (demo/shoot.py)
+demo/shots/
+
 # Python
 __pycache__/
 *.py[cod]
