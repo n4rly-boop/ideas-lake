@@ -7,7 +7,10 @@ import asyncio
 import httpx
 
 from .. import queue
-from .agent import DeepResearchAgent, ResearchError, _safe_queries, build_research_prompt
+from .agent import (
+    GRAMMAR_MAX_LENGTH, PLAN_SCHEMA, SYNTHESIS_SCHEMA, DeepResearchAgent,
+    ResearchError, _safe_queries, build_research_prompt,
+)
 from .models import ResearchRequest, ResearchSource
 from .web import ResearchSearchError, SelfHostedResearchClient, WebHit
 
@@ -126,7 +129,35 @@ def _model(prompt: str, *, op: str, **kwargs):
     raise AssertionError(op)
 
 
+def _max_lengths(node) -> list[int]:
+    """Every `maxLength` anywhere in a schema, however deeply nested."""
+    found: list[int] = []
+    if isinstance(node, dict):
+        if isinstance(node.get("maxLength"), int):
+            found.append(node["maxLength"])
+        for value in node.values():
+            found.extend(_max_lengths(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_max_lengths(value))
+    return found
+
+
 def main() -> None:
+    # Offline guard for an online failure that cost a whole prod round every time:
+    # llama.cpp expands a bounded-length string into explicit grammar repetitions and
+    # answers `400 failed to parse grammar` past a certain size. `SYNTHESIS_SCHEMA`
+    # shipped with `summary: maxLength 7000`, so every prod round answered 200 with the
+    # fallback report and `synthesis_failed:LLMError` — a schema this server cannot
+    # compile is not a style question. Nothing here talks to a model, so this is the
+    # only place the ceiling can be enforced without a live server.
+    for name, schema in (("PLAN_SCHEMA", PLAN_SCHEMA), ("SYNTHESIS_SCHEMA", SYNTHESIS_SCHEMA)):
+        for limit in _max_lengths(schema):
+            assert limit <= GRAMMAR_MAX_LENGTH, (
+                f"{name}: maxLength={limit} exceeds the {GRAMMAR_MAX_LENGTH} llama.cpp "
+                "will compile; the server answers 400 and the step silently degrades"
+            )
+
     try:
         ResearchRequest(query=" ")
     except ValueError:

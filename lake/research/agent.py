@@ -31,10 +31,31 @@ PLAN_SCHEMA = {
     "additionalProperties": False,
 }
 
+GRAMMAR_MAX_LENGTH = 1_000
+"""Largest `maxLength` llama.cpp will compile into a grammar on the school servers.
+
+Measured against Qwen3.5-9B (`/v1/chat/completions`, `response_format.json_schema`):
+`maxLength: 1000` answers 200, `2000` and `7000` both answer
+`400 {"error":{"message":"Failed to initialize samplers: failed to parse grammar"}}`
+in ~37ms. llama.cpp expands a bounded-length string into explicit grammar repetitions,
+and past some size the grammar no longer parses.
+
+This is not a tuning knob — it is a hard ceiling on what may appear in a schema here.
+`SYNTHESIS_SCHEMA` shipped with `summary: maxLength 7000` and therefore never once
+produced a synthesized report on prod: every round answered 200 with the fallback text
+and `synthesis_failed:LLMError`. `selfcheck` asserts the ceiling so a schema cannot
+quietly reacquire it.
+"""
+
 SYNTHESIS_SCHEMA = {
     "type": "object",
     "properties": {
-        "summary": {"type": "string", "maxLength": 7_000},
+        # No `maxLength` here: the length bound is applied in `_synthesize` with
+        # `_one_line(..., 7_000)`, and duplicating it in the schema is what broke the
+        # grammar (see GRAMMAR_MAX_LENGTH). `max_tokens=1200` bounds the generation
+        # itself, and an answer cut by that limit arrives as `finish_reason="length"`,
+        # which `llm.complete` refuses rather than accepting a truncated summary.
+        "summary": {"type": "string"},
         "directions": {"type": "array", "maxItems": 8,
                         "items": {"type": "string", "maxLength": 700}},
         "gaps": {"type": "array", "maxItems": 8,
