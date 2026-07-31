@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import httpx
 
-from .. import queue
+from .. import llm, queue
 from .agent import (
-    GRAMMAR_MAX_LENGTH, PLAN_SCHEMA, SYNTHESIS_SCHEMA, DeepResearchAgent,
-    ResearchError, _safe_queries, build_research_prompt,
+    DEFAULT_RESEARCH_LLM_TIMEOUT_S,
+    GRAMMAR_MAX_LENGTH,
+    PLAN_SCHEMA,
+    SYNTHESIS_SCHEMA,
+    DeepResearchAgent,
+    ResearchError,
+    _safe_queries,
+    build_default_agent,
+    build_research_prompt,
 )
 from .models import ResearchRequest, ResearchSource
 from .web import ResearchSearchError, SelfHostedResearchClient, WebHit
@@ -144,6 +152,22 @@ def _max_lengths(node) -> list[int]:
 
 
 def main() -> None:
+    # Research planning and synthesis use the stronger reasoning model. Check the
+    # production factory, not only the constructor default, so an accidental
+    # factory override cannot silently send `/research` back to the 9B endpoint.
+    default_agent = build_default_agent()
+    assert default_agent._model is llm.QWEN_35B
+    assert default_agent._timeout_s == DEFAULT_RESEARCH_LLM_TIMEOUT_S
+    prior_timeout = os.environ.get("LAKE_RESEARCH_LLM_TIMEOUT_S")
+    try:
+        os.environ["LAKE_RESEARCH_LLM_TIMEOUT_S"] = "123"
+        assert build_default_agent()._timeout_s == 123
+    finally:
+        if prior_timeout is None:
+            os.environ.pop("LAKE_RESEARCH_LLM_TIMEOUT_S", None)
+        else:
+            os.environ["LAKE_RESEARCH_LLM_TIMEOUT_S"] = prior_timeout
+
     # Offline guard for an online failure that cost a whole prod round every time:
     # llama.cpp expands a bounded-length string into explicit grammar repetitions and
     # answers `400 failed to parse grammar` past a certain size. `SYNTHESIS_SCHEMA`
