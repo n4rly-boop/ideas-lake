@@ -25,18 +25,21 @@ the same behaviour as calling the port. The routes below shape the wire and
 nothing else; `lake.ops` exceptions become statuses in ONE place, `app.py`.
 """
 from pathlib import Path
+import asyncio
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from .. import graph_client, index, ops, vault
 from ..retrieve import api as retrieve_api
+from ..research import ResearchError, build_default_agent
 from . import jobs
 from ..models import FETCH_DIR
 from .schemas import (MAX_K, MAX_PAGE, EdgeOut, ErrorResponse, FetchRequest, Health, IdeaOut,
                       IdeaPatch, JobOut, Page, PendingLinkOut, Phase1Request, Phase2Request,
-                      ReindexResult, RetrieveRequest, RetrieveResponse, SearchHit, SourceIn,
-                      SourceOut, StagingOut, Stats, ThesisOut, VaultExportResult)
+                      ReindexResult, ResearchRequest, ResearchResponse, RetrieveRequest,
+                      RetrieveResponse, SearchHit, SourceIn, SourceOut, StagingOut, Stats,
+                      ThesisOut, VaultExportResult)
 
 SOURCES_YAML = Path(__file__).resolve().parents[1] / "sources.yaml"
 
@@ -55,6 +58,10 @@ _QUEUE_FULL = {429: {"model": ErrorResponse, "description":
                      "The ingest backlog is at `LAKE_QUEUE_MAX`. Carries `Retry-After`. "
                      "Accepting past the ceiling would hand out a `queued` status that "
                      "nothing reaches for hours."}}
+_RESEARCH_ERRORS = {**_BAD, 503: {"model": ErrorResponse,
+                                   "description": "Neither a usable Lake prior nor an "
+                                                  "independently fetched web report was "
+                                                  "available."}}
 # The queue is a file (`data/jobs.db`), so these three routes can fail the way the store
 # can: a read-only mount, a full disk, a locked database. Documented per route rather
 # than inherited — the handler over `graph_client.STORE_ERRORS` (`sqlite3.Error`) already
@@ -220,6 +227,33 @@ def retrieve_endpoint(req: RetrieveRequest, request: Request):
         # the {error, log_id} body, and the handler must not build a second one.
         return JSONResponse(status_code=status, content=payload)
     return payload
+
+
+# ---------------------------------------------------------------- deep research
+
+research = APIRouter(tags=["research"])
+
+
+@research.post("/research", response_model=ResearchResponse,
+               responses=_RESEARCH_ERRORS, summary="RAG + web → language research report")
+def research_endpoint(body: ResearchRequest, request: Request):
+    """Run one bounded research round owned by Ideas Lake.
+
+    GigaEvo calls this from its background research worker.  It is deliberately
+    not part of `/retrieve` and is never invoked by a memory selector or an
+    evolution hook.  The agent is cached per process; tests and embedders may
+    inject `app.state.research_agent` before making a request.
+    """
+    if request.app.state.mock:
+        raise HTTPException(503, "mock mode: /research is disabled")
+    agent = getattr(request.app.state, "research_agent", None)
+    if agent is None:
+        agent = build_default_agent()
+        request.app.state.research_agent = agent
+    try:
+        return asyncio.run(agent.research(body))
+    except ResearchError as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 # -------------------------------------------------------------------------- ingest
@@ -425,4 +459,4 @@ def vault_export():
         return job["report"]
 
 
-ROUTERS = (retrieve, graph, search, fetch_router, ingest, ops_router)
+ROUTERS = (retrieve, research, graph, search, fetch_router, ingest, ops_router)

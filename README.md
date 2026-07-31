@@ -19,6 +19,7 @@ AIRI Summer 2026, проект 28 «Озеро идей».
 | `lake/models.py` | `Source` / `Thesis` / `Idea` — pydantic; отдельно литеральные JSON-схемы для LLM |
 | `lake/ingest/` | write path: fetch → parse → generalize → link → запись батчем |
 | `lake/retrieve/` | read path: rewrite → гибридный поиск → подъём к идеям → ранжирование |
+| `lake/research/` | reusable deep-research agent: Lake priors + independent web evidence → language report |
 | `lake/api/` | HTTP-слой на всё: граф, поиск, ингест заданиями, retrieve, починка индекса |
 | `lake/index.py` | индекс тезисов: SQLite FTS5 + вектора + RRF |
 | `lake/graph_client.py` | единственное место, знающее формат графового хранилища |
@@ -46,6 +47,20 @@ POST /retrieve
 ```
 
 `via` — как идея попала в выдачу: `thesis` | `edge` | `padding`.
+
+Отдельная ручка `POST /research` принимает естественно-языковой запрос и bounded
+контекст, сначала получает приоры из `/retrieve`, затем независимо ищет и читает
+источники через SearXNG, Crawl4AI и Docling. Она возвращает language report с URL
+и выдержками, а не готовые локальные карточки. Карточки Lake используются только
+для gap/duplicate analysis и не копируются в task-local memory. Состояние RAG и
+предупреждения явно возвращаются; если одновременно нет рабочего RAG и
+independent web evidence, ответ — `503`, а не выдуманный пустой успех.
+
+Эволюционный `EvolutionResearchAgent` пока остаётся копией в
+`gigaevo-core-runtime/` для совместимости текущих прогонов. Будущие прогоны Core
+могут вызывать `/research` из фонового research worker; Core сам решает, какие
+гипотезы передать в task-local memory. Ручка не вызывается из `select_cards`,
+`pre_step_hook` или `post_step_hook`.
 
 Это контракт C3, но не весь сервер. Тем же приложением ходят чтение графа
 (`/sources`, `/ideas`, `/theses` — постранично, с фильтрами), сырой гибридный поиск
@@ -80,6 +95,10 @@ Python 3.12. Зависимости: `fastapi`, `uvicorn`, `pydantic`, `numpy`,
 ```
 LAKE_KEY_9B      ключ к Qwen3.5-9B
 LAKE_KEY_35B     ключ к Qwen3.6-35B-A3B
+LAKE_SEARXNG_URL  адрес локального SearXNG (по умолчанию http://127.0.0.1:8080)
+LAKE_CRAWL4AI_URL адрес локального Crawl4AI (по умолчанию http://127.0.0.1:11235)
+LAKE_DOCLING_URL  адрес локального Docling (по умолчанию http://127.0.0.1:5001)
+LAKE_RESEARCH_TIMEOUT_S таймаут одной операции research (по умолчанию 30)
 NEO4J_URI        neo4j+s://…
 NEO4J_USERNAME
 NEO4J_PASSWORD
@@ -89,7 +108,11 @@ NEO4J_DATABASE
 ```bash
 python -m lake.selfcheck                      # инварианты; --offline снимает единственный сетевой пункт
 python -m lake.api.selfcheck                  # офлайн-проверка HTTP-слоя, реальный data/ не трогает
+python -m lake.research.selfcheck             # офлайн-проверка планирования, RAG/web boundary и отказа
 python -m lake.api.app --port 8077            # сервер; --mock отдаёт форму /retrieve без графа и LLM
+curl -H "Authorization: Bearer $LAKE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"query":"alternative mechanisms for maintaining diversity in evolutionary search"}' \
+  http://127.0.0.1:8077/research
 python -m lake.ingest.run phase1 --limit 3    # то же, что POST /ingest/phase1, из терминала
 python -m lake.ingest.run phase2              # staging → граф + индекс, последовательно, с курсором
 python -m lake.vault                          # озеро → data/vault, открыть папку как vault в Obsidian

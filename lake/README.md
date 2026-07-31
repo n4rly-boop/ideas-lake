@@ -22,9 +22,10 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 | `python3 -m lake.ingest.run phase1 [--limit N] [--sources path]` | fetch → parse → generalize → `data/staging.jsonl`. 8 потоков. **В граф не пишет ничего** |
 | `python3 -m lake.ingest.run phase2 [--limit N]` | staging → линковка → граф + индекс → пере-вывод. Последовательно, курсор |
 | `python3 -m lake.ingest.run selfcheck` | офлайн end-to-end на фикстурах, временные БД |
-| `python3 -m lake.api.app [--port 8077] [--host H] [--mock] [--no-auth]` | FastAPI-сервер под uvicorn: граф, поиск, ингест, retrieve. Нужен `LAKE_API_KEY`, иначе не поднимется |
+| `python3 -m lake.api.app [--port 8077] [--host H] [--mock] [--no-auth]` | FastAPI-сервер под uvicorn: граф, поиск, ингест, retrieve, research. Нужен `LAKE_API_KEY`, иначе не поднимется |
 | `uvicorn lake.api.app:app --port 8077` | то же штатным способом |
 | `python3 -m lake.api.selfcheck` | офлайн-проверка HTTP-слоя (она же `--selfcheck`) |
+| `python3 -m lake.research.selfcheck` | офлайн-проверка research boundary без сети и ключей |
 | `python3 -m lake.selfcheck [--offline]` | 25 проверок §6. `--offline` пропускает канарейку (единственный сетевой пункт) |
 | `python3 tools/gen_sources.py` | `09-raw/a11-sources.yaml` → `lake/sources.yaml` (84 записи) |
 | `docker compose --env-file .env.local up -d` | локально: соберёт образ сам. На сервере образ приезжает из GHCR, см. ниже |
@@ -71,6 +72,7 @@ lake/
   neo4j_load.py     # односторонняя заливка в Neo4j блока B; уйдёт, когда B сдаст адаптер
   ingest/  fetch parse generalize link rederive split run
   retrieve/ rewrite search rank api        # api.py — ядро чтения, без транспорта
+  research/ models agent web              # RAG + self-hosted web → language report
   api/     app routes schemas jobs workers selfcheck   # HTTP-слой на всё, единственный сервер
                     # workers.py — пул фазы 1 + единственный писатель фазы 2 поверх queue.py
   prompts/{parse,generalize,link,rederive,rewrite}/system.txt
@@ -240,6 +242,7 @@ POST /retrieve
 | | |
 |---|---|
 | `POST /retrieve` | контракт C3: запрос → идеи с провенансом (ниже) |
+| `POST /research` | bounded language mission → Lake priors + independent web evidence → report; не создаёт локальные идеи |
 | `GET /search?q&k` | сырой гибрид по тезисам: BM25 + косинус, RRF. Без переписывания и без идей |
 | `GET /sources`, `GET /sources/{id}` | постранично; `total` считается тем же фильтром и тем же JOIN, что и страница |
 | `POST /sources` | upsert: сюда блок C пишет исход прогона. id = f(url, version), повтор заменяет строку. Повтор с другим `title`/`type` → `409`: это провенанс уже записанных листьев |
@@ -275,6 +278,30 @@ OpenAPI перечисляет ровно то, что ручка отдаёт: 
 держит эквивалентность в обе стороны: лишний статус в схеме — та же поломка, что и недостающий,
 C пишет ветку, которая никогда не сработает.
 
+### 5.2 Deep research
+
+`POST /research` — отдельная потребительская граница Ideas Lake. Запрос содержит
+`query`, bounded `context`, полный список известных идей и направления, которые
+нужно исследовать. Агент:
+
+1. получает небольшой список карточек через локальный `/retrieve` только для
+   gap/duplicate analysis;
+2. планирует до пяти разных запросов (при сбое модели использует deterministic
+   coverage fallback);
+3. параллельно ищет в SearXNG и читает страницы через Crawl4AI, а PDF/arXiv —
+   через Docling;
+4. возвращает language report, `queries`, independently fetched `sources` и
+   per-round token/latency cost.
+
+RAG-приоры не копируются в task-local memory и не считаются доказательством.
+Отсутствие RAG явно помечается `rag_status=empty|degraded`; отсутствие web
+evidence при сломанном RAG даёт `503`. Модель не выносит verdict о feasibility,
+fitness, usefulness или promotion — это ответственность Core и evaluator.
+
+Для текущих запусков копия агента остаётся в `gigaevo-core-runtime/`.
+Интеграция Core с `/research` будет отдельной веткой: вызов должен оставаться
+в фоне, а EvolutionResearchAgent — выбирать task-local hypotheses из отчёта.
+
 ```
 POST /retrieve
   { query, k=5, run_id?, budget?, rewrite=true, allow_web=false }
@@ -283,6 +310,13 @@ POST /retrieve
                effect_claimed, effect_observed, trust_score, score, via,
                theses: [ { text, url, title, effect, locator } ] } ],
     log_id, cost: { tokens_in, tokens_out, wall_ms } }
+
+POST /research
+  { query, context?, known_ideas?, directions?, max_queries?, max_sources?, rag_k?, run_id? }
+->
+  { report, queries, sources: [ { source_id, title, url, excerpt } ],
+    rag_status, rag_log_id, rag_ideas, warnings,
+    cost: { tokens_in, tokens_out, wall_ms } }
 ```
 
 400 — битый JSON, нет `query`, `k <= 0`, `budget <= 0`, `allow_web=true`, неизвестное поле

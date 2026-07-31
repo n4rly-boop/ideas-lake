@@ -14,6 +14,7 @@ from typing import ClassVar, Generic, Literal, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from ..models import EMBED_DIM
+from ..research.models import ResearchRequest, ResearchResponse
 
 MAX_QUERY_CHARS = 4000      # a query is a sentence; anything larger is not a query
 MAX_K = 50                  # k is a page size, not a dump switch
