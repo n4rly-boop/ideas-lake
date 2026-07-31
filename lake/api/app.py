@@ -43,11 +43,12 @@ import argparse
 import hmac
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .. import graph_client, ops
@@ -62,11 +63,22 @@ from .routes import ROUTERS
 OPS_STATUS: tuple[tuple[type[ops.OpsError], int], ...] = (
     (ops.NotFound, 404), (ops.Conflict, 409), (ops.Broken, 503))
 
-# The only paths served without a key, and the list is deliberately three lines long:
-# the OpenAPI document is the integration contract, it holds no lake data, and C reads
-# it before it has anything to authenticate with. Everything else — including /healthz,
-# which counts the leaves, and including paths that do not exist — needs the key.
-OPEN_PATHS = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"})
+# The only paths served without a key, and the list is deliberately short: the OpenAPI
+# document is the integration contract, it holds no lake data, and C reads it before it
+# has anything to authenticate with. Everything else — including /healthz, which counts
+# the leaves, and including paths that do not exist — needs the key.
+#
+# `/ui` is on the list for exactly the same reason `/docs` is, and on no weaker one: it
+# is a static asset that holds no lake data and reads nothing. A browser cannot put a
+# header on a top-level navigation, so a guarded page would be a page nobody can open;
+# the alternative — the key in the query string — would put a secret in every log and
+# every history entry. The DATA the page shows is still every one of these routes,
+# fetched with the key the operator types into it. Kept out of the OpenAPI document
+# (`include_in_schema=False`) so the contract keeps describing the API and nothing else,
+# and so `_drop_422` does not stamp it with a 401 it cannot answer.
+UI_PATH = "/ui"
+UI_FILE = Path(__file__).resolve().parent / "console.html"
+OPEN_PATHS = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc", UI_PATH})
 
 DESCRIPTION = """\
 Долговременная память между прогонами эволюции (проект 28, блок A).
@@ -147,6 +159,22 @@ def create_app(mock: bool = False, warmup: bool = True, api_key=None,
     for router in ROUTERS:
         app.include_router(router)
 
+    @app.get(UI_PATH, include_in_schema=False)
+    def console():
+        """The operator console: one static file that then talks to the routes above.
+
+        Read from disk per request rather than baked into the module: it is a template
+        file like the prompts are (`lake/prompts/`), and editing it while the server
+        runs is the whole point of having it be one file. 503 rather than 500 if it is
+        missing — an image built without it is a broken deployment, not a bad request.
+        """
+        if not UI_FILE.is_file():
+            return JSONResponse(status_code=503, content={
+                "error": f"console.html is missing next to app.py ({UI_FILE}); the API "
+                         "itself is unaffected — use /docs"})
+        return FileResponse(UI_FILE, media_type="text/html; charset=utf-8",
+                            headers={"Cache-Control": "no-store"})
+
     @app.middleware("http")
     async def _require_key(request: Request, call_next):
         """`Authorization: Bearer <LAKE_API_KEY>` on everything but `OPEN_PATHS`.
@@ -157,7 +185,12 @@ def create_app(mock: bool = False, warmup: bool = True, api_key=None,
         the key is needed even to learn which paths exist.
         """
         expected = request.app.state.api_key
-        if expected is False or request.url.path in OPEN_PATHS:
+        # GET/HEAD only, not "this path is open": every entry in `OPEN_PATHS` is a
+        # document or a static asset, and matching on the path alone let any verb
+        # through to the router — which then answered 405 and told a stranger the path
+        # exists. Found by the self-check the moment `/ui` was added.
+        if expected is False or (request.url.path in OPEN_PATHS
+                                 and request.method in ("GET", "HEAD")):
             return await call_next(request)
         if not expected:
             # Unreachable once `lifespan` has run, and 503 rather than "let it through"

@@ -1,0 +1,1297 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ideas Lake — консоль блока A</title>
+<style>
+:root{
+  color-scheme:dark;
+  --plane:#0d0d0d; --surface:#141414; --surface-2:#1a1a19; --raised:#1f1f1e;
+  --ink:#fff; --ink-2:#c3c2b7; --muted:#898781;
+  --grid:#2c2c2a; --axis:#383835; --hair:rgba(255,255,255,.10);
+  --s1:#3987e5; --s2:#d95926;
+  --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
+}
+:root[data-theme="light"]{
+  color-scheme:light;
+  --plane:#f9f9f7; --surface:#fcfcfb; --surface-2:#f4f3f0; --raised:#fff;
+  --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --axis:#c3c2b7; --hair:rgba(11,11,11,.10);
+  --s1:#2a78d6; --s2:#eb6834;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--plane);color:var(--ink);
+  font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--s1)}
+button,input,select,textarea{font:inherit;color:inherit}
+.mono,input.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+  font-variant-numeric:tabular-nums}
+.dim{color:var(--muted)}
+.hide{display:none !important}
+
+/* ---------- chrome ---------- */
+header.bar{position:sticky;top:0;z-index:20;background:var(--surface);
+  border-bottom:1px solid var(--hair);padding:10px 18px;display:flex;gap:16px;
+  align-items:center;flex-wrap:wrap}
+.brand{font-weight:650;letter-spacing:-.01em}
+.brand small{display:block;font-weight:400;font-size:11px;color:var(--muted);letter-spacing:.06em;
+  text-transform:uppercase}
+.stat-strip{display:flex;gap:14px;flex-wrap:wrap;margin-left:auto;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:6px;background:var(--surface-2);
+  border:1px solid var(--hair);border-radius:999px;padding:5px 11px;font-size:12px;color:var(--ink-2)}
+.chip b{color:var(--ink);font-variant-numeric:tabular-nums}
+.chip .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.chip.ok .dot{background:var(--good)} .chip.warn .dot{background:var(--warning)}
+.chip.bad .dot{background:var(--critical)}
+nav.tabs{display:flex;gap:2px;padding:0 18px;background:var(--surface);
+  border-bottom:1px solid var(--hair);position:sticky;top:53px;z-index:19;overflow-x:auto}
+nav.tabs button{background:none;border:0;border-bottom:2px solid transparent;padding:11px 14px;
+  color:var(--muted);cursor:pointer;white-space:nowrap}
+nav.tabs button:hover{color:var(--ink-2)}
+nav.tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--s1)}
+main{padding:20px 18px 80px;max-width:1560px;margin:0 auto}
+
+/* ---------- controls ---------- */
+.panel{background:var(--surface);border:1px solid var(--hair);border-radius:12px;
+  padding:16px 18px;margin-bottom:14px}
+.panel h2{margin:0 0 4px;font-size:12px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--muted);font-weight:600}
+.panel p.help{margin:0 0 14px;color:var(--ink-2);font-size:13px;max-width:1000px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+label.f{display:flex;flex-direction:column;gap:5px;font-size:11px;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--muted)}
+label.f input,label.f select{background:var(--surface-2);border:1px solid var(--hair);
+  border-radius:8px;padding:8px 10px;min-width:90px}
+label.f input:focus,label.f select:focus{outline:2px solid var(--s1);outline-offset:-1px}
+label.f.grow{flex:1 1 340px}
+label.f.grow input{width:100%}
+label.cb{display:inline-flex;gap:7px;align-items:center;font-size:13px;color:var(--ink-2);
+  padding-bottom:9px}
+button.act{background:var(--s1);border:0;border-radius:8px;padding:9px 16px;color:#fff;
+  cursor:pointer;font-weight:550}
+button.act:hover{filter:brightness(1.08)}
+button.act[disabled]{opacity:.5;cursor:progress}
+button.ghost{background:var(--surface-2);border:1px solid var(--hair);border-radius:8px;
+  padding:8px 13px;cursor:pointer;color:var(--ink-2)}
+button.ghost:hover{color:var(--ink)}
+button.ghost.sm{padding:4px 9px;font-size:12px}
+button.danger{border-color:var(--serious);color:var(--serious)}
+
+/* ---------- status line ---------- */
+.status{margin-top:12px;border-radius:8px;padding:10px 13px;font-size:13px;
+  border:1px solid var(--hair);background:var(--surface-2);display:flex;gap:10px;align-items:baseline}
+.status.err{border-color:var(--critical);color:var(--critical)}
+.status.warn{border-color:var(--warning);color:var(--warning)}
+.status.ok{border-color:var(--good)}
+.status .code{font-family:ui-monospace,Menlo,monospace;font-weight:650}
+.spinner{display:inline-block;width:11px;height:11px;border:2px solid var(--hair);
+  border-top-color:var(--s1);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---------- tables ---------- */
+table.tbl{width:100%;border-collapse:collapse;font-size:13px}
+table.tbl th{text-align:left;font-size:11px;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--muted);font-weight:600;padding:9px 10px;border-bottom:1px solid var(--hair);
+  position:sticky;top:0;background:var(--surface)}
+table.tbl td{padding:9px 10px;border-bottom:1px solid var(--hair);color:var(--ink-2);
+  vertical-align:top}
+table.tbl tr:hover td{background:var(--surface-2)}
+table.tbl td.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.scroller{overflow:auto;max-height:60vh;border:1px solid var(--hair);border-radius:10px}
+.pager{display:flex;gap:10px;align-items:center;margin-top:10px;font-size:12.5px;color:var(--muted)}
+
+/* ---------- badges ---------- */
+.badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:3px 9px;
+  font-size:11.5px;border:1px solid var(--hair);background:var(--surface-2);color:var(--ink-2);
+  white-space:nowrap}
+.badge .g{font-size:10px}
+.b-thesis .g{color:var(--good)} .b-edge .g{color:var(--warning)}
+.b-padding{color:var(--muted)} .b-padding .g{color:var(--serious)}
+.b-ok{border-color:var(--good)} .b-failed{border-color:var(--critical);color:var(--critical)}
+.b-running,.b-queued,.b-staged{border-color:var(--warning)}
+.b-run{border-color:var(--s2)} .b-paper{border-color:var(--s1)}
+.b-dirty{border-color:var(--warning);color:var(--warning)}
+
+/* ---------- idea cards ---------- */
+.cards{display:grid;gap:11px}
+.card{background:var(--surface);border:1px solid var(--hair);border-radius:12px;padding:15px 17px}
+.card.pad{border-left:3px solid var(--serious)}
+.card-h{display:flex;gap:12px;align-items:flex-start}
+.rank{flex:0 0 24px;height:24px;border-radius:7px;background:var(--surface-2);color:var(--ink-2);
+  display:grid;place-items:center;font-size:12px;font-weight:600}
+.card-t{font-size:15px;line-height:1.45;font-weight:550}
+.metrics{display:flex;flex-wrap:wrap;gap:7px 16px;margin:11px 0 0;padding-top:10px;
+  border-top:1px solid var(--hair);font-size:12.5px;align-items:center}
+.m{display:inline-flex;align-items:center;gap:6px}
+.m .k{color:var(--muted);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase}
+.m .v{font-variant-numeric:tabular-nums;font-weight:600}
+.cos-hi{color:var(--good)} .cos-mid{color:var(--warning)} .cos-lo{color:var(--muted)}
+.tbar{width:48px;height:5px;border-radius:3px;background:var(--surface-2);overflow:hidden}
+.tbar i{display:block;height:100%;background:var(--s1)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px 22px;
+  margin-top:12px}
+.fl{font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+.fv{margin-top:4px;font-size:13px;color:var(--ink-2)}
+details.blk{margin-top:12px;border-top:1px solid var(--hair);padding-top:10px}
+details.blk summary{cursor:pointer;font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--muted)}
+ul.fm{margin:9px 0 0;padding-left:17px} ul.fm li{font-size:12.5px;color:var(--ink-2);margin-bottom:5px}
+.leaf{border-left:2px solid var(--s1);padding:1px 0 1px 12px;margin:10px 0}
+.leaf-t{font-size:12.5px;color:var(--ink-2);line-height:1.5}
+.leaf-m{margin-top:5px;display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;font-size:11.5px}
+.leaf-m .loc{color:var(--muted);font-family:ui-monospace,Menlo,monospace}
+.leaf-m .eff{background:var(--surface-2);border-radius:6px;padding:2px 6px;color:var(--ink-2)}
+.idbox{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted)}
+
+/* ---------- ab compare ---------- */
+.ab{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.ab .col-h{display:flex;gap:10px;align-items:baseline;margin-bottom:8px}
+.ab .col-h b{font-size:13px}
+@media (max-width:1100px){.ab{grid-template-columns:1fr}}
+
+/* ---------- graph ---------- */
+.graphwrap{position:relative;background:var(--surface-2);border:1px solid var(--hair);
+  border-radius:10px;overflow:hidden}
+svg.graph{display:block;width:100%;height:min(70vh,720px)}
+svg.graph .edge{stroke:var(--ink-2)}
+svg.graph .node{stroke:var(--surface);stroke-width:1;cursor:pointer}
+svg.graph .node.sel{stroke:var(--s2);stroke-width:2.5}
+svg.graph text.nl{fill:var(--ink);font-size:10.5px;pointer-events:none}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--ink-2);
+  align-items:center}
+.sw{width:11px;height:11px;border-radius:3px;background:var(--muted);display:inline-block}
+.ramp{display:inline-flex;gap:2px}.ramp i{width:14px;height:10px;display:block;border-radius:2px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:12.5px;margin-top:10px}
+.kv dt{color:var(--muted)} .kv dd{margin:0;color:var(--ink-2)}
+
+/* ---------- key gate ---------- */
+.gate{position:fixed;inset:0;background:rgba(0,0,0,.72);display:grid;place-items:center;z-index:50}
+.gate .box{background:var(--surface);border:1px solid var(--hair);border-radius:14px;
+  padding:26px 28px;width:min(520px,92vw)}
+.gate h3{margin:0 0 8px;font-size:19px}
+.gate p{color:var(--ink-2);font-size:13px;margin:0 0 16px}
+.pill{display:inline-flex;gap:6px;align-items:center;font-size:12px;color:var(--muted);
+  border:1px solid var(--hair);border-radius:999px;padding:4px 10px;cursor:pointer;background:none}
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">Ideas Lake<small>блок A · консоль</small></div>
+  <div class="stat-strip" id="strip"><span class="chip"><span class="dot"></span>подключаюсь…</span></div>
+  <button class="pill" id="theme-btn" title="Светлая / тёмная">◐ тема</button>
+  <button class="pill" id="key-btn" title="Сменить ключ">🔑 ключ</button>
+</header>
+
+<nav class="tabs" id="tabs"></nav>
+<main id="main"></main>
+
+<div class="gate hide" id="gate">
+  <div class="box">
+    <h3>Ключ доступа</h3>
+    <p>Все ручки, кроме <span class="mono">/openapi.json</span>, <span class="mono">/docs</span> и
+      этой страницы, требуют <span class="mono">Authorization: Bearer $LAKE_API_KEY</span>. Ключ
+      живёт в <span class="mono">sessionStorage</span> этой вкладки: закрыл вкладку — ключа нет.
+      В URL он не попадает и на сервер, кроме этого же API, не уходит.</p>
+    <label class="f grow" style="margin-bottom:14px">LAKE_API_KEY
+      <input type="password" id="key-input" class="mono" autocomplete="off" spellcheck="false">
+    </label>
+    <div class="row">
+      <button class="act" id="key-save">Сохранить и проверить</button>
+      <span class="dim" id="key-msg"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* =====================================================================
+   Ideas Lake console — one file, no build, no dependencies.
+
+   Two rules the UI must not soften, because the API does not:
+     1. 503 is not []. A store that raised is shown as "озеро сломано";
+        an empty 200 is shown as "пусто" and they never look the same.
+     2. A number is either right or absent. Totals come from `total`,
+        never from items.length; a truncated list says so.
+   ===================================================================== */
+
+const KEY_STORE = "lake.api.key";
+const $ = (sel, root = document) => root.querySelector(sel);
+const el = (tag, attrs = {}, ...kids) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") node.className = v;
+    else if (k === "html") node.innerHTML = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid === null || kid === undefined || kid === false) continue;
+    node.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  }
+  return node;
+};
+const fmt = (n) => typeof n === "number" ? n.toLocaleString("ru-RU") : n;
+const cut = (s, n) => (s || "").length > n ? s.slice(0, n - 1) + "…" : (s || "");
+
+/* ---------------------------------------------------------------- transport */
+
+let API_KEY = sessionStorage.getItem(KEY_STORE) || "";
+
+class ApiError extends Error {
+  constructor(status, message, body) {
+    super(message); this.status = status; this.body = body;
+  }
+}
+
+async function api(path, { method = "GET", body = null, timeout = 120000 } = {}) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeout);
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      signal: ctl.signal,
+      headers: {
+        ...(API_KEY ? { Authorization: "Bearer " + API_KEY } : {}),
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    // A network failure is not an empty answer either: no status, so say that.
+    throw new ApiError(0, err.name === "AbortError"
+      ? `нет ответа за ${Math.round(timeout / 1000)} с (таймаут на стороне страницы)`
+      : `сеть недоступна: ${err.message}`, null);
+  }
+  clearTimeout(timer);
+  const text = await res.text();
+  let payload = null;
+  try { payload = text ? JSON.parse(text) : null; } catch { payload = { error: text }; }
+  if (res.status === 401) { openGate("Ключ не принят: 401."); throw new ApiError(401, "ключ не принят", payload); }
+  if (!res.ok) {
+    const retry = res.headers.get("Retry-After");
+    throw new ApiError(res.status, (payload && payload.error) || res.statusText,
+                       retry ? { ...payload, retry_after: retry } : payload);
+  }
+  return payload;
+}
+
+/* Human wording per status, so no caller has to invent one. The distinctions are
+   the API's own: 409 is a refusal to act, 503 is a broken lake, 0 is no answer. */
+function explain(err) {
+  const map = {
+    0: "нет связи с API",
+    400: "запрос не принят",
+    401: "ключ не принят",
+    404: "такой строки нет",
+    409: "отказ: слот занят или запись не наша",
+    429: "очередь ингеста заполнена" + (err.body?.retry_after ? `, повтор через ${err.body.retry_after} с` : ""),
+    503: "ОЗЕРО НЕДОСТУПНО — это не «пусто»",
+  };
+  return map[err.status] || `ошибка ${err.status}`;
+}
+
+/* ------------------------------------------------------------------ status UI */
+
+function setStatus(host, kind, code, text, extra) {
+  const box = el("div", { class: "status " + kind },
+    code !== null && code !== undefined ? el("span", { class: "code" }, String(code)) : null,
+    el("span", {}, text), extra || null);
+  host.replaceChildren(box);
+  return box;
+}
+const busy = (host, what) => setStatus(host, "", null,
+  what, el("span", { class: "spinner", style: "margin-left:8px" }));
+const failed = (host, err) => setStatus(host, err.status === 409 || err.status === 429 ? "warn" : "err",
+  err.status || "—", `${explain(err)} · ${err.message}`);
+
+/* N calls, `width` of them in flight. The graph view needs one request per idea (there
+   is no bulk read for edges), and doing that strictly one at a time is minutes over a
+   tunnel; firing all 200 at once is a self-inflicted load test on the school's box. */
+async function pool(items, worker, width = 6) {
+  const queue = [...items];
+  const out = [];
+  await Promise.all(Array.from({ length: Math.min(width, queue.length) }, async () => {
+    while (queue.length) {
+      const item = queue.shift();
+      out.push([item, await worker(item)]);
+    }
+  }));
+  return out;
+}
+
+/* Wraps a call so no view can forget the three outcomes. */
+async function run(host, label, fn) {
+  busy(host, label);
+  try {
+    const out = await fn();
+    return out;
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    failed(host, err);
+    return undefined;
+  }
+}
+
+/* ----------------------------------------------------------------- key gate */
+
+function openGate(message) {
+  $("#gate").classList.remove("hide");
+  $("#key-msg").textContent = message || "";
+  $("#key-input").value = "";
+  $("#key-input").focus();
+}
+$("#key-btn").onclick = () => openGate("");
+$("#key-save").onclick = async () => {
+  const value = $("#key-input").value.trim();
+  if (!value) { $("#key-msg").textContent = "пустой ключ — сервер такой не примет"; return; }
+  API_KEY = value;
+  $("#key-msg").textContent = "проверяю…";
+  try {
+    await api("/healthz", { timeout: 15000 });
+  } catch (err) {
+    API_KEY = "";
+    $("#key-msg").textContent = err.status === 401 ? "401 — ключ не тот" : `${err.status || "—"}: ${err.message}`;
+    return;
+  }
+  sessionStorage.setItem(KEY_STORE, value);
+  $("#gate").classList.add("hide");
+  refreshStrip();
+  render();
+};
+$("#key-input")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("#key-save").click(); });
+
+$("#theme-btn").onclick = () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem("lake.theme", next);
+};
+document.documentElement.dataset.theme = localStorage.getItem("lake.theme") || "dark";
+
+/* --------------------------------------------------------------- stat strip */
+
+let LAST_STATS = null;
+
+async function refreshStrip() {
+  const strip = $("#strip");
+  if (!API_KEY) { strip.replaceChildren(el("span", { class: "chip warn" },
+    el("span", { class: "dot" }), "ключ не задан")); return; }
+  let health, stats;
+  try {
+    [health, stats] = await Promise.all([api("/healthz", { timeout: 20000 }),
+                                        api("/stats", { timeout: 30000 })]);
+  } catch (err) {
+    if (err.status === 401) return;
+    strip.replaceChildren(el("span", { class: "chip bad" }, el("span", { class: "dot" }),
+      `${err.status || "—"} · ${explain(err)}`));
+    return;
+  }
+  LAST_STATS = stats;
+  const chips = [];
+  const add = (kind, ...kids) => chips.push(el("span", { class: "chip " + kind },
+    el("span", { class: "dot" }), ...kids));
+  add(health.status === "ok" ? "ok" : "bad", "healthz ", el("b", {}, health.status),
+      health.mock ? " (mock)" : "");
+  add(stats.in_sync ? "ok" : "bad", "индекс/хранилище ",
+      el("b", {}, `${fmt(stats.theses_indexed)}/${fmt(stats.theses)}`));
+  add("", "источники ", el("b", {}, fmt(stats.sources)));
+  add("", "идеи ", el("b", {}, fmt(stats.ideas)));
+  add("", "тезисы ", el("b", {}, fmt(stats.theses)));
+  add("", "рёбра ", el("b", {}, fmt(stats.edges)));
+  if (stats.ideas_without_leaves.length)
+    add("bad", "идей без листьев ", el("b", {}, stats.ideas_without_leaves.length));
+  if (stats.pending_link) add("warn", "pending_link ", el("b", {}, stats.pending_link));
+  if (stats.job_running) add("warn", "занято ", el("b", {}, stats.job_running));
+  const dead = Object.entries(stats.workers || {}).filter(([, alive]) => !alive);
+  if (dead.length) add("bad", "мертвы: ", el("b", {}, dead.map(([n]) => n).join(", ")));
+  strip.replaceChildren(...chips);
+}
+
+/* ===================================================================== views */
+
+const VIEWS = [];
+const view = (id, title, mount) => VIEWS.push({ id, title, mount });
+
+/* --------------------------------------------------------------- 1. retrieve */
+
+const cosClass = (v) => v >= 0.60 ? "cos-hi" : v >= 0.52 ? "cos-mid" : "cos-lo";
+const VIA = { thesis: ["тезис", "◆"], edge: ["ребро", "◈"], padding: ["добито", "◇"] };
+
+function viaBadge(via) {
+  const [label, glyph] = VIA[via] || [via, "•"];
+  return el("span", { class: "badge b-" + via, title:
+    via === "padding" ? "recall-first дозаполнил выдачу до k: это НЕ находка"
+    : via === "edge" ? "поднято по ребру графа, не по совпадению тезиса"
+    : "найдено по тезису в индексе" }, el("span", { class: "g" }, glyph), "via " + label);
+}
+
+function ideaCard(item, rank) {
+  const leaves = item.theses || [];
+  return el("article", { class: "card" + (item.via === "padding" ? " pad" : "") },
+    el("div", { class: "card-h" },
+      rank ? el("span", { class: "rank" }, rank) : null,
+      el("div", { class: "card-t" }, item.text),
+      el("span", { class: "idbox", style: "margin-left:auto;white-space:nowrap" }, item.idea_id || item.id)),
+    el("div", { class: "metrics" },
+      item.via ? viaBadge(item.via) : null,
+      typeof item.cosine_similarity === "number" ? el("span", { class: "m", title:
+        "косинус запроса и идеи; сравним между вызовами. Замерено: ~0.48 когда в озере нечего найти, ~0.63 когда есть" },
+        el("span", { class: "k" }, "cosine"),
+        el("span", { class: "v " + cosClass(item.cosine_similarity) }, item.cosine_similarity.toFixed(3))) : null,
+      typeof item.score === "number" ? el("span", { class: "m", title:
+        "min-max по кандидатам ЭТОГО вызова: у лучшего ~1.0 на любом запросе. Порядок, не качество" },
+        el("span", { class: "k" }, "score"), el("span", { class: "v dim" }, item.score.toFixed(2))) : null,
+      el("span", { class: "m", title: item.dirty ? "листья менялись после суда: число от прошлого состава" : "" },
+        el("span", { class: "k" }, "trust"),
+        el("span", { class: "tbar" }, el("i", { style: `width:${(item.trust_score || 0) * 100}%` })),
+        el("span", { class: "v" }, (item.trust_score ?? 0).toFixed(1)),
+        item.dirty ? el("span", { class: "badge b-dirty" }, "dirty") : null),
+      el("span", { class: "m" }, el("span", { class: "k" }, "листьев"),
+        el("span", { class: "v" }, leaves.length)),
+      item.origin ? el("span", { class: "badge" }, item.origin) : null),
+    el("div", { class: "grid2" },
+      el("div", {}, el("div", { class: "fl" }, "применимо когда"),
+        el("div", { class: "fv" }, item.applicability_conditions || "—")),
+      el("div", {}, el("div", { class: "fl" }, "ограничения"),
+        el("div", { class: "fv" }, item.limitations || "—")),
+      el("div", {}, el("div", { class: "fl" }, "эффект заявленный"),
+        el("div", { class: "fv" }, item.effect_claimed || "—")),
+      el("div", {}, el("div", { class: "fl" }, "эффект наблюдённый"),
+        el("div", { class: "fv" }, item.effect_observed || "—"))),
+    (item.failure_modes || []).length ? el("details", { class: "blk" },
+      el("summary", {}, `режимы отказа · ${item.failure_modes.length}`),
+      el("ul", { class: "fm" }, ...item.failure_modes.map((m) => el("li", {}, m)))) : null,
+    el("details", { class: "blk", open: rank === 1 ? "" : null },
+      el("summary", {}, `провенанс · ${leaves.length}`),
+      ...(leaves.length ? leaves.map((leaf) => el("div", { class: "leaf" },
+            el("div", { class: "leaf-t" }, leaf.text),
+            el("div", { class: "leaf-m" },
+              leaf.url ? el("a", { href: leaf.url, target: "_blank", rel: "noreferrer" },
+                            leaf.title || leaf.source_title || leaf.url) : null,
+              el("span", { class: "loc" }, leaf.locator || ""),
+              leaf.effect ? el("span", { class: "eff" }, leaf.effect) : null)))
+          : [el("div", { class: "fv" }, "листьев нет — для origin=extracted это нарушение инварианта")])));
+}
+
+function answerBlock(answer, label) {
+  const ideas = answer.ideas || [];
+  const padded = ideas.filter((i) => i.via === "padding").length;
+  const best = ideas.length ? Math.max(...ideas.map((i) => i.cosine_similarity ?? -1)) : null;
+  return el("div", {},
+    el("div", { class: "col-h" }, el("b", {}, label),
+      el("span", { class: "dim mono" },
+        `${answer.cost.wall_ms.toFixed(0)} мс · ${answer.cost.tokens_in}+${answer.cost.tokens_out} ток. · ${answer.log_id}`),
+      best !== null ? el("span", { class: "badge" }, `лучший cosine ${best.toFixed(3)}`) : null,
+      padded ? el("span", { class: "badge b-padding" }, el("span", { class: "g" }, "◇"),
+                    `${padded} добито до k`) : null),
+    ideas.length
+      ? el("div", { class: "cards" }, ...ideas.map((item, i) => ideaCard(item, i + 1)))
+      : el("div", { class: "status warn" }, el("span", { class: "code" }, "200"),
+          "выдача пуста, и это ДАННЫЕ: живое хранилище ответило нулём идей (не 503)"));
+}
+
+view("retrieve", "Retrieve", (host) => {
+  const out = el("div"), statusHost = el("div");
+  const q = el("input", { class: "grow", placeholder: "как задача или как решение…", value: "" });
+  const k = el("input", { type: "number", min: 1, max: 50, value: 5 });
+  const budget = el("input", { type: "number", min: 1, placeholder: "по умолчанию" });
+  const runId = el("input", { placeholder: "run_id (в трейс)" });
+  const rewrite = el("input", { type: "checkbox", checked: "" });
+
+  async function fire(both) {
+    const query = q.value.trim();
+    if (!query) { setStatus(statusHost, "warn", null, "пустой запрос — сервер ответит 400"); return; }
+    const base = { query, k: Number(k.value) || 5 };
+    if (budget.value) base.budget = Number(budget.value);
+    if (runId.value.trim()) base.run_id = runId.value.trim();
+    const arms = both ? [true, false] : [rewrite.checked];
+    out.replaceChildren();
+    const answers = await run(statusHost, both ? "гоню оба плеча…" : "запрос в озеро…", async () => {
+      const res = [];
+      for (const rw of arms) res.push([rw, await api("/retrieve", { method: "POST", body: { ...base, rewrite: rw } })]);
+      return res;
+    });
+    if (!answers) return;
+    const totalMs = answers.reduce((s, [, a]) => s + a.cost.wall_ms, 0);
+    setStatus(statusHost, "ok", 200, `${answers.length} вызов(а) · ${totalMs.toFixed(0)} мс суммарно`);
+    out.replaceChildren(el("div", { class: answers.length > 1 ? "ab" : "" },
+      ...answers.map(([rw, a]) => answerBlock(a, rw ? "rewrite on" : "rewrite off"))));
+  }
+
+  host.replaceChildren(
+    el("div", { class: "panel" },
+      el("h2", {}, "POST /retrieve"),
+      el("p", { class: "help" }, "Запрос эволюции → идеи с провенансом. Recall-first: отказа по низкому "
+        + "скору нет, выдача дозаполняется до k — поэтому смотри via и cosine, а не score."),
+      el("div", { class: "row" },
+        el("label", { class: "f grow" }, "запрос", q),
+        el("label", { class: "f" }, "k", k),
+        el("label", { class: "f" }, "budget (ток.)", budget),
+        el("label", { class: "f" }, "run_id", runId),
+        el("label", { class: "cb" }, rewrite, "rewrite"),
+        el("button", { class: "act", onclick: () => fire(false) }, "Спросить озеро"),
+        el("button", { class: "ghost", onclick: () => fire(true) }, "Оба плеча рядом")),
+      statusHost),
+    out);
+  q.focus();
+});
+
+/* ----------------------------------------------------------------- 2. search */
+
+view("search", "Индекс", (host) => {
+  const out = el("div"), statusHost = el("div");
+  const q = el("input", { class: "grow", placeholder: "слова как есть, без rewrite" });
+  const k = el("input", { type: "number", min: 1, max: 50, value: 10 });
+
+  async function fire() {
+    if (!q.value.trim()) { setStatus(statusHost, "warn", null, "пустой q → 400"); return; }
+    const hits = await run(statusHost, "ищу по тезисам…", () =>
+      api(`/search?q=${encodeURIComponent(q.value.trim())}&k=${Number(k.value) || 10}`));
+    if (!hits) return;
+    const deadFts = hits.length && hits.every((h) => h.bm25_rank === null);
+    setStatus(statusHost, deadFts ? "warn" : "ok", 200,
+      deadFts ? "BM25 не вернул ни одной строки: гибрид работает на одном косинусе — проверь FTS-индекс"
+              : `${hits.length} попаданий, обе руки индекса живы`);
+    out.replaceChildren(hits.length ? el("div", { class: "scroller" },
+      el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["#", "тезис", "идея", "RRF score", "BM25 rank", "vector rank"]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...hits.map((h, i) => el("tr", {},
+          el("td", { class: "num" }, i + 1),
+          el("td", { class: "mono" }, h.thesis_id),
+          el("td", { class: "mono" },
+            el("a", { href: "#", onclick: (e) => { e.preventDefault(); openIdea(h.idea_id); } }, h.idea_id)),
+          el("td", { class: "num mono" }, h.score.toFixed(5)),
+          el("td", { class: "num mono" }, h.bm25_rank ?? "—"),
+          el("td", { class: "num mono" }, h.vec_rank ?? "—"))))))
+      : el("div", { class: "status warn" }, el("span", { class: "code" }, "200"),
+          "индекс ответил нулём строк — это данные, а не поломка"));
+  }
+
+  host.replaceChildren(
+    el("div", { class: "panel" },
+      el("h2", {}, "GET /search"),
+      el("p", { class: "help" }, "Сырой гибрид: BM25 + косинус, слитые RRF. Ни rewrite, ни подъёма к "
+        + "идеям. Пустая колонка BM25 у всех строк = FTS-индекс мёртв, и это видно только здесь."),
+      el("div", { class: "row" },
+        el("label", { class: "f grow" }, "q", q),
+        el("label", { class: "f" }, "k", k),
+        el("button", { class: "act", onclick: fire }, "Искать")),
+      statusHost),
+    out);
+});
+
+/* ------------------------------------------------------------------ 3. ideas */
+
+const PAGE = 25;
+
+function pager(state, total, reload) {
+  const from = total ? state.offset + 1 : 0;
+  const to = Math.min(state.offset + state.limit, total);
+  return el("div", { class: "pager" },
+    el("button", { class: "ghost sm", disabled: state.offset === 0 ? "" : null,
+      onclick: () => { state.offset = Math.max(0, state.offset - state.limit); reload(); } }, "← назад"),
+    el("button", { class: "ghost sm", disabled: to >= total ? "" : null,
+      onclick: () => { state.offset += state.limit; reload(); } }, "вперёд →"),
+    el("span", {}, `показано ${from}–${to} из ${fmt(total)} (total от сервера, не длина списка)`));
+}
+
+let openIdea = () => {};
+
+view("ideas", "Идеи", (host) => {
+  const out = el("div"), statusHost = el("div"), detail = el("div");
+  const state = { offset: 0, limit: PAGE };
+  const jump = el("input", { class: "mono", placeholder: "idea_…" });
+
+  async function load() {
+    const page = await run(statusHost, "читаю идеи…", () =>
+      api(`/ideas?limit=${state.limit}&offset=${state.offset}`));
+    if (!page) return;
+    setStatus(statusHost, "ok", 200, `${page.items.length} строк на странице, total ${fmt(page.total)}`);
+    out.replaceChildren(
+      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["идея", "текст", "trust", "листьев", "origin", "обновлена", ""]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...page.items.map((idea) => el("tr", {},
+          el("td", { class: "mono" }, idea.id),
+          el("td", {}, cut(idea.text, 150)),
+          el("td", { class: "num" }, idea.trust_score.toFixed(1),
+            idea.dirty ? el("span", { class: "badge b-dirty", style: "margin-left:6px" }, "dirty") : null),
+          el("td", { class: "num" }, idea.theses.length),
+          el("td", {}, idea.origin),
+          el("td", { class: "mono dim" }, idea.updated_at || "«»"),
+          el("td", {}, el("button", { class: "ghost sm", onclick: () => show(idea.id) }, "открыть"))))))),
+      pager(state, page.total, load));
+  }
+
+  async function show(ideaId) {
+    detail.replaceChildren();
+    const statusBox = el("div");
+    detail.append(el("div", { class: "panel" }, el("h2", {}, "идея " + ideaId), statusBox));
+    const [idea, edges] = await run(statusBox, "читаю идею и её рёбра…", () => Promise.all([
+      api(`/ideas/${encodeURIComponent(ideaId)}`),
+      api(`/ideas/${encodeURIComponent(ideaId)}/neighbors?hops=1`),
+    ])) || [];
+    if (!idea) return;
+    setStatus(statusBox, "ok", 200, `${idea.theses.length} листьев, ${edges.length} рёбер (1 хоп)`);
+
+    /* PATCH form: only the fields the API allows. `trust_score`, `dirty` and `origin`
+       are absent on purpose — the judge writes the first two in one update, and a
+       hand-written score would separate them. */
+    const editable = ["text", "applicability_conditions", "limitations", "differentiation",
+                      "effect_claimed", "effect_observed"];
+    const inputs = {};
+    const patchStatus = el("div");
+    const form = el("div", { class: "panel" },
+      el("h2", {}, "PATCH /ideas/{id}"),
+      el("p", { class: "help" }, "Правится только то, что ручка принимает. trust_score, dirty и origin "
+        + "недоступны намеренно: счёт и флаг пишет судья одной транзакцией, а origin — факт "
+        + "происхождения. Меняешь text — сервер сам пересчитает вектор."),
+      ...editable.map((field) => {
+        const input = el("input", { class: "grow", value: idea[field] ?? "" });
+        inputs[field] = input;
+        return el("label", { class: "f grow", style: "margin-bottom:8px" }, field, input);
+      }),
+      el("div", { class: "row" },
+        el("button", { class: "act", onclick: async () => {
+          const body = {};
+          for (const field of editable) {
+            const now = inputs[field].value;
+            const was = idea[field] ?? "";
+            if (now !== was) body[field] = field === "differentiation" && now === "" ? null : now;
+          }
+          if (!Object.keys(body).length) {
+            setStatus(patchStatus, "warn", null, "ничего не изменено — пустой PATCH сервер отклонит (400)");
+            return;
+          }
+          const updated = await run(patchStatus, "пишу…", () =>
+            api(`/ideas/${encodeURIComponent(ideaId)}`, { method: "PATCH", body }));
+          if (!updated) return;
+          setStatus(patchStatus, "ok", 200,
+            `записано: ${Object.keys(body).join(", ")}; updated_at ${updated.updated_at || "«»"}`);
+          show(ideaId); load();
+        } }, "Записать изменения"),
+        el("button", { class: "ghost", onclick: () => show(ideaId) }, "Сбросить")),
+      patchStatus);
+
+    detail.append(
+      el("div", { class: "cards" }, ideaCard(idea, null)),
+      form,
+      el("div", { class: "panel" },
+        el("h2", {}, "рёбра из идеи · GET /ideas/{id}/neighbors"),
+        edges.length ? el("div", { class: "scroller" }, el("table", { class: "tbl" },
+          el("thead", {}, el("tr", {}, ...["тип", "куда", "вес", "хоп", "свидетельства", "заметка"]
+            .map((h) => el("th", {}, h)))),
+          el("tbody", {}, ...edges.map((edge) => el("tr", {},
+            el("td", {}, el("span", { class: "badge" }, edge.type)),
+            el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
+              e.preventDefault(); show(edge.target_id); } }, edge.target_id)),
+            el("td", { class: "num" }, edge.weight ?? "—"),
+            el("td", { class: "num" }, edge.hop),
+            el("td", { class: "num" }, (edge.evidence || []).length || "—"),
+            el("td", { class: "dim" }, cut(edge.note, 80)))))))
+          : el("div", { class: "status" }, el("span", { class: "code" }, "200"),
+              "рёбер нет — у этой идеи их действительно ноль (ручка ответила пустым списком)")),
+      el("div", { class: "row" },
+        el("button", { class: "ghost", onclick: () => { detail.replaceChildren(); } }, "Закрыть карточку")));
+    detail.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+  openIdea = (id) => { switchTo("ideas"); setTimeout(() => show(id), 0); };
+
+  host.replaceChildren(
+    el("div", { class: "panel" },
+      el("h2", {}, "GET /ideas"),
+      el("p", { class: "help" }, "Ноды графа с листьями. Открытая карточка даёт рёбра и правку полей."),
+      el("div", { class: "row" },
+        el("label", { class: "f grow" }, "открыть по id", jump),
+        el("button", { class: "act", onclick: () => jump.value.trim() && show(jump.value.trim()) }, "Открыть"),
+        el("button", { class: "ghost", onclick: load }, "Обновить список")),
+      statusHost),
+    detail, out);
+  load();
+});
+
+/* ----------------------------------------------------------------- 4. theses */
+
+view("theses", "Тезисы", (host) => {
+  const out = el("div"), statusHost = el("div");
+  const state = { offset: 0, limit: PAGE };
+  const byIdea = el("input", { class: "mono", placeholder: "idea_…" });
+  const bySource = el("input", { class: "mono", placeholder: "источник" });
+
+  async function load() {
+    const params = new URLSearchParams({ limit: state.limit, offset: state.offset });
+    if (byIdea.value.trim()) params.set("idea_id", byIdea.value.trim());
+    if (bySource.value.trim()) params.set("source_id", bySource.value.trim());
+    const page = await run(statusHost, "читаю тезисы…", () => api(`/theses?${params}`));
+    if (!page) return;
+    setStatus(statusHost, "ok", 200, `total ${fmt(page.total)} при этом фильтре`);
+    out.replaceChildren(
+      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["тезис", "текст", "эффект", "локатор", "источник", "идея"]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...page.items.map((leaf) => el("tr", {},
+          el("td", { class: "mono" }, leaf.id),
+          el("td", {}, cut(leaf.text, 180)),
+          el("td", {}, leaf.effect || "—"),
+          el("td", { class: "mono dim" }, leaf.locator || "—"),
+          el("td", {}, el("a", { href: leaf.source_url, target: "_blank", rel: "noreferrer" },
+            cut(leaf.source_title, 60)),
+            el("span", { class: "badge b-" + leaf.source_type, style: "margin-left:6px" }, leaf.source_type)),
+          el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
+            e.preventDefault(); openIdea(leaf.idea_id); } }, leaf.idea_id))))))),
+      pager(state, page.total, load));
+  }
+
+  host.replaceChildren(
+    el("div", { class: "panel" },
+      el("h2", {}, "GET /theses"),
+      el("p", { class: "help" }, "Листья. Ручки на запись тезиса нет и не будет: тезис неизменяем и "
+        + "создаётся только фазой 2, которая назначает ему идею через арбитра."),
+      el("div", { class: "row" },
+        el("label", { class: "f" }, "idea_id", byIdea),
+        el("label", { class: "f" }, "source_id", bySource),
+        el("button", { class: "act", onclick: () => { state.offset = 0; load(); } }, "Фильтровать")),
+      statusHost),
+    out);
+  load();
+});
+
+/* ---------------------------------------------------------------- 5. sources */
+
+view("sources", "Источники", (host) => {
+  const out = el("div"), statusHost = el("div"), formStatus = el("div");
+  const state = { offset: 0, limit: PAGE };
+
+  async function load() {
+    const page = await run(statusHost, "читаю источники…", () =>
+      api(`/sources?limit=${state.limit}&offset=${state.offset}`));
+    if (!page) return;
+    setStatus(statusHost, "ok", 200, `total ${fmt(page.total)}`);
+    out.replaceChildren(
+      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["источник", "тип", "название", "версия", "получен", "прогон", ""]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...page.items.map((src) => el("tr", {},
+          el("td", { class: "mono" }, src.id),
+          el("td", {}, el("span", { class: "badge b-" + src.type }, src.type)),
+          el("td", {}, el("a", { href: src.url, target: "_blank", rel: "noreferrer" }, cut(src.title, 90))),
+          el("td", { class: "mono" }, src.version),
+          el("td", { class: "mono dim" }, (src.retrieved_at || "").slice(0, 16)),
+          el("td", {}, src.run_success === null || src.run_success === undefined ? "—"
+            : el("span", { class: "badge " + (src.run_success ? "b-ok" : "b-failed") },
+                src.run_success ? "успех" : "провал")),
+          el("td", {}, el("button", { class: "ghost sm", onclick: () => {
+            switchTo("theses");
+            setTimeout(() => { $("main input.mono[placeholder='источник']").value = src.id;
+                               $("main button.act").click(); }, 0);
+          } }, "тезисы"))))))),
+      pager(state, page.total, load));
+  }
+
+  const f = {
+    url: el("input", { class: "grow", placeholder: "https://…" }),
+    title: el("input", { class: "grow" }),
+    type: el("select", {}, ...["run", "paper", "doc", "synthesis"].map((t) => el("option", {}, t))),
+    version: el("input", { value: "v1" }),
+    success: el("select", {}, ...["—", "успех", "провал"].map((t) => el("option", {}, t))),
+    meta: el("input", { class: "mono grow", placeholder: '{"fitness_delta": 0.12}' }),
+  };
+
+  host.replaceChildren(
+    el("div", { class: "panel" },
+      el("h2", {}, "GET /sources"),
+      el("p", { class: "help" }, "Статьи, документация и логи прогонов. id выводится из (url, version), "
+        + "поэтому повторный POST заменяет строку, а не плодит вторую."),
+      el("div", { class: "row" }, el("button", { class: "ghost", onclick: load }, "Обновить")),
+      statusHost),
+    el("details", { class: "panel" },
+      el("summary", { style: "cursor:pointer;color:var(--muted);font-size:12px;letter-spacing:.1em;text-transform:uppercase" },
+        "POST /sources — записать источник (сюда блок C сдаёт исход прогона)"),
+      el("p", { class: "help", style: "margin-top:12px" },
+        "Единственная запись, кроме ингеста. title и type у существующего id заморожены: попытка "
+        + "переписать их — 409, потому что это провенанс уже записанных листьев."),
+      el("div", { class: "row" },
+        el("label", { class: "f grow" }, "url", f.url),
+        el("label", { class: "f grow" }, "title", f.title),
+        el("label", { class: "f" }, "type", f.type),
+        el("label", { class: "f" }, "version", f.version),
+        el("label", { class: "f" }, "run_success", f.success),
+        el("label", { class: "f grow" }, "run_meta (JSON)", f.meta),
+        el("button", { class: "act", onclick: async () => {
+          const body = { url: f.url.value.trim(), title: f.title.value.trim(),
+                         type: f.type.value, version: f.version.value.trim() || "v1" };
+          if (f.success.value !== "—") body.run_success = f.success.value === "успех";
+          if (f.meta.value.trim()) {
+            try { body.run_meta = JSON.parse(f.meta.value); }
+            catch (err) { setStatus(formStatus, "err", null, "run_meta не JSON: " + err.message); return; }
+          }
+          const src = await run(formStatus, "пишу источник…", () =>
+            api("/sources", { method: "POST", body }));
+          if (!src) return;
+          setStatus(formStatus, "ok", 200, `записан ${src.id}`);
+          load();
+        } }, "Записать")),
+      formStatus),
+    out);
+  load();
+});
+
+/* ---------------------------------------------------------------- 6. ingest */
+
+const JOB_KIND = { fetch: "статья", run: "прогон", phase1: "фаза 1", phase2: "фаза 2",
+                   reindex: "индекс", "vault-export": "vault", trust: "суд" };
+
+view("ingest", "Ингест и ops", (host) => {
+  const jobsHost = el("div"), jobStatus = el("div");
+  const fetchStatus = el("div"), phaseStatus = el("div"), opsStatus = el("div");
+  const stagingHost = el("div"), pendingHost = el("div");
+  let timer = null;
+
+  async function loadJobs(quiet) {
+    const jobs = await (quiet
+      ? api("/ingest/jobs?limit=30").catch((err) => { failed(jobStatus, err); return undefined; })
+      : run(jobStatus, "читаю очередь…", () => api("/ingest/jobs?limit=30")));
+    if (!jobs) return;
+    const live = jobs.filter((j) => ["queued", "running", "staged"].includes(j.status)).length;
+    setStatus(jobStatus, live ? "warn" : "ok", 200,
+      `${jobs.length} заданий в списке (limit 30 — список обрезан сервером, если их больше), в работе ${live}`);
+    jobsHost.replaceChildren(el("div", { class: "scroller" }, el("table", { class: "tbl" },
+      el("thead", {}, el("tr", {}, ...["задание", "что", "статус", "попыток", "создано", "итог"]
+        .map((h) => el("th", {}, h)))),
+      el("tbody", {}, ...jobs.map((job) => el("tr", {},
+        el("td", { class: "mono" }, job.id),
+        el("td", {}, JOB_KIND[job.kind] || job.kind,
+          job.stage ? el("span", { class: "dim" }, " · " + job.stage) : null,
+          el("div", { class: "dim mono", style: "font-size:11px" },
+            cut(JSON.stringify(job.args || {}), 90))),
+        el("td", {}, el("span", { class: "badge b-" + job.status }, job.status)),
+        el("td", { class: "num" }, job.attempts),
+        el("td", { class: "mono dim" }, (job.created_at || "").slice(0, 19).replace("T", " ")),
+        el("td", {}, job.error
+          ? el("span", { style: "color:var(--critical)" }, cut(job.error, 160))
+          : el("span", { class: "dim mono" }, cut(JSON.stringify(job.report || {}), 160)))))))));
+  }
+
+  const url = el("input", { class: "grow", placeholder: "https://arxiv.org/abs/2406.04824" });
+  const p1limit = el("input", { type: "number", min: 1, placeholder: "все" });
+  const p1workers = el("input", { type: "number", min: 1, max: 16, value: 8 });
+  const p2limit = el("input", { type: "number", min: 1, placeholder: "всё, что в staging" });
+  const trustIds = el("input", { class: "mono grow", placeholder: "idea_… через запятую; пусто = все dirty" });
+
+  const post = (statusHost, label, path, body) => async () => {
+    const job = await run(statusHost, label, () => api(path, { method: "POST", body }));
+    if (!job) return;
+    setStatus(statusHost, "ok", 202, `задание ${job.id} · ${job.status}`);
+    loadJobs(true);
+  };
+
+  async function loadStaging() {
+    const st = await run(stagingHost, "читаю staging…", () => api("/ingest/staging"));
+    if (!st) return;
+    stagingHost.replaceChildren(
+      el("div", { class: "row" },
+        el("span", { class: "badge" }, `строк ${st.lines}`),
+        el("span", { class: "badge" }, `курсор ${st.cursor}`),
+        el("span", { class: "badge " + (st.pending_lines ? "b-queued" : "b-ok") },
+          `ждёт фазы 2: ${st.pending_lines}`)),
+      st.sources.length ? el("div", { class: "scroller", style: "margin-top:10px;max-height:32vh" },
+        el("table", { class: "tbl" },
+          el("thead", {}, el("tr", {}, ...["источник", "название", "строк", "внесён"].map((h) => el("th", {}, h)))),
+          el("tbody", {}, ...st.sources.map((s) => el("tr", {},
+            el("td", { class: "mono" }, s.id),
+            el("td", {}, cut(s.title, 90)),
+            el("td", { class: "num" }, s.lines),
+            el("td", {}, s.ingested ? el("span", { class: "badge b-ok" }, "да")
+                                    : el("span", { class: "badge b-queued" }, "нет")))))))
+        : el("div", { class: "status" }, el("span", { class: "code" }, "200"),
+            "staging пуст — между фазами ничего не лежит"));
+  }
+
+  async function loadPending() {
+    const rows = await run(pendingHost, "читаю очередь арбитра…", () => api("/ingest/pending-link?limit=50"));
+    if (!rows) return;
+    pendingHost.replaceChildren(rows.length
+      ? el("div", { class: "scroller", style: "max-height:36vh" }, el("table", { class: "tbl" },
+          el("thead", {}, el("tr", {}, ...["когда", "ошибка", "тезис", "источник", "кандидатов"]
+            .map((h) => el("th", {}, h)))),
+          el("tbody", {}, ...rows.map((row) => el("tr", {},
+            el("td", { class: "mono dim" }, (row.ts || "").slice(0, 19).replace("T", " ")),
+            el("td", { style: "color:var(--warning)" }, cut(row.error, 90)),
+            el("td", {}, cut(row.thesis_text, 160)),
+            el("td", { class: "mono" }, row.source_id),
+            el("td", { class: "num" }, row.candidates))))))
+      : el("div", { class: "status ok" }, el("span", { class: "code" }, "200"),
+          "очередь пуста: арбитр ни разу не отказался"));
+  }
+
+  host.replaceChildren(
+    el("div", { class: "panel" },
+      el("h2", {}, "POST /fetch — одна статья целиком"),
+      el("p", { class: "help" }, "Оба этапа за один вызов: fetch → тезисы → идеи в графе. Ответ 202 и "
+        + "задание в очереди на диске; можно послать десять ссылок подряд, писать в граф всё равно "
+        + "будет один поток. Повторная ссылка возвращает ТО ЖЕ задание, а не второе."),
+      el("div", { class: "row" },
+        el("label", { class: "f grow" }, "ссылка на arXiv", url),
+        el("button", { class: "act", onclick: () => post(fetchStatus, "ставлю в очередь…", "/fetch",
+          { url: url.value.trim() })() }, "Забрать статью")),
+      fetchStatus),
+
+    el("div", { class: "panel" },
+      el("h2", {}, "Фазы по отдельности"),
+      el("p", { class: "help" }, "Приёмка стоит между фазами намеренно: фаза 1 граф не открывает вовсе, "
+        + "тезисы читаются глазами из staging, промпт правится, фаза 1 перегоняется — и всё это до "
+        + "первой записи в граф. Слот один: второй запуск получит 409."),
+      el("div", { class: "row" },
+        el("label", { class: "f" }, "limit", p1limit),
+        el("label", { class: "f" }, "workers", p1workers),
+        el("button", { class: "act", onclick: () => post(phaseStatus, "фаза 1 пошла…", "/ingest/phase1",
+          { ...(p1limit.value ? { limit: Number(p1limit.value) } : {}),
+            workers: Number(p1workers.value) || 8 })() }, "Фаза 1 (из sources.yaml)"),
+        el("label", { class: "f" }, "limit фазы 2", p2limit),
+        el("button", { class: "act", onclick: () => post(phaseStatus, "фаза 2 пошла…", "/ingest/phase2",
+          p2limit.value ? { limit: Number(p2limit.value) } : {})() }, "Фаза 2 (staging → граф)")),
+      phaseStatus),
+
+    el("div", { class: "panel" },
+      el("h2", {}, "Обслуживание"),
+      el("p", { class: "help" }, "Пересборка индекса читает хранилище и сверяет числа. Суд — десятки "
+        + "вызовов 35B, поэтому заданием, а не в ответе. Выгрузка vault пересоздаёт папку целиком и "
+        + "откажется затирать заметки, которых не писала."),
+      el("div", { class: "row" },
+        el("button", { class: "ghost", onclick: async () => {
+          const res = await run(opsStatus, "пересобираю индекс…", () =>
+            api("/admin/reindex", { method: "POST" }));
+          if (!res) return;
+          setStatus(opsStatus, res.in_sync ? "ok" : "err", 200,
+            `было ${res.indexed_before}, в хранилище ${res.leaves_in_store}, стало ${res.indexed_after}`
+            + (res.in_sync ? " — сходится" : " — НЕ СХОДИТСЯ"));
+          refreshStrip();
+        } }, "Пересобрать индекс"),
+        el("label", { class: "f grow" }, "судить идеи", trustIds),
+        el("button", { class: "ghost", onclick: () => {
+          const ids = trustIds.value.split(",").map((s) => s.trim()).filter(Boolean);
+          post(opsStatus, "ставлю суд…", "/admin/trust", ids.length ? { idea_ids: ids } : {})();
+        } }, "Судить"),
+        el("button", { class: "ghost", onclick: async () => {
+          const res = await run(opsStatus, "выгружаю vault…", () =>
+            api("/vault/export", { method: "POST" }));
+          if (!res) return;
+          setStatus(opsStatus, res.orphans ? "warn" : "ok", 200,
+            `${res.files} файлов в ${res.dest}: идей ${res.ideas}, тезисов ${res.theses}, `
+            + `источников ${res.sources}, сирот ${res.orphans}`);
+        } }, "Выгрузить в Obsidian")),
+      opsStatus),
+
+    el("div", { class: "panel" },
+      el("h2", {}, "GET /ingest/jobs"),
+      el("div", { class: "row" },
+        el("button", { class: "ghost", onclick: () => loadJobs(false) }, "Обновить"),
+        el("label", { class: "cb" },
+          el("input", { type: "checkbox", onchange: (e) => {
+            clearInterval(timer);
+            timer = e.target.checked ? setInterval(() => { loadJobs(true); refreshStrip(); }, 4000) : null;
+          } }), "автообновление 4 с")),
+      jobStatus, jobsHost),
+
+    el("div", { class: "panel" },
+      el("h2", {}, "GET /ingest/staging — точка приёмки"),
+      el("div", { class: "row" }, el("button", { class: "ghost", onclick: loadStaging }, "Обновить")),
+      stagingHost),
+
+    el("div", { class: "panel" },
+      el("h2", {}, "GET /ingest/pending-link — отказы арбитра"),
+      el("p", { class: "help" }, "Арбитр не смог решить, к какой идее лист — строка падает сюда, а не "
+        + "тихо в add. Непустая очередь значит, что тезисы ждут решения, а не что ингест сломан."),
+      el("div", { class: "row" }, el("button", { class: "ghost", onclick: loadPending }, "Обновить")),
+      pendingHost));
+
+  loadJobs(false); loadStaging(); loadPending();
+});
+
+/* ------------------------------------------------------------------ 7. graph */
+
+const TRUST_RAMP = ["#1c5cab", "#256abf", "#2a78d6", "#3987e5", "#5598e7",
+                    "#6da7ec", "#86b6ef", "#b7d3f6", "#cde2fb"];
+const trustColor = (v) => TRUST_RAMP[Math.max(0, Math.min(8, Math.round((v || 0) * 10)))];
+
+/* Fruchterman-Reingold, seeded on a circle. 225 nodes on the main loop is a few
+   hundred ms — no worker, no library, and the layout is recomputed on demand only. */
+function layout(nodes, links, w, h, iters = 320) {
+  const n = nodes.length;
+  if (!n) return;
+  const k = Math.sqrt((w * h) / n) * 0.62;
+  nodes.forEach((node, i) => {
+    const a = (i / n) * Math.PI * 2;
+    node.x = w / 2 + Math.cos(a) * w * 0.32 * (0.55 + ((i * 37) % 100) / 200);
+    node.y = h / 2 + Math.sin(a) * h * 0.32 * (0.55 + ((i * 61) % 100) / 200);
+    node.dx = node.dy = 0;
+  });
+  const index = new Map(nodes.map((node, i) => [node.id, i]));
+  const edges = links.map((e) => [index.get(e.source), index.get(e.target), e.weight || 1])
+                     .filter(([a, b]) => a !== undefined && b !== undefined);
+  for (let step = 0; step < iters; step++) {
+    const temp = Math.max(w, h) * 0.06 * Math.pow(1 - step / iters, 1.5) + 0.5;
+    for (const node of nodes) node.dx = node.dy = 0;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        let dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 0.01) { dx = (i % 7) - 3; dy = (j % 5) - 2; d2 = dx * dx + dy * dy + 0.01; }
+        const f = (k * k) / d2;
+        nodes[i].dx += dx * f; nodes[i].dy += dy * f;
+        nodes[j].dx -= dx * f; nodes[j].dy -= dy * f;
+      }
+    }
+    for (const [a, b, weight] of edges) {
+      const dx = nodes[a].x - nodes[b].x, dy = nodes[a].y - nodes[b].y;
+      const d = Math.hypot(dx, dy) + 1e-6;
+      const f = (d * d) / k * Math.log1p(weight) * 0.9 / d;
+      nodes[a].dx -= dx * f; nodes[a].dy -= dy * f;
+      nodes[b].dx += dx * f; nodes[b].dy += dy * f;
+    }
+    for (const node of nodes) {
+      const d = Math.hypot(node.dx, node.dy) + 1e-9;
+      node.x += (node.dx / d) * Math.min(d, temp);
+      node.y += (node.dy / d) * Math.min(d, temp);
+      node.x = Math.max(18, Math.min(w - 18, node.x));
+      node.y = Math.max(18, Math.min(h - 18, node.y));
+    }
+  }
+  // Fit to the box at the end: clipping against the frame during the run leaves the
+  // drawing hugging one corner, which reads as "half the graph is missing".
+  const xs = nodes.map((node) => node.x), ys = nodes.map((node) => node.y);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const scale = Math.min((w - 44) / Math.max(x1 - x0, 1e-6), (h - 44) / Math.max(y1 - y0, 1e-6));
+  for (const node of nodes) {
+    node.x = 22 + (node.x - x0) * scale;
+    node.y = 22 + (node.y - y0) * scale;
+  }
+}
+
+view("graph", "Граф", (host) => {
+  const statusHost = el("div"), wrap = el("div", { class: "graphwrap" }), info = el("div");
+  const seed = el("input", { class: "mono grow", placeholder: "idea_… (пусто = всё озеро)" });
+  const hops = el("select", {}, ...[1, 2, 3].map((n) => el("option", {}, n)));
+  const minW = el("input", { type: "number", min: 0, step: 1, placeholder: "любой" });
+  const cap = el("input", { type: "number", min: 10, max: 400, value: 200 });
+
+  async function draw() {
+    const rootId = seed.value.trim();
+    const limit = Math.min(200, Math.max(10, Number(cap.value) || 200));
+    const params = new URLSearchParams({ hops: hops.value });
+    if (minW.value) params.set("min_weight", minW.value);
+
+    const data = await run(statusHost, rootId ? "тяну окрестность идеи…"
+      : "тяну идеи и рёбра каждой из них…", async () => {
+      if (rootId) {
+        const [idea, edges] = await Promise.all([
+          api(`/ideas/${encodeURIComponent(rootId)}`),
+          api(`/ideas/${encodeURIComponent(rootId)}/neighbors?${params}`),
+        ]);
+        const ids = [...new Set([idea.id, ...edges.flatMap((e) => [e.source_id, e.target_id])])]
+          .filter((id) => id !== idea.id);
+        const bodies = new Map([[idea.id, idea]]);
+        // Neighbours come back as edges only, so their bodies are fetched one by one —
+        // there is no bulk read for a set of ids, and inventing one client-side would
+        // mean drawing a node whose trust and leaf count nobody looked up. A 404 here
+        // is a real answer (an edge to an idea that is gone), so it drops the node
+        // rather than the whole picture.
+        for (const [id, body] of await pool(ids, (id) =>
+            api(`/ideas/${encodeURIComponent(id)}`).catch((err) => {
+              if (err.status === 404) return null;
+              throw err;
+            })))
+          if (body) bodies.set(id, body);
+        return { bodies, edges, total: bodies.size, shown: bodies.size, truncated: false };
+      }
+      const page = await api(`/ideas?limit=${limit}&offset=0`);
+      const bodies = new Map(page.items.map((idea) => [idea.id, idea]));
+      const edges = [];
+      for (const [, part] of await pool([...bodies.keys()], (id) =>
+          api(`/ideas/${encodeURIComponent(id)}/neighbors?${params}`)))
+        for (const edge of part) if (bodies.has(edge.target_id)) edges.push(edge);
+      return { bodies, edges, total: page.total, shown: bodies.size,
+               truncated: page.total > bodies.size };
+    });
+    if (!data) return;
+
+    const nodes = [...data.bodies.values()].map((idea) => ({
+      id: idea.id, idea, r: 4 + 1.5 * Math.sqrt(Math.max(0, idea.theses.length - 1)) }));
+    const seen = new Set();
+    const links = [];
+    for (const edge of data.edges) {
+      const key = [edge.source_id, edge.target_id].sort().join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      links.push({ source: edge.source_id, target: edge.target_id, weight: edge.weight || 1,
+                   type: edge.type });
+    }
+    setStatus(statusHost, data.truncated ? "warn" : "ok", 200, rootId
+      ? `окрестность: ${nodes.length} узлов, ${links.length} связей на ${hops.value} хоп(а); `
+        + `в озере всего ${fmt(LAST_STATS ? LAST_STATS.ideas : data.total)} идей`
+      : `узлов ${nodes.length} из ${fmt(data.total)} идей в озере, связей ${links.length}`
+        + (data.truncated
+            ? ` — СПИСОК ОБРЕЗАН до ${nodes.length}: рёбра к идеям вне выборки не нарисованы`
+            : " — обрезки нет"));
+
+    // Everything below is rendering, and a throw here used to leave an empty box under
+    // a green "200" — the picture missing while the status said it arrived. Same class
+    // of lie as an empty list for a broken store, so it gets the same treatment.
+    try {
+    const w = wrap.clientWidth || 1200, h = Math.min(720, Math.round(window.innerHeight * 0.7));
+    layout(nodes, links, w, h);
+    const pos = new Map(nodes.map((node) => [node.id, node]));
+    const mk = (tag, attrs = {}) => {
+      const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+      for (const [k2, v] of Object.entries(attrs)) node.setAttribute(k2, v);
+      return node;
+    };
+    // createElementNS, not `el()`: `document.createElement("svg")` builds an
+    // HTMLUnknownElement that lays out as nothing and renders no children.
+    const svg = mk("svg", { class: "graph", viewBox: `0 0 ${w} ${h}` });
+    const tip = (parent, text) => { const t = mk("title"); t.textContent = text; parent.append(t); };
+    const gEdges = mk("g", { class: "edges" }), gNodes = mk("g", { class: "nodes" }),
+          gLabels = mk("g", { class: "labels" });
+    for (const link of links) {
+      const a = pos.get(link.source), b = pos.get(link.target);
+      if (!a || !b) continue;
+      const strength = Math.min(1, Math.log1p(link.weight) / Math.log1p(6));
+      const line = mk("line", { class: "edge", x1: a.x.toFixed(1), y1: a.y.toFixed(1),
+        x2: b.x.toFixed(1), y2: b.y.toFixed(1), "stroke-opacity": (0.06 + 0.24 * strength).toFixed(3),
+        "stroke-width": (0.6 + 0.9 * strength).toFixed(2) });
+      tip(line, `${link.type} · вес ${link.weight}`);
+      gEdges.append(line);
+    }
+    for (const node of nodes) {
+      const circle = mk("circle", { class: "node" + (node.id === rootId ? " sel" : ""),
+        cx: node.x.toFixed(1), cy: node.y.toFixed(1), r: node.r.toFixed(1),
+        fill: trustColor(node.idea.trust_score) });
+      tip(circle, `${cut(node.idea.text, 160)}\ntrust ${node.idea.trust_score.toFixed(1)} · `
+        + `листьев ${node.idea.theses.length}`);
+      circle.addEventListener("click", () => {
+        info.replaceChildren(el("div", { class: "cards" }, ideaCard(node.idea, null)),
+          el("div", { class: "row", style: "margin-top:10px" },
+            el("button", { class: "ghost", onclick: () => { seed.value = node.id; draw(); } },
+              "Раскрыть окрестность этой идеи"),
+            el("button", { class: "ghost", onclick: () => openIdea(node.id) }, "Открыть в «Идеях»")));
+        info.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      });
+      gNodes.append(circle);
+      if (node.id === rootId) {
+        const label = mk("text", { class: "nl", x: node.x.toFixed(1),
+          y: (node.y - node.r - 7).toFixed(1), "text-anchor": "middle" });
+        label.textContent = "корень";
+        gLabels.append(label);
+      }
+    }
+    svg.append(gEdges, gNodes, gLabels);
+    wrap.replaceChildren(svg);
+    } catch (err) {
+      wrap.replaceChildren();
+      setStatus(statusHost, "err", null,
+        `данные пришли (${nodes.length} узлов), но отрисовка упала: ${err.message}`);
+      throw err;
+    }
+  }
+
+  host.replaceChildren(
+    el("div", { class: "panel" },
+      el("h2", {}, "Граф идея—идея"),
+      el("p", { class: "help" }, "Рёбра читаются через /ideas/{id}/neighbors — по одной идее за вызов, "
+        + "массового чтения рёбер в API нет. Поэтому «всё озеро» это N+1 запросов: при 225 идеях "
+        + "терпимо, при полном корпусе понадобится отдельная ручка. Раскладка force-directed в "
+        + "браузере, цвет — trust, размер — число листьев."),
+      el("div", { class: "row" },
+        el("label", { class: "f grow" }, "корневая идея", seed),
+        el("label", { class: "f" }, "хопов", hops),
+        el("label", { class: "f" }, "min_weight", minW),
+        el("label", { class: "f" }, "идей максимум", cap),
+        el("button", { class: "act", onclick: draw }, "Нарисовать")),
+      statusHost,
+      el("div", { class: "legend" },
+        el("span", {}, el("span", { class: "ramp" },
+          ...TRUST_RAMP.map((c) => el("i", { style: "background:" + c }))), " trust 0.0 → 0.8"),
+        el("span", {}, el("span", { class: "sw", style: "border-radius:50%;width:7px;height:7px" }),
+          el("span", { class: "sw", style: "border-radius:50%;width:15px;height:15px;margin-left:4px" }),
+          " размер — число листьев"),
+        el("span", { class: "dim" }, "клик по узлу — карточка идеи ниже"))),
+    wrap, el("div", { style: "height:14px" }), info);
+  draw();
+});
+
+/* ------------------------------------------------------------------- 8. raw */
+
+view("raw", "Ручки", (host) => {
+  const out = el("div"), statusHost = el("div");
+  const method = el("select", {}, ...["GET", "POST", "PATCH"].map((m) => el("option", {}, m)));
+  const path = el("input", { class: "mono grow", value: "/stats" });
+  const body = el("textarea", { class: "mono", rows: 5, style:
+    "width:100%;background:var(--surface-2);border:1px solid var(--hair);border-radius:8px;padding:10px",
+    placeholder: '{"query": "diversity", "k": 3}' });
+
+  host.replaceChildren(
+    el("div", { class: "panel" },
+      el("h2", {}, "Прямой вызов"),
+      el("p", { class: "help" }, "Тот же ключ, тот же origin, ответ как есть. Полный список ручек — "),
+      el("p", { class: "help" }, el("a", { href: "/docs", target: "_blank" }, "/docs"), " · ",
+        el("a", { href: "/openapi.json", target: "_blank" }, "/openapi.json"),
+        " — эти два пути открыты без ключа: они и есть контракт."),
+      el("div", { class: "row" },
+        el("label", { class: "f" }, "метод", method),
+        el("label", { class: "f grow" }, "путь", path),
+        el("button", { class: "act", onclick: async () => {
+          let parsed = null;
+          if (method.value !== "GET" && body.value.trim()) {
+            try { parsed = JSON.parse(body.value); }
+            catch (err) { setStatus(statusHost, "err", null, "тело не JSON: " + err.message); return; }
+          }
+          const res = await run(statusHost, "…", () =>
+            api(path.value.trim(), { method: method.value, body: parsed }));
+          if (res === undefined) return;
+          setStatus(statusHost, "ok", 200, "ответ ниже");
+          out.replaceChildren(el("pre", { class: "mono", style:
+            "background:var(--surface-2);border:1px solid var(--hair);border-radius:10px;padding:14px;overflow:auto;max-height:60vh" },
+            JSON.stringify(res, null, 2)));
+        } }, "Позвать")),
+      el("label", { class: "f", style: "margin-top:10px;width:100%" }, "тело (JSON)", body),
+      statusHost),
+    out);
+});
+
+/* =================================================================== router */
+
+let CURRENT = location.hash.slice(1) || "retrieve";
+
+function switchTo(id) {
+  CURRENT = id;
+  history.replaceState(null, "", "#" + id);
+  render();
+}
+
+function render() {
+  const tabs = $("#tabs");
+  tabs.replaceChildren(...VIEWS.map((v) => el("button", {
+    role: "tab", "aria-selected": String(v.id === CURRENT), onclick: () => switchTo(v.id),
+  }, v.title)));
+  const main = $("#main");
+  main.replaceChildren();
+  if (!API_KEY) { openGate(""); return; }
+  const chosen = VIEWS.find((v) => v.id === CURRENT) || VIEWS[0];
+  chosen.mount(main);
+}
+
+window.addEventListener("hashchange", () => {
+  const id = location.hash.slice(1);
+  if (id && id !== CURRENT) { CURRENT = id; render(); }
+});
+
+render();
+if (API_KEY) { refreshStrip(); setInterval(refreshStrip, 20000); } else openGate("");
+</script>
+</body>
+</html>

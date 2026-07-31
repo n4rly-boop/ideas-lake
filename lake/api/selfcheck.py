@@ -13,7 +13,9 @@ import csv
 import functools
 import json
 import os
+import re
 import shutil
+import subprocess
 import sqlite3
 import sys
 import tempfile
@@ -32,7 +34,7 @@ from ..ingest import run as run_mod
 from ..models import (DATA, EMBED_DIM, Idea, Source, Thesis, new_idea_id, new_thesis_id,
                       source_id as make_source_id, text_hash)
 from ..retrieve import api as retrieve_api, rank as rank_mod, search as search_mod
-from . import jobs, schemas, workers
+from . import app as app_mod, jobs, schemas, workers
 from .app import create_app
 from .schemas import MAX_K, MAX_PAGE, MAX_QUERY_CHARS, IdeaOut, ThesisOut
 
@@ -1486,6 +1488,59 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
     print("ok: the key — 401 on every route and on unknown paths, wrong key and wrong "
           "scheme refused, 400 still 400, schema open and documents its 401, empty or "
           "missing key refuses to start")
+
+    # ------------------------------------------------------------------ the console
+    # `/ui` is the fifth open path, and it is open for the same reason `/docs` is: a
+    # browser cannot put a header on a top-level navigation. So the asserts here are
+    # about what that costs — the asset must hold no lake data, must not appear in the
+    # contract, and must not have widened the door for anything else.
+    with TestClient(create_app(mock=True, warmup=False, api_key=key, workers=False)) as guarded:
+        page = guarded.get(app_mod.UI_PATH)
+        assert page.status_code == 200, page.status_code
+        assert page.headers["content-type"].startswith("text/html"), page.headers
+        body = page.text
+        assert "<title>" in body and "Bearer" in body, "the console must ask for the key itself"
+        # No lake data baked into the asset: it reads everything over the same routes,
+        # with the key the operator types. A page shipping ids, a key or a Bolt URL
+        # would be a page that keeps answering after the key is revoked. Matched as
+        # real ids (`idea_` + hex), not as the bare prefix — the page says `idea_…` in
+        # its own input placeholders, and a check that trips on those is a check
+        # somebody deletes.
+        for leaked in (r"idea_[0-9a-f]{8}", r"th_[0-9a-f]{8}", r"LAKE_API_KEY\s*=\s*\S",
+                       r"neo4j(\+s)?://", r"bolt://"):
+            assert not re.search(leaked, body), leaked
+        # Not in the contract: C integrates against /openapi.json, and an HTML page in
+        # there would be an operation with no schema — plus `_drop_422` would stamp it
+        # with a 401 it deliberately does not answer.
+        assert app_mod.UI_PATH not in guarded.get("/openapi.json").json()["paths"]
+        # The door is exactly one path wider, and the neighbours of that path stay shut:
+        # a prefix match instead of an exact one would have opened all of them.
+        for near in (app_mod.UI_PATH + "/", app_mod.UI_PATH + "/x", "/ui.html", "/uix"):
+            assert guarded.get(near).status_code == 401, near
+        assert guarded.post(app_mod.UI_PATH).status_code == 401, "only GET is open"
+    assert app_mod.UI_FILE.is_file(), app_mod.UI_FILE
+
+    # The page is one file of hand-written JS, and a missing bracket in it does not
+    # fail loudly: the browser parses nothing, runs nothing, and shows a header over an
+    # empty page — served with a 200 by a server that is perfectly healthy. That is the
+    # exact shape of a silent failure this project refuses elsewhere, so it gets a
+    # check. (Caught precisely this, four times, the first time it ran.)
+    script = re.search(r"<script>(.*)</script>", app_mod.UI_FILE.read_text(encoding="utf-8"),
+                       re.S)
+    assert script, "console.html has no <script> block"
+    node = shutil.which("node")
+    if node:
+        scratch = tmp / "console.js"
+        scratch.write_text(script.group(1), encoding="utf-8")
+        checked = subprocess.run([node, "--check", str(scratch)], capture_output=True, text=True)
+        assert checked.returncode == 0, f"console.html: {checked.stderr.strip()[:400]}"
+        print("ok: the console — its JavaScript parses (node --check)")
+    else:
+        # Named, not swallowed: a check that quietly did not run is worse than none.
+        print("SKIPPED: node is not installed, so console.html's JavaScript was NOT "
+              "parsed — a syntax error in it would ship as a blank page")
+    print("ok: the console — /ui open and HTML, no lake data in it, absent from the "
+          "contract, neighbouring paths and non-GET still 401")
 
 
 def _await(client, job_id: str, timeout: float = 10.0) -> dict:
