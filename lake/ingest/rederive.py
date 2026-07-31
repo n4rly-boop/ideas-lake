@@ -5,7 +5,11 @@ is ingested in several passes and leaves from C4 runs arrive separately and late
 an in-memory counter would be lost between passes and fire in the wrong place.
 
 `id` is preserved — edges and their accumulated weights do not break (`08:200`).
-`dirty` and `trust_score` stay untouched: they are B's and mean something else.
+`dirty` and `trust_score` stay untouched HERE, and that is deliberate now that both
+belong to A (`13` §3.2-3.3): re-derivation rewrites what the idea SAYS, judging decides
+what it is WORTH, and the two fail separately. They meet in `ingest/trust.py`, which is
+the one place that lowers the flag — after a judge that failed, the idea stays dirty and
+the next pass judges it again. Clearing the flag here would spend that retry on nothing.
 `differentiation` needs neighbouring ideas, i.e. edges, and is a separate pass.
 """
 from .. import graph_client, llm

@@ -17,6 +17,7 @@ CLI:
 """
 import argparse
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -27,6 +28,12 @@ from ..models import (PENDING_LINK, STAGING, STAGING_CURSOR, DraftThesis, IdeaFi
 
 # Phase 1 runs in 8 threads and every one of them appends to the same file.
 _staging_lock = threading.Lock()
+
+# How many ideas the judge may score in one pass (`13` §3.3). One 35B call per idea:
+# on a lake of 26 that is two minutes, on a lake of 500 it would be most of an hour
+# hanging off a single `/fetch`. The remainder is not lost — it stays dirty and the
+# next pass takes it, oldest first — and the report says how many were deferred.
+TRUST_PER_PASS = int(os.environ.get("LAKE_TRUST_PER_PASS") or 50)
 
 
 # ------------------------------------------------------------------------ phase 1
@@ -86,6 +93,9 @@ def phase1(entries: list[dict], workers: int = 8) -> int:
 def _one_source(entry: dict, fetch, parse, generalize, staging_path) -> tuple[int, int, int]:
     """One source end to end into staging lines. Returns (lines, leaks, dropped)."""
     from .. import embed
+    # local: matches `_report`'s own import (run.py, below) — kept off this module's
+    # top-level import chain the same way runlog keeps csv/argparse off `run.py`'s.
+    from . import runlog
 
     src, sections = fetch.fetch_source(entry)
     # The abstract rides in the section list as reference material for every call
@@ -106,9 +116,16 @@ def _one_source(entry: dict, fetch, parse, generalize, staging_path) -> tuple[in
     # pre-generalization text: candidates are gathered thesis-to-thesis (§4.5).
     vectors = embed.embed_docs([draft.text for draft in drafts])
     source = src.model_dump()
+    # MINOR (§9 p.9, second round): `fetch.py:396` accepts `stype == "run"`, so a run
+    # source CAN reach phase 1 (unlike `_report`'s recount, this call was never
+    # exercised by a real run today — but "inert until a caller does the one thing
+    # the type system allows" is not the same as "correct"). Same widening as
+    # `_report` (below): a `run` source's leakage check needs `runlog.leak_terms`,
+    # not the paper-shaped rule alone, or a leaked `program_id` reads clean.
+    extra_terms = runlog.leak_terms(source) if source.get("type") == "run" else ()
     lines, leaks = [], 0
     for section_id, draft, fields, vector in zip(section_ids, drafts, ideas, vectors):
-        leaks += bool(generalize.leakage(draft, fields))
+        leaks += bool(generalize.leakage(draft, fields, extra_terms=extra_terms))
         lines.append(json.dumps({
             "source": source,
             "section_id": section_id,
@@ -175,8 +192,8 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
 def _phase2(staging_path, limit: int | None) -> dict:
     """The body of `phase2`, under the writer lock. Not an entry point — call `phase2`."""
     llm.assert_grammar_works(llm.QWEN_9B)       # rederive
-    llm.assert_grammar_works(llm.QWEN_35B)      # link arbiter
-    from . import generalize, link, rederive, split
+    llm.assert_grammar_works(llm.QWEN_35B)      # link arbiter AND the trust judge
+    from . import generalize, link, rederive, split, trust
 
     # Before a single arbiter call: an index that is empty while the store is not
     # makes step [1] return zero candidates for every thesis, and zero candidates
@@ -200,6 +217,8 @@ def _phase2(staging_path, limit: int | None) -> dict:
     rederive_failed: list[dict] = []
     splits: list[dict] = []
     split_failed: list[dict] = []
+    cocitation_pairs = 0
+    cocitation_missing: list[dict] = []
 
     def split_sweep() -> None:
         """Split every idea over the leaf ceiling (issue #2).
@@ -262,6 +281,20 @@ def _phase2(staging_path, limit: int | None) -> dict:
             index.index_theses(theses)
             written += len(theses)
 
+        # D12: co-citation edges for THIS source's own ideas, right after all of
+        # them are committed and before `split_sweep()` — a child idea a split
+        # creates below has no leaves of its own under `src.id` yet, so writing
+        # edges before the split covers the same ideas co-citation is defined
+        # over (two ideas sharing a source), not idea shells split has not
+        # populated. `write_cocitation_edges` is idempotent per source (repeat
+        # ingest of the same source recomputes the same pairs, its own id is
+        # already recorded, weight does not move — `neo4j_store` docstring).
+        for outcome in graph_client.write_cocitation_edges(src.id):
+            if outcome["missing"]:
+                cocitation_missing.append({"source_id": src.id, **outcome})
+            else:
+                cocitation_pairs += 1
+
         _reconcile_index()
 
         split_sweep()
@@ -288,11 +321,38 @@ def _phase2(staging_path, limit: int | None) -> dict:
 
     split_sweep()       # see the docstring: `groups` can be empty and the node stays
 
+    # The judge, last: after every leaf of this pass is in, after re-derivations have
+    # rewritten what the ideas say, and after splits have decided which idea is which.
+    # Judging per source instead would pay 35B for an idea that the next source of the
+    # same run is about to change. The set comes from the STORE, not from this run, so
+    # an idea left dirty by an earlier failed judgement is picked up here — that is the
+    # retry, and it is the reason `dirty` is lowered nowhere else (`13` §3.3).
+    #
+    # `trust.run_pass()` (no args) is exactly this: `dirty_ideas()`, capped at
+    # `TRUST_PER_PASS`, `trust_due`/`trust_deferred` reported. Calling it here instead
+    # of inlining the same three lines keeps ONE definition of "how a pass runs" that
+    # both this end-of-phase-2 step and the operator-triggered `/admin/trust` share
+    # (finding, review 2026-07-31) — the thing `13` §3.3 warns a second entry point
+    # risks duplicating.
+    trust_report = trust.run_pass()
+
     report = _report(processed, generalize, cursor)
     report.update({"sources_processed": len(groups[:limit]), "theses_written": written,
                    "theses_skipped": skipped, "theses_refused": refused,
                    "rederived": rederived, "rederive_failed": rederive_failed,
                    "splits": splits, "split_failed": split_failed,
+                   # `cocitation_pairs`, not `cocitation_edges` (review, 2026-07-31): this
+                   # counts idea PAIRS `write_cocitation_edges` reported as written — one
+                   # per source pass over the loop below. `/stats.edges` (`counts()["edges"]`)
+                   # counts `(:Idea)-[:RELATED]->(:Idea)` ROWS, both directions, so it reads
+                   # TWICE this number for the same co-citation work (`neo4j_store` module
+                   # docstring: "both directions... the stored edge is directed"). A field
+                   # literally named `..._edges` holding half of what `/stats.edges` calls
+                   # edges was the kind of number that does not agree with what the page
+                   # shows without actually being wrong — renamed rather than doubled, since
+                   # "pairs found" is what the loop below actually counts.
+                   "cocitation_pairs": cocitation_pairs,
+                   "cocitation_missing": cocitation_missing, **trust_report,
                    # Read off the STORE, not off `split_failed`. The failure list counts
                    # attempts — one idea failing under ten sources is ten entries, and an
                    # idea nobody attempted is zero — so it answers "did a call raise",
@@ -424,18 +484,37 @@ def drain_one(staging_path, staged: dict | None = None) -> dict:
 
 def _report(processed: list[dict], generalize, cursor: int) -> dict:
     """The numbers §4.7 asks for, over the whole store, not only this run."""
+    # local: keeps runlog (csv/argparse, `13` §2.5's converter) off run.py's own
+    # import chain, the same way run.py's other ingest submodules are imported.
+    from . import runlog
+
     leaves = graph_client.all_theses()
     orphans = graph_client.ideas_without_leaves()
     ideas = graph_client.get_ideas(sorted({leaf["idea_id"] for leaf in leaves} | set(orphans)))
     multi = sum(1 for idea in ideas if len({t["source_id"] for t in idea["theses"]}) >= 2)
     sources = {t["source_id"] for idea in ideas for t in idea["theses"]}
+    # BLOCKER 1: a `run`-type row needs the run-specific term list (§2.2.1) —
+    # program id, run id, task, mutation model, the mutant's own code names —
+    # or this recount is the paper-shaped check re-run on a log, which the
+    # spec (§9 p.9) says means nothing: a leaked `program_id` would pass clean.
     leaked = sum(1 for row in processed
-                 if generalize.leakage(_draft_of(row), IdeaFields(**row["idea_fields"])))
+                 if generalize.leakage(
+                     _draft_of(row), IdeaFields(**row["idea_fields"]),
+                     extra_terms=(runlog.leak_terms(row["source"])
+                                  if row["source"].get("type") == "run" else ())))
+    # An idea with no leaves is two opposite things since `13` §5, and one number for
+    # both would hide each behind the other: a hypothesis is legal and carries no
+    # evidence by definition, an EXTRACTED idea with no leaves is the write that broke
+    # between `create_idea` and `write_theses`. Counted apart, named apart.
+    by_id = {idea["id"]: idea for idea in ideas}
+    hypotheses = [i for i in orphans if by_id.get(i, {}).get("origin") == "synthesized"]
+    broken = [i for i in orphans if i not in set(hypotheses)]
     return {"sources": len(sources), "theses": len(leaves), "ideas": len(ideas),
             "ideas_multi_source": _share(multi, len(ideas)),
             "pending_link": _count_lines(PENDING_LINK),
             "leakage_share": _share(leaked, len(processed)),
-            "ideas_without_leaves": len(orphans),
+            "ideas_without_leaves": len(broken),
+            "hypotheses": len(hypotheses),
             "cursor": cursor, **trace.totals()}
 
 
@@ -444,8 +523,21 @@ def _print_report(report: dict) -> None:
     for key, value in report.items():
         print(f"  {key}: {value}")
     if report["ideas_without_leaves"]:
-        # IDEA ||--|{ THESIS (`06:85`). Loud, not a number nobody reads.
-        print(f"  INVARIANT BROKEN: {report['ideas_without_leaves']} ideas have no leaves")
+        # `06:85` weakened by `13` §5: a leafless idea is legal exactly when it is a
+        # hypothesis (`origin="synthesized"`). Anything else with no leaves is still
+        # the broken write it always was. Loud, not a number nobody reads.
+        print(f"  INVARIANT BROKEN: {report['ideas_without_leaves']} extracted ideas "
+              "have no leaves")
+    if report.get("trust_failed"):
+        # Not folded into "judged": a refusal leaves the previous score standing and
+        # the idea dirty, which is the opposite of a score of 0.0 (`13` §9 p.4).
+        print(f"  trust: the judge refused on {report['trust_failed']} idea(s), "
+              "their scores are unchanged and they stay dirty")
+        for failure in report.get("trust_errors") or []:
+            print(f"    {failure['idea_id']}: {failure['error']}")
+    if report.get("trust_deferred"):
+        print(f"  trust: {report['trust_deferred']} dirty idea(s) not judged this pass "
+              f"(ceiling {TRUST_PER_PASS}), they are queued for the next one")
     # Two independent facts, each from its own source of truth. A split can fail with
     # nothing left over the ceiling (the store commit went through and only the index
     # rebuild raised), and an idea can be over the ceiling with nothing in `split_failed`
@@ -459,6 +551,10 @@ def _print_report(report: dict) -> None:
         from .split import MAX_LEAVES
         print(f"  STILL OVER THE CEILING: {report['ideas_over_ceiling']} idea(s) above "
               f"{MAX_LEAVES} leaves, max is {report['max_leaves_per_idea']} (issue #2)")
+    if report.get("cocitation_missing"):
+        print(f"  co-citation edges that matched no idea: {len(report['cocitation_missing'])}")
+        for miss in report["cocitation_missing"]:
+            print(f"    {miss['source_id']}: {miss['idea_a_id']} <-> {miss['idea_b_id']}")
 
 
 def _draft_of(row: dict) -> DraftThesis:
@@ -515,13 +611,20 @@ def _reconcile_index() -> tuple[int, int]:
 
 
 def _rederive_due(threshold: int = 3) -> list[str]:
-    """Ideas with `len(leaves) - rederived_at_leaf_count >= threshold` (§4.6)."""
+    """`dirty` AND `len(leaves) - rederived_at_leaf_count >= threshold` (§4.6, `13` §3.2).
+
+    Both conditions, because they are one definition in two representations: the flag
+    says the leaves moved at all, the counter says how far. Dropping the flag brings
+    back the state where an idea whose leaves were rolled back still looks due; dropping
+    the counter re-derives on every single leaf. The flag is also the cheap half — it is
+    a column read, the counter needs the leaf tally.
+    """
     counts: dict[str, int] = {}
     for row in graph_client.all_theses():
         counts[row["idea_id"]] = counts.get(row["idea_id"], 0) + 1
     due = []
     for idea in graph_client.get_ideas(sorted(counts)):
-        if counts[idea["id"]] - idea["rederived_at_leaf_count"] >= threshold:
+        if idea["dirty"] and counts[idea["id"]] - idea["rederived_at_leaf_count"] >= threshold:
             due.append(idea["id"])
     return due
 
@@ -576,7 +679,7 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     if args.phase == "selfcheck":
-        selfcheck()
+        raise SystemExit(selfcheck())
     elif args.phase == "phase1":
         import yaml                             # only the CLI reads sources.yaml
         entries = yaml.safe_load(Path(args.sources).read_text(encoding="utf-8"))
@@ -587,13 +690,17 @@ def main(argv=None) -> None:
 
 # ------------------------------------------------------------------- self-check
 
-def selfcheck() -> None:
+def selfcheck() -> int:
     """Offline end-to-end over two fixture sources: no network, no model load.
 
     fetch/parse/generalize/link, `lake.embed` and `llm.complete` are fakes; the store
     and the index go to a temporary directory. ponytail: one runnable check, not a
     suite — it fails if the staging format, the cursor, idempotency or the re-derive
     trigger break.
+
+    Returns 1 on SKIPPED/REFUSED, 0 once every assertion below actually ran — a
+    demo that never touched the graph must not read like a passed check
+    (`lake/api/selfcheck.py:main` docstring has the full story).
     """
     import functools
     import sys
@@ -603,7 +710,7 @@ def selfcheck() -> None:
 
     import numpy as np
 
-    from .. import stub_store
+    from .. import neo4j_store
     from ..models import (EMBED_DIM, Idea, Section, Thesis, new_idea_id,
                           new_thesis_id, source_id as make_source_id)
 
@@ -678,7 +785,7 @@ def selfcheck() -> None:
         return IdeaFields(text=f"lever {lever}", applicability_conditions="ac",
                           limitations="lim", failure_modes=["fm"])
 
-    def leakage(draft, out):
+    def leakage(draft, out, extra_terms=()):
         return ["dataset name leaked"] if out.text.endswith("1") else []   # lever 1 leaks
 
     install(f"{__package__}.fetch",
@@ -697,10 +804,11 @@ def selfcheck() -> None:
         out = []
         for row in rows:
             th = row["thesis"]
-            with stub_store._lock:
-                seen = stub_store._c().execute(
-                    "SELECT 1 FROM thesis WHERE source_id=? AND text_hash=?",
-                    (source_id, th["text_hash"])).fetchone()
+            leaf_key = f"{source_id}|{th['text_hash']}"
+            with neo4j_store._session() as _s:
+                seen = _s.execute_read(lambda tx, leaf_key=leaf_key: tx.run(
+                    "MATCH (t:Thesis {leaf_key: $leaf_key}) RETURN 1 AS c",
+                    leaf_key=leaf_key).single())
             if seen:
                 out.append({"thesis": None, "idea": None, "skipped": True,
                             "reason": "text_hash already under this source"})
@@ -721,8 +829,17 @@ def selfcheck() -> None:
 
     install(f"{__package__}.link", link_batch=link_batch)
 
+    judged: list[str] = []
+
     def complete(prompt, *, system, schema, op, max_tokens, timeout, model=None,
                  temperature=0.0):
+        if op == "trust":
+            # The judge runs on every dirty idea at the end of phase 2 (`13` §3.3).
+            # Its prompt is checked in `ingest/trust.py`; here it only has to be the
+            # 35B model and to answer inside the enum.
+            assert model == llm.QWEN_35B, model
+            judged.append(prompt)
+            return {"reason": "one source, no run evidence", "score": "5"}
         assert op == "rederive" and system.startswith("You re-derive"), op
         assert "LEAVES (4)" in prompt, prompt              # ALL leaves, not just the new ones
         assert "source_type: paper" in prompt and "source_type: run" in prompt, prompt
@@ -736,12 +853,38 @@ def selfcheck() -> None:
 
     from . import rederive
 
+    # D11 removed the isolated store this check used to swap in (a fresh SQLite
+    # file). Neo4j has no equivalent disposable target, so the fixture below is
+    # written into whatever `NEO4J_URI` names for real — guarded the same way
+    # `vault.demo`/`lake.api.selfcheck` are: the host must be local/scratch
+    # (`neo4j_store._require_local_target`) and the graph confirmed empty first.
+    # BLOCKER (review 2026-07-31): checked `os.environ.get("NEO4J_URI")` here and
+    # unconditionally `DETACH DELETE`d below — one variable checked, a different
+    # one (whatever the driver connected with, possibly set before an env change)
+    # wiped. `_get_driver()` first, then the URI it actually snapshotted
+    # (`neo4j_store._uri`), same as `lake.selfcheck._wipe_graph`.
+    try:
+        neo4j_store._get_driver()  # so `_uri` below reflects what the driver really used
+        neo4j_store._require_local_target(neo4j_store._uri)
+        with neo4j_store._session() as _s:
+            _existing = _s.execute_read(
+                lambda tx: tx.run("MATCH (n) RETURN count(n) AS c").single()["c"])
+    except graph_client.STORE_ERRORS as exc:
+        print(f"SKIPPED: no Neo4j reachable at {os.environ.get('NEO4J_URI')} "
+              f"({type(exc).__name__}: {exc}). Bring one up with "
+              "`docker compose up -d neo4j` and rerun.")
+        return 1
+    if _existing:
+        print(f"REFUSED: the graph is not empty ({_existing} node(s) total) — this "
+              "self-check only ever runs against an empty scratch instance. Point "
+              "NEO4J_URI at an empty instance and rerun.")
+        return 1
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             STAGING = Path(tmp) / "staging.jsonl"
             cursor_path = _cursor_path(STAGING)
             idx = Path(tmp) / "index.db"
-            stub_store._db_path = Path(tmp) / "lake.db"
             # Every graph call is @trace'd into TRACES_DIR/<run_id>.jsonl. Deleting the
             # file afterwards was not enough: `_write` mkdirs the directory, and a data/
             # that exists while holding no file is what makes `vault.demo`'s leak guard
@@ -810,6 +953,24 @@ def selfcheck() -> None:
             assert index.count(db=idx) == 4, index.count(db=idx)
             print("ok: phase 2 on 1 source — 4 leaves, 2 ideas, cursor 4, no re-derive yet")
 
+            # --- co-citation edges (D12): source s1 gives BOTH "lever 0" and "lever 1"
+            # 2 leaves each (one per section) — 2 DISTINCT ideas under one source is
+            # what the gate is on (BLOCKER 2, review 2026-07-31: not a per-idea leaf
+            # count — `lake/neo4j_store.py`'s own live self-check covers the 1-leaf-
+            # per-idea shape this fixture does not), so phase 2 must write one
+            # co-citation edge, both directions, weight min(2, 2) = 2.
+            hot0, cold0 = ideas_by_text["lever 0"], ideas_by_text["lever 1"]
+            assert first["cocitation_pairs"] == 1 and first["cocitation_missing"] == [], first
+            assert graph_client.counts()["edges"] == 2, graph_client.counts()  # 1 pair, 2 rows
+            hop = graph_client.neighbors([hot0])
+            assert len(hop) == 1 and hop[0]["target_id"] == cold0 and hop[0]["weight"] == 2.0, hop
+            assert hop[0]["type"] == "related_via_source", hop
+            back = graph_client.neighbors([cold0])
+            assert len(back) == 1 and back[0]["target_id"] == hot0 and back[0]["weight"] == 2.0, \
+                back
+            print("ok: phase 2 writes co-citation edges for the source's own ideas, "
+                  "both directions, weight min(count_a, count_b) (D12)")
+
             # --- restart: continues from the cursor -------------------------
             second = phase2(STAGING)
             assert second["sources_processed"] == 1, "restart re-processed source 1"
@@ -823,6 +984,12 @@ def selfcheck() -> None:
             assert second["leakage_share"] == 0.0 and second["pending_link"] == 0, second
             #  ^ source 2 is all lever 0; the whole staging replayed below is 2/6
             assert second["wall_ms"] > 0, second
+            # source s2 (`run`) links both its leaves onto the SAME idea ("lever 0"
+            # twice, `link_batch`'s fake overlay) — one idea under s2, no pair to
+            # co-cite, and the s1 edge above must be untouched by a different source.
+            assert second["cocitation_pairs"] == 0 and second["cocitation_missing"] == [], second
+            assert graph_client.neighbors([hot0])[0]["weight"] == 2.0, \
+                "an unrelated source's phase 2 must not touch another source's edge"
             print("ok: restart from the cursor — source 2 only, 6 leaves, index == graph")
 
             # --- the re-derive itself ---------------------------------------
@@ -834,7 +1001,12 @@ def selfcheck() -> None:
             assert idea["effect_claimed"] == "+3.1 pp on paper leaves"
             assert idea["effect_observed"] == "+1.0 pp on run leaves"
             assert idea["failure_modes"] == ["fm2"] and idea["limitations"] == "lim2"
-            assert not idea["dirty"] and idea["trust_score"] > 0, "dirty/trust_score are B's"
+            # `13` §3.2-3.3: both are A's now. Writing leaves raised `dirty`, the judge
+            # at the end of the pass stored a score and lowered it again — in that
+            # order, and only through `set_trust`.
+            assert idea["trust_score"] == 0.5, idea["trust_score"]
+            assert not idea["dirty"], "the judge ran and the flag is still up"
+            assert idea["origin"] == "extracted", idea["origin"]
             assert np.allclose(idea["vector"], embed_docs(["REDERIVED lever 0"])[0], atol=1e-6), \
                 "text changed and the vector did not follow it"
             assert rederive.maybe_rederive(cold) is False, "3 leaves needed, cold has 2"
@@ -849,7 +1021,16 @@ def selfcheck() -> None:
             assert again["theses_written"] == 0, "a replay wrote new theses"
             assert again["leakage_share"] == 0.333, again
             assert index.count(db=idx) == 6
-            print("ok: replay of the whole staging — 6 skipped, 0 new theses, 0 new ideas")
+            # D12 idempotency requirement: replaying source s1 recomputes the same
+            # co-citation pair (still not "missing"), but its own source id is
+            # already in the edge's `evidence`, so the weight must NOT have doubled
+            # to 4.0 — a re-ingest of the same source must not inflate the weight.
+            assert again["cocitation_pairs"] == 1, again
+            assert graph_client.counts()["edges"] == 2, graph_client.counts()
+            assert graph_client.neighbors([hot0])[0]["weight"] == 2.0, \
+                "replaying the same source doubled the co-citation weight"
+            print("ok: replay of the whole staging — 6 skipped, 0 new theses, 0 new ideas, "
+                  "co-citation weight unchanged (D12 idempotency)")
 
             # --- /fetch: one source, own staging, corpus untouched -----------
             corpus_before = STAGING.read_text(encoding="utf-8")
@@ -941,15 +1122,59 @@ def selfcheck() -> None:
             assert after["rederived_at_leaf_count"] == 0, "the trigger moved on a failure"
             print("ok: failed re-derivation — idea untouched, counter not moved, raised")
 
+            # -- BLOCKER 1 (leakage plumbing): `_report`'s recount must widen with
+            # `runlog.leak_terms` for a `run`-type row, and invent nothing for a
+            # `paper` row. Driven directly, not through phase2, so a real store and
+            # index are not needed and the fake `leakage` above (which only looks at
+            # `out.text`) cannot mask a wiring bug in `extra_terms`. -----------------
+            from . import runlog as runlog_mod
+
+            leak_calls: dict[str, tuple] = {}
+
+            def recording_leakage(draft, out, extra_terms=()):
+                leak_calls[draft.locator] = tuple(extra_terms)
+                return []
+
+            run_src = Source(id=make_source_id("gigaevo://run1/prog1", "prog1"),
+                             url="gigaevo://run1/prog1", title="t", type="run",
+                             version="prog1", retrieved_at="2026-07-28T10:00:00Z",
+                             run_success=True,
+                             run_meta={"run": "run1", "program_id": "prog1", "task": "",
+                                       "mutation_model": "", "mutant_code_names": []})
+            paper_src = Source(id=make_source_id("https://arxiv.org/abs/x", "v1"),
+                               url="https://arxiv.org/abs/x", title="t2", type="paper",
+                               version="v1", retrieved_at="2026-07-28T10:00:00Z",
+                               run_success=None, run_meta=None)
+
+            def _row(src, locator):
+                return {"source": src.model_dump(),
+                        "thesis": {"text": "t", "context": "c", "effect": "e",
+                                  "locator": locator},
+                        "draft": {"draft_text": "d", "draft_applicability": "a",
+                                 "draft_limitations": "l"},
+                        "idea_fields": {"text": "x", "applicability_conditions": "",
+                                       "limitations": "", "failure_modes": []}}
+
+            _report([_row(run_src, "l1"), _row(paper_src, "l2")],
+                    types.SimpleNamespace(leakage=recording_leakage), cursor=0)
+            assert leak_calls["l1"] == ("prog1", "run1"), leak_calls
+            assert leak_calls["l2"] == (), leak_calls
+            print("ok: _report widens the leakage recount with leak_terms for a run "
+                  "row, and only a run row")
+
             index._CONNS.pop(str(idx)).close()
-            stub_store._conn.close()
-            stub_store._conn = None
     finally:
         STAGING = real_staging
         index.index_theses, llm.complete = real_index_theses, real_complete
         index.has, index.index_rows = real_has, real_index_rows
         index.stale_links, index.reconcile = real_stale_links, real_reconcile
         llm.assert_grammar_works = real_canary
+        # The graph was confirmed empty above, so wiping it outright on the way out
+        # cannot touch anything this run did not itself write. Unconditional, in the
+        # `finally`: an assertion failure above must not leave fixtures behind to
+        # poison the emptiness gate of the next invocation.
+        with neo4j_store._session() as _s:
+            _s.execute_write(lambda tx: tx.run("MATCH (n) DETACH DELETE n").consume())
         for full_name, prev_mod, prev_attr in reversed(installed):
             parent, _, leaf = full_name.rpartition(".")   # a fake left behind is a trap
             if prev_mod is None:
@@ -964,6 +1189,7 @@ def selfcheck() -> None:
         writer_lock.LOCK_PATH = real_lock_path
 
     print("run self-check OK")
+    return 0
 
 
 if __name__ == "__main__":

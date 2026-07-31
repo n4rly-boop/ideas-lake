@@ -126,7 +126,7 @@ def patch_idea(idea_id: str, fields: dict) -> dict:
     that sets both loses its own vector, deliberately: the text is the source.
 
     Raises `NotFound`. What may be patched at all is the HTTP layer's business
-    (`schemas.IdeaPatch`); what the columns accept is the store's (`stub_store`).
+    (`schemas.IdeaPatch`); what the columns accept is the store's (`neo4j_store`).
     """
     fields = dict(fields)
     if "text" in fields:
@@ -174,6 +174,7 @@ def health() -> dict:
     try:
         leaves = graph_client.counts()["theses"]
         indexed = index.count()
+        fts_indexed = index.fts_count()
         pending = queue.counts()
     except Exception as exc:
         return {"status": "degraded", "detail": f"{type(exc).__name__}: {exc}"}
@@ -193,12 +194,18 @@ def health() -> dict:
                                      if name.startswith("fetch")):
         stalled.append(f"{pending['queued']} article(s) queued while no fetch worker is "
                        "alive — nothing will be parsed until the process restarts")
-    ok = indexed == leaves and not stalled
+    ok = indexed == leaves and fts_indexed == indexed and not stalled
     detail = None
     if stalled:
         detail = "; ".join(stalled)
     elif indexed != leaves:
         detail = "index and store disagree — POST /admin/reindex (§6.19)"
+    elif fts_indexed != indexed:
+        # idx_thesis matches the store, but its own `thesis_fts` twin does not — a
+        # gap that `indexed == leaves` alone cannot see (2026-07-31 finding): the
+        # hybrid has silently degraded to cosine alone (or, less likely, BM25 alone).
+        detail = (f"thesis_fts has {fts_indexed} rows against {indexed} in "
+                  "idx_thesis — POST /admin/reindex (§6.19)")
     return {"status": "ok" if ok else "degraded", "theses_indexed": indexed,
             "leaves_in_store": leaves, "in_sync": indexed == leaves, "detail": detail}
 
@@ -210,10 +217,11 @@ def stats() -> dict:
     from .api import workers
     counts = graph_client.counts()
     indexed = index.count()
+    fts_indexed = index.fts_count()
     running = jobs.running()
     return {**counts, "queue": queue.counts(), "workers": workers.alive(),
             "theses_indexed": indexed,
-            "in_sync": indexed == counts["theses"],
+            "in_sync": indexed == counts["theses"] and fts_indexed == indexed,
             "ideas_without_leaves": graph_client.ideas_without_leaves(),
             "trust_scale": graph_client.trust_scale(),
             "staging_lines": len(_lines(STAGING)),

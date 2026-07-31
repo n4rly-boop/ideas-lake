@@ -1,7 +1,7 @@
 # Ideas Lake, блок A.
 #
 #   docker compose --env-file .env.local up -d
-#   docker compose --env-file .env.local run --rm lake python -m lake.neo4j_load
+#   docker compose --env-file .env.local run --rm lake python -m lake.neo4j_load --dry-run
 #   docker compose down -v                                       # с томом графа
 #
 # `--env-file .env.local` подставляет окружение приложения; compose по умолчанию
@@ -12,10 +12,23 @@
 # down -v` и `ps` работают без него. Забытый флаг у `up` стоит только пустых
 # ключей в контейнере, а не отказа разобрать конфиг.
 #
-# Облачный граф — те же четыре `NEO4J_*` в `.env.local`, указывающие на Aura.
-# Контейнер Neo4j при этом просто стоит без дела; гасить его отдельно не нужно.
-# Жёсткой связи между сервисами нет и по существу: API держит озеро в SQLite
-# (`graph_client` → `stub_store`), а в Neo4j ходит только `lake.neo4j_load`.
+# Граф — только Neo4j (D11): `graph_client._select_backend()` требует
+# `NEO4J_URI` в `.env.local`, пусто — отказ на старте, тихого SQLite-фолбэка в
+# коде больше нет. `neo4j` ниже — локальный сервис под штатный
+# `NEO4J_URI=bolt://neo4j:7687`; `lake` стартует только после того, как он
+# отвечает на healthcheck (`depends_on` ниже), иначе первый же запрос ушёл бы в
+# несуществующий граф.
+#
+# Реальная заливка (без `--dry-run`) пишет через ОТДЕЛЬНЫЕ NEO4J_TARGET_* (не
+# `NEO4J_URI` выше — это то, что `neo4j_load.py` ЧИТАЕТ, локальное озеро), см.
+# `.env.local.example`, раздел «Облачный граф вместо локального» — там же
+# однострочная команда с `-e NEO4J_TARGET_URI=...` для разовой заливки в Aura,
+# без переключения самого сервиса `lake` (`13` §4.4 п.1, BLOCKER третьего раунда).
+#
+# Указать вместо локального графа облачный (Aura) для самого сервиса `lake` — те
+# же четыре `NEO4J_*` выше (не `NEO4J_TARGET_*`), см. комментарий в
+# `.env.local.example`: это значит, что и сам сервис `lake` пишет прямо в чужую
+# базу блока B (`07:79`), согласовывать отдельно.
 
 services:
   lake:
@@ -24,7 +37,20 @@ services:
     # sha прогона — тогда откат это тот же up с другим тегом, а не пересборка.
     # `build:` остаётся для локальной разработки: `docker compose build` собирает
     # и метит тем же именем, `up` без pull возьмёт локальный образ.
-    image: ghcr.io/n4rly-boop/ideas-lake:${LAKE_TAG:-latest}
+    #
+    # Деплой пишет `LAKE_TAG=<sha>` в `.env.local` на сервере (идемпотентно —
+    # заменяет строку, не плодит дубли), так что и ручной `docker compose
+    # up`/`run` без флагов резолвит тот же образ, что и последний деплой — не
+    # только команда самого workflow. Дефолт здесь — `local`, не `latest`:
+    # `latest` в GHCR двигает сам CI при каждой сборке и это чужой, мутируемый
+    # указатель — если `.env.local` когда-нибудь потеряет `LAKE_TAG` (свежий
+    # чекаут, ручная правка), `pull` на `:local` упадёт явно («тег не найден»,
+    # такого тега в реестре нет), а не тихо подставит образ неизвестной
+    # свежести. Разобрано на живом сервере: контейнер бежал на
+    # `f9ebcd10efc9`, а `docker compose run` без `LAKE_TAG` тянул `:latest` и
+    # падал `No module named lake.idea_edges` — то есть `:latest` в GHCR на
+    # тот момент был старым образом.
+    image: ghcr.io/n4rly-boop/ideas-lake:${LAKE_TAG:-local}
     build: .
     # Всё окружение отсюда: LAKE_KEY_9B, LAKE_KEY_35B, NEO4J_*.
     env_file: [.env.local]
@@ -46,17 +72,33 @@ services:
       # Значение по умолчанию есть, поэтому голые `down`/`ps` не ломаются.
       - ${LAKE_DATA:-./lake/data}:/app/lake/data
     healthcheck:
-      # `/healthz` сверяет индекс с хранилищем, а не просто отвечает 200. Ключ идёт
-      # из окружения того же контейнера: ручка закрыта наравне с остальными — она
-      # отдаёт число листьев, — а healthcheck без ключа получал бы 401 и вечный
-      # `unhealthy` на живом сервисе.
+      # `/healthz` сверяет индекс с хранилищем, а не просто отвечает 200 — но сама
+      # ручка (`lake/ops.py:health()`) НИКОГДА не поднимает код ответа выше 200:
+      # недоступный граф читается как `{"status": "degraded", ...}`, а не 503
+      # (осознанно — «healthz, который падает, говорит меньше, чем тот, что
+      # объясняет, что не так»). Поэтому статус-код тут смотреть недостаточно:
+      # тело нужно разобрать и свериться с `status`, иначе degraded читается как
+      # здоровый на уровне compose/Docker (`13` §4.4 п.4). Это и есть тот самый
+      # «честный /healthz» — после ребута хоста `restart: unless-stopped` поднимает
+      # контейнеры без порядка `depends_on` (тот соблюдается только `up`), и `lake`
+      # может стартовать раньше графа; вместо вечного ложного `healthy` над
+      # degraded-сервисом Docker теперь видит `unhealthy`, пока граф не поднялся, и
+      # `healthy` снова — как только `ops.health()` перечитает граф успешно (без
+      # рестарта процесса: `_get_driver()` переоткрывает соединение сам).
+      #
+      # Ключ идёт из окружения того же контейнера: ручка закрыта наравне с
+      # остальными — она отдаёт число листьев, — а healthcheck без ключа получал бы
+      # 401 и вечный `unhealthy` на живом сервисе.
       test: ["CMD", "python", "-c",
-             "import os,urllib.request,sys; r=urllib.request.Request('http://localhost:8077/healthz', headers={'Authorization': 'Bearer ' + os.environ.get('LAKE_API_KEY', '')}); sys.exit(0 if urllib.request.urlopen(r, timeout=5).status==200 else 1)"]
+             "import json,os,urllib.request,sys; r=urllib.request.Request('http://localhost:8077/healthz', headers={'Authorization': 'Bearer ' + os.environ.get('LAKE_API_KEY', '')}); resp=urllib.request.urlopen(r, timeout=5); body=json.load(resp); sys.exit(0 if resp.status==200 and body.get('status')=='ok' else 1)"]
       interval: 30s
       timeout: 10s
       start_period: 120s   # первый старт греет энкодер до открытия порта
       retries: 3
     restart: unless-stopped
+    depends_on:
+      neo4j:
+        condition: service_healthy
 
   neo4j:
     image: neo4j:5-community
@@ -80,9 +122,16 @@ services:
       - "127.0.0.1:7687:7687"   # Bolt
     volumes:
       - neo4j-data:/data
-    # Healthcheck здесь не стоит: `depends_on` на него никто не вешает — API в
-    # Neo4j не ходит, а загрузчик запускается руками. Проверка, которую ничто не
-    # ждёт, — украшение, и пароль в неё пришлось бы протаскивать вторым путём.
+    healthcheck:
+      # `lake` теперь ждёт этого (`depends_on` выше): без него сервис стартовал
+      # бы раньше графа и падал в цикл рестарта на первом же запросе, а не
+      # держался бы за пустой порт. HTTP-браузер, не Bolt — не требует пароля,
+      # который `NEO4J_AUTH: none` всё равно игнорирует.
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
     restart: unless-stopped
 
 volumes:

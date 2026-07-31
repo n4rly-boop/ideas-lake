@@ -28,6 +28,7 @@ PENDING_LINK = DATA / "pending_link.jsonl"
 INDEX_DB = DATA / "index.db"
 LAKE_DB = DATA / "lake.db"
 FETCH_DIR = DATA / "fetch"      # one staging file per single-url ingest, see run.ingest_one
+RUN_DIR = DATA / "run"          # one staging file per evolution-log batch, see ingest/runlog.py
 JOBS_DB = DATA / "jobs.db"      # the durable job queue, see queue.py — not format B
 RAW_DIR = DATA / "raw"
 CACHE_DIR = DATA / "cache"
@@ -72,7 +73,7 @@ class Source(Record):
     id: str
     url: str
     title: str
-    type: str            # paper | doc | run
+    type: str            # paper | doc | run | synthesis
     version: str
     retrieved_at: str
     run_success: bool | None = None
@@ -102,8 +103,17 @@ class Idea(Record):
     effect_observed: str
     vector: list[float] = Field(..., min_length=EMBED_DIM, max_length=EMBED_DIM)
     differentiation: str | None = None
-    trust_score: float = 0.0          # written by B
-    dirty: bool = False               # written by B
+    # Where the idea came from. `extracted` — derived from theses of papers or runs;
+    # `synthesized` — a hypothesis a model built out of other ideas (`13` §5). Without
+    # the field those two are the same state in the database and nothing in the answer
+    # tells them apart. A is the only writer today and always writes "extracted"; B
+    # sets "synthesized" on its hypotheses.
+    origin: str = "extracted"         # extracted | synthesized
+    # `13` §3.2-3.3 moved both to A on 2026-07-31. `dirty` is set in the same
+    # transaction as the leaves and cleared where `rederived_at_leaf_count` moves;
+    # `trust_score` is written by the judge (`ingest/trust.py`), never computed on read.
+    trust_score: float = 0.0
+    dirty: bool = False
     rederived_at_leaf_count: int = 0  # written by A, trigger of §4.6
     created_at: str = ""
     updated_at: str = ""
@@ -229,6 +239,37 @@ REWRITE_SCHEMA = {
     "type": "object",
     "properties": {"query": {"type": "string", "maxLength": 300}},
     "required": ["query"],
+    "additionalProperties": False,
+}
+
+# The judge of `trust_score` (`13` §3.3). Two properties, in this order, because the
+# grammar generates them in the order declared: the one-line reading of the evidence
+# is written FIRST and the number after it, so the score is stated against something
+# rather than guessed and then justified. `reason` also goes into the trace, which is
+# how the prompt gets calibrated at all.
+#
+# The score is an ENUM OF STRINGS, and both halves of that are deliberate. `{"type":
+# "integer", "minimum": 0, "maximum": 10}` does not bound anything: llama.cpp's
+# grammar builder has no way to express a numeric range, so "12" would come back as
+# valid JSON, pass every check here, and make trust_norm > 1 — the exact silent
+# breakage §3.3 removed from the two-copies-of-a-formula era. An enum is a literal
+# alternation, which the grammar does hold. Strings rather than numbers because the
+# alternation is then over plain literals with no numeric parsing in the middle.
+# `_reject_truncated` gives numbers no cover, so the Python side re-checks anyway.
+TRUST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        # 600 against the prompt's stated 280. The first live corpus judged at a
+        # ceiling of 300 and lost ~15% of its calls (9 of 50): a model asked for 280
+        # lands on 300 often enough, and 300 is exactly what `_reject_truncated` reads
+        # as a cut-off word. The ceiling is a runaway guard, not a length limit — the
+        # length lives in the prompt, and this number only has to be far enough above
+        # it that reaching it means something actually went wrong (§3.1 p.7).
+        "reason": {"type": "string", "maxLength": 600},
+        "score": {"type": "string",
+                  "enum": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]},
+    },
+    "required": ["reason", "score"],
     "additionalProperties": False,
 }
 

@@ -5,11 +5,10 @@ Why a file and not the dict in `api/jobs.py`: that dict dies with the process, a
 lake's files. The cursor already made the *work* restart-safe (§4.7); this makes
 the *record* of it restart-safe too, which is what a caller polling a job id needs.
 
-Why its own database file and not a table in `lake.db`: `stub_store` is documented
-as the throwaway half of format B ("this file dies the day the graph moves to
-Neo4j", `stub_store.py:1-4`) and only `graph_client` may open it (§3.4). A queue of
-jobs is neither format B nor throwaway. `index.py` set the precedent: own file, own
-module, own lock (`index.py:1-6`).
+Why its own database file and not a Neo4j node: format B is `graph_client`'s alone
+to write (§3.4), and a queue of jobs is not format B — it is this module's own
+state, restart-safe the same way the graph is, but through a different store.
+`index.py` set the precedent: own file, own module, own lock (`index.py:1-6`).
 
 The queue does not decide anything about the ingest. It holds rows and hands the
 oldest one out exactly once — `claim` is a single UPDATE, so two workers asking at
@@ -69,15 +68,25 @@ CREATE INDEX IF NOT EXISTS job_dedup ON job(dedup_key, status);
 """
 
 # One lock over one connection per database file — the same ponytail compromise as
-# `stub_store.py:41` and `index.py:30`, and for the same reason: every caller is in
-# this process. `claim` is still a single UPDATE, so the invariant does not depend
-# on the lock; the lock only keeps the connection to itself.
+# `index.py:30`, and for the same reason: every caller is in this process. `claim`
+# is still a single UPDATE, so the invariant does not depend on the lock; the lock
+# only keeps the connection to itself.
 _LOCK = threading.RLock()
 _CONNS: dict[str, sqlite3.Connection] = {}
 
 
 class Full(RuntimeError):
     """The queue is at its ceiling. The caller answers 429, never a silent accept."""
+
+
+class DedupConflict(RuntimeError):
+    """A live job (queued/running/staged) already owns `dedup_key`, and its stored
+    `args["payload_hash"]` differs from this call's. Handing back the live job here,
+    the way a same-body replay does, would silently keep serving the FIRST body
+    forever and drop the second one with no error anywhere — the exact lie idempotency
+    must not tell. Only raised when both sides carry a `payload_hash`; a caller that
+    never sets one (`/fetch`, whose `args` already double as identity) keeps today's
+    plain idempotent replay."""
 
 
 def _now() -> str:
@@ -123,17 +132,26 @@ def close() -> None:
 # ------------------------------------------------------------------------ writing
 
 def enqueue(kind: str, args: dict, *, dedup_key: str | None = None,
-            ceiling: int = 0, db=None) -> dict:
+            ceiling: int = 0, db=None, on_accept=None) -> dict:
     """Add a job, or return the live one with the same `dedup_key`.
 
     Idempotent on purpose: `POST /fetch` of a url that is already waiting must not
     open a second run of the same article. Two jobs for one source would parse it
     twice and hand phase 2 two staging files whose second run reads as "0 written,
-    30 skipped" — a duplicate that looks like a clean replay.
+    30 skipped" — a duplicate that looks like a clean replay. A dedup hit whose
+    `args["payload_hash"]` disagrees with this call's is a DIFFERENT body wearing
+    the same id, and raises `DedupConflict` instead of silently serving the old one.
 
     `ceiling` > 0 refuses with `Full` once that many jobs are unfinished. Accepting
     an unbounded backlog is the polite version of dropping it: every accepted job
     gets a status saying "queued" that no worker will reach for hours.
+
+    `on_accept`, if given, runs (still holding `_LOCK`) after the dedup and ceiling
+    checks pass and BEFORE the row is inserted — so a caller with a side-channel
+    payload too big for `args` (the batch body of `POST /run`) writes it exactly
+    when, and only when, the job is actually accepted: never on a 429, never on a
+    dedup hit. Before the INSERT, not after, so a worker can never see a queued row
+    whose payload is not on disk yet.
     """
     with _LOCK:
         con = _con(db)
@@ -143,7 +161,15 @@ def enqueue(kind: str, args: dict, *, dedup_key: str | None = None,
                 "('queued', 'running', 'staged') ORDER BY created_at LIMIT 1",
                 (dedup_key,)).fetchone()
             if live is not None:
-                return _row(live)
+                live_row = _row(live)
+                new_hash = args.get("payload_hash")
+                live_hash = live_row["args"].get("payload_hash")
+                if new_hash is not None and live_hash is not None and new_hash != live_hash:
+                    raise DedupConflict(
+                        f"a {live_row['status']} job for dedup_key {dedup_key!r} (id "
+                        f"{live_row['id']}) already exists with a different body; wait "
+                        "for it to finish or use a different id")
+                return live_row
         if ceiling:
             waiting = con.execute(
                 "SELECT count(*) FROM job WHERE status IN ('queued', 'running', "
@@ -151,6 +177,8 @@ def enqueue(kind: str, args: dict, *, dedup_key: str | None = None,
             if waiting >= ceiling:
                 raise Full(f"{waiting} jobs already queued or running (ceiling "
                            f"{ceiling}); retry when the backlog drains")
+        if on_accept is not None:
+            on_accept()
         job_id = f"job_{os.urandom(6).hex()}"
         con.execute("INSERT INTO job (id, kind, args, dedup_key, status, created_at) "
                     "VALUES (?, ?, ?, ?, 'queued', ?)",
@@ -165,6 +193,16 @@ def claim(status: str, stage: str, *, db=None) -> dict | None:
     One statement, so the check and the take cannot be interleaved: the worker pool
     and the writer both call this, and a job handed to two of them would ingest one
     article twice.
+
+    Claims the oldest row of ANY kind — `api/workers.py`'s two steps dispatch on
+    `job["kind"]` themselves (the `_STAGE`/`_DRAIN` tables) rather than running a
+    claimer per kind, so the pool stays `FETCH_WORKERS` wide and the writer stays
+    exactly one, whichever kind is waiting. A `kind=` filter used to sit here for a
+    worker pool split by kind that nothing ever built — both real callers always
+    passed `kind=None` — so it was a second, duplicated `UPDATE ... RETURNING`
+    branch that only this module's own self-check ever exercised. Removed rather
+    than kept as a primitive nobody calls; the dispatch table is what is asserted
+    now, in `api/selfcheck.py`'s `/fetch` and `/run` sections.
     """
     with _LOCK:
         con = _con(db)
