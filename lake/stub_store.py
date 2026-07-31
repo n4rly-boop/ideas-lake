@@ -8,12 +8,15 @@ Storage notes:
   on the way out.
 - vectors are float32 blobs (`array('f')`); thesis vectors are *not* returned by
   read paths, the thesis index lives in `index.py` (§3.5).
-- `trust_score` is a stub computed at read time, never stored: log of the number of
-  distinct sources under the idea (`06:226`, candidate of the first version). B
-  replaces the value; the formula is smeared nowhere else.
+- `trust_score` is STORED and read back as stored (`13` §3.3). It used to be computed
+  at read time as `log(1 + distinct sources)`; the number now comes from the judge in
+  `ingest/trust.py`, and `trust_scale()` is a fixed 1.0 because that number is already
+  normalized. There is no second expression of the scale anywhere.
+- `dirty` is written here in the same transaction as the leaves and lowered only by
+  `set_trust` (`13` §3.2). One definition, two representations: the flag is the cheap
+  prefilter, `rederived_at_leaf_count` keeps the threshold.
 """
 import json
-import math
 import sqlite3
 import threading
 from array import array
@@ -29,6 +32,7 @@ CREATE TABLE IF NOT EXISTS source(id TEXT PRIMARY KEY, url, title, type, version
                     retrieved_at, run_success INT, run_meta TEXT);
 CREATE TABLE IF NOT EXISTS idea(id TEXT PRIMARY KEY, text, applicability_conditions, limitations,
                   failure_modes TEXT, differentiation, effect_claimed, effect_observed,
+                  origin TEXT DEFAULT 'extracted',
                   trust_score REAL, dirty INT, rederived_at_leaf_count INT DEFAULT 0,
                   created_at, updated_at, vec BLOB);
 CREATE TABLE IF NOT EXISTS thesis(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE, source_id, idea_id,
@@ -54,7 +58,27 @@ def _c() -> sqlite3.Connection:
         _conn = sqlite3.connect(_db_path, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.executescript(DDL)
+        _migrate(_conn)
     return _conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Columns added to a model after a database already exists.
+
+    `CREATE TABLE IF NOT EXISTS` does nothing to a live file, and `_insert` builds its
+    column list from `model_fields` — so a new field turns the very next write into
+    `OperationalError: table idea has no column named origin`, which `STORE_ERRORS`
+    then reports as "the store is down". The live `lake/data/lake.db` on the server is
+    exactly such a file (26 ideas), so the column is added here rather than by hand.
+
+    DEFAULT fills the existing rows: `_idea_out` hands a NULL straight to pydantic and
+    a non-nullable field would reject it (`13` §5).
+    """
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(idea)")}
+    if "origin" not in have:
+        conn.execute("ALTER TABLE idea ADD COLUMN origin TEXT DEFAULT 'extracted'")
+        conn.execute("UPDATE idea SET origin = 'extracted' WHERE origin IS NULL")
+        conn.commit()
 
 
 # ------------------------------------------------------------------ encode/decode
@@ -109,18 +133,23 @@ def _leaf_out(row: sqlite3.Row) -> dict:
     return d
 
 
-def _stub_trust(leaves: list[dict]) -> float:
-    """log of the number of distinct sources under the idea (§3.4, `06:226`).
-    1 + n keeps a single-source idea defined and above zero."""
-    return math.log(1 + len({leaf["source_id"] for leaf in leaves}))
-
-
 # ------------------------------------------------------------------------- writes
 
 def _insert_theses(conn: sqlite3.Connection, source_id: str, theses: list[Thesis]) -> list[str]:
     for th in theses:
         if th.source_id and th.source_id != source_id:
             raise ValueError(f"thesis {th.id} carries source_id {th.source_id}, batch is {source_id}")
+        # No FK on `thesis.idea_id`/`source_id` (DDL above) — SQLite would happily
+        # accept either pointing nowhere, and the row would then be invisible to
+        # `ideas_without_leaves()` and to every JOIN-based count (`counts`,
+        # `count_theses`, `all_theses`): a leaf nobody can reach. `neo4j_store`
+        # already refuses this (its write MATCHes both nodes before CREATEing the
+        # Thesis); this makes the two backends agree instead of one raising and
+        # the other silently writing a dangling row (`13` MINOR).
+        if conn.execute("SELECT 1 FROM source WHERE id=?", (source_id,)).fetchone() is None:
+            raise ValueError(f"thesis {th.id}: source {source_id!r} does not exist")
+        if conn.execute("SELECT 1 FROM idea WHERE id=?", (th.idea_id,)).fetchone() is None:
+            raise ValueError(f"thesis {th.id}: idea {th.idea_id!r} does not exist")
         _insert(conn, "thesis", th, source_id=source_id)
     return [th.id for th in theses]
 
@@ -134,8 +163,18 @@ def write_source(src: Source) -> str:
 
 
 def write_theses(source_id: str, theses: list[Thesis]) -> list[str]:
+    """Append-only: leaves onto ideas that already exist (`create_idea_with_theses`
+    is the pair that also creates the idea). `dirty` is raised here too, in the same
+    transaction, on every idea touched — the module docstring already promised this
+    for every leaf write, and until 2026-07-31 this path silently did not keep that
+    promise: a leaf landing through here left the idea clean with a stale score,
+    invisible to the judge (`13` finding, review of the same date).
+    """
     with _lock, _c() as conn:
-        return _insert_theses(conn, source_id, theses)
+        ids = _insert_theses(conn, source_id, theses)
+        for idea_id in sorted({th.idea_id for th in theses}):
+            _update_idea(conn, idea_id, {"dirty": True})
+        return ids
 
 
 def create_idea(idea: Idea) -> str:
@@ -148,11 +187,20 @@ def create_idea_with_theses(idea: Idea | None, source_id: str, theses: list[Thes
     """Idea and its leaves in ONE transaction (§3.4): a failure between the two would
     leave an idea with zero leaves, against `IDEA ||--|{ THESIS` (`06:85`).
     `idea=None` means the idea already exists, only append leaves.
-    `with conn` is BEGIN ... COMMIT, and ROLLBACK on any exception."""
+    `with conn` is BEGIN ... COMMIT, and ROLLBACK on any exception.
+
+    `dirty` is raised on every idea this call touches, inside the same transaction
+    (`13` §3.2). Outside it the flag would survive a rolled-back write and claim a
+    re-derivation is owed for leaves that were never stored.
+    """
     with _lock, _c() as conn:
         if idea is not None:
-            _insert(conn, "idea", idea)
-        return _insert_theses(conn, source_id, theses)
+            _insert(conn, "idea", idea, dirty=True)
+        ids = _insert_theses(conn, source_id, theses)
+        for idea_id in sorted({th.idea_id for th in theses}):
+            if idea is None or idea_id != idea.id:
+                _update_idea(conn, idea_id, {"dirty": True})
+        return ids
 
 
 # No `update_thesis`, here or anywhere: thesis immutability (§1.2) is held by the
@@ -217,6 +265,12 @@ def split_idea(parent_id: str, parent_fields: dict,
     leaf named twice, and a split that would leave the parent with none — the whole
     move happens or none of it does, and `IDEA ||--|{ THESIS` (`06:85`) holds at both
     ends. See the note above `_update_idea` on why this is not `update_thesis`.
+
+    `dirty` is forced to True here, on the parent AND on every child, regardless of
+    what `parent_fields` carries (`rederive.derive` never touches it — §4.6 rewrites
+    what an idea SAYS, judging what it is WORTH). Both leaf sets just changed and
+    neither has been judged over its new composition; leaving either clean is the
+    same "invisible to the sweep" defect `write_theses` had (`13` §3.2 finding).
     """
     if not children:
         raise ValueError("split_idea called with no children")
@@ -243,10 +297,14 @@ def split_idea(parent_id: str, parent_fields: dict,
         if not owned - set(moving):
             raise ValueError(f"split_idea: would move every leaf off {parent_id}, "
                              "leaving an idea with none")
-        if parent_fields:
-            _update_idea(conn, parent_id, parent_fields)
+        # The parent's leaf set just changed (it lost every leaf a child takes) and
+        # every child is a brand-new idea whose leaves nothing has ever judged — both
+        # must come out of this transaction dirty, or the sweep (`dirty_ideas`) never
+        # looks at them again and a stale/zero trust_score sits there permanently
+        # (`13` finding, review of 2026-07-31, same door as `write_theses` before it).
+        _update_idea(conn, parent_id, {**parent_fields, "dirty": True})
         for idea, thesis_ids in children:
-            _insert(conn, "idea", idea)
+            _insert(conn, "idea", idea, dirty=True)
             conn.execute(
                 f"UPDATE thesis SET idea_id=? WHERE id IN ({_placeholders(thesis_ids)})",
                 [idea.id] + thesis_ids)
@@ -281,7 +339,6 @@ def get_ideas(ids: list[str]) -> list[dict]:
     for row in rows:
         d = _idea_out(row)
         d["theses"] = leaves.get(d["id"], [])
-        d["trust_score"] = _stub_trust(d["theses"])
         by_id[d["id"]] = d
     return [by_id[i] for i in ids if i in by_id]
 
@@ -416,15 +473,42 @@ def ideas_without_leaves() -> list[str]:
     return [r["id"] for r in rows]
 
 
-def trust_scale() -> float:
-    """Max trust over the whole graph — the FIXED scale `rank.py` normalizes by (§5.3).
-    Normalizing by the returned page instead would make the 0.15 weight relative and
-    leave nothing to calibrate it on."""
+def dirty_ideas(limit: int | None = None) -> list[str]:
+    """Ideas whose leaves moved since they were last judged (`13` §3.2), oldest first.
+
+    Oldest first so a truncated pass always finishes what an earlier one started
+    instead of re-judging the same head of the list forever.
+    """
+    sql = "SELECT id FROM idea WHERE dirty = 1 ORDER BY rowid"
     with _lock:
-        rows = _c().execute(
-            "SELECT idea_id, COUNT(DISTINCT source_id) AS n FROM thesis GROUP BY idea_id"
-        ).fetchall()
-    return max((math.log(1 + r["n"]) for r in rows), default=1.0) or 1.0
+        rows = _c().execute(sql + (" LIMIT ?" if limit is not None else ""),
+                            (limit,) if limit is not None else ()).fetchall()
+    return [r["id"] for r in rows]
+
+
+def trust_scale() -> float:
+    """Fixed 1.0 — the judge already answers on a normalized scale (`13` §3.3).
+
+    It used to be `max(log(1 + distinct sources))` over the whole graph, the second
+    copy of a formula that also lived in `_stub_trust`. Two copies of one number is
+    how `trust_norm` climbs above 1 and quietly changes what the 0.15 weight in
+    `rank.py` means; the function stays because `rank.py` and `/stats` read it, and
+    because a backend that ever stores an unnormalized number has one place to say so.
+    """
+    return 1.0
+
+
+def set_trust(idea_id: str, score: float) -> None:
+    """The judge's number, and the only place `dirty` is lowered (`13` §3.2-3.3).
+
+    One update, so an idea can never be clean with a stale score: either both moved
+    or neither did. A judge that failed calls nothing at all — the idea stays dirty
+    and the next pass judges it again.
+    """
+    if not 0.0 <= score <= 1.0:
+        raise ValueError(f"trust_score out of [0, 1]: {score!r}")
+    with _lock, _c() as conn:
+        _update_idea(conn, idea_id, {"trust_score": float(score), "dirty": False})
 
 
 def neighbors(ids: list[str], hops: int = 1, min_weight: float | None = None) -> list[dict]:
@@ -500,7 +584,22 @@ if __name__ == "__main__":
             assert leaf["run_success"] is True
             assert leaf["run_meta"] == {"fitness_delta": 0.1}
             assert "vec" not in leaf
-        assert abs(one["trust_score"] - math.log(2)) < 1e-9, one["trust_score"]
+        # `13` §3.3: the number is stored, never derived on read. A fresh idea has
+        # never been judged, so it reads back as the column default.
+        assert one["trust_score"] == 0.0, one["trust_score"]
+        assert one["origin"] == "extracted", one["origin"]
+        assert one["dirty"] is True, "writing leaves must raise dirty in the same transaction"
+        set_trust(idea.id, 0.7)
+        after_trust = get_ideas([idea.id])[0]
+        assert after_trust["trust_score"] == 0.7, after_trust["trust_score"]
+        assert after_trust["dirty"] is False, "set_trust is the one place dirty is lowered"
+        assert trust_scale() == 1.0, trust_scale()
+        try:
+            set_trust(idea.id, 1.4)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a score outside [0, 1] must be refused, not stored")
         assert get_leaves(idea.id) == one["theses"]
         assert leaf_count(idea.id) == 2
         assert neighbors([idea.id]) == []
@@ -573,6 +672,29 @@ if __name__ == "__main__":
         else:
             raise AssertionError("thesis written under a source_id it does not belong to")
         print("ok: create_idea + write_theses; a thesis from another source is refused")
+
+        # `13` MINOR: no FK on thesis.idea_id/source_id (DDL) used to mean a leaf
+        # pointing at a nonexistent idea or source landed silently — invisible to
+        # ideas_without_leaves() and every JOIN-based count, a row nobody could
+        # reach. neo4j_store already refused this; now both backends do.
+        ghost_idea = make_thesis("ghost idea")
+        ghost_idea.idea_id = "idea_does_not_exist"
+        try:
+            write_theses(sid, [ghost_idea])
+        except ValueError as exc:
+            assert "idea_does_not_exist" in str(exc), exc
+        else:
+            raise AssertionError("write_theses accepted a nonexistent idea_id")
+        ghost_source = make_thesis("ghost source")
+        ghost_source.source_id = ghost_source.idea_id = idea3.id  # any id absent from `source`
+        try:
+            write_theses(idea3.id, [ghost_source])
+        except ValueError as exc:
+            assert idea3.id in str(exc), exc
+        else:
+            raise AssertionError("write_theses accepted a nonexistent source_id")
+        assert leaf_count(idea3.id) == 1, "the refused writes must not have landed partially"
+        print("ok: write_theses refuses a nonexistent idea_id or source_id (13 MINOR)")
 
         # §1.2 the other way round: INSERT OR REPLACE rewrites every column of an
         # existing row, so it is a thesis edit that carries no UPDATE for §6.9's source

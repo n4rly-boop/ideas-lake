@@ -17,6 +17,7 @@ CLI:
 """
 import argparse
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -27,6 +28,12 @@ from ..models import (PENDING_LINK, STAGING, STAGING_CURSOR, DraftThesis, IdeaFi
 
 # Phase 1 runs in 8 threads and every one of them appends to the same file.
 _staging_lock = threading.Lock()
+
+# How many ideas the judge may score in one pass (`13` §3.3). One 35B call per idea:
+# on a lake of 26 that is two minutes, on a lake of 500 it would be most of an hour
+# hanging off a single `/fetch`. The remainder is not lost — it stays dirty and the
+# next pass takes it, oldest first — and the report says how many were deferred.
+TRUST_PER_PASS = int(os.environ.get("LAKE_TRUST_PER_PASS") or 50)
 
 
 # ------------------------------------------------------------------------ phase 1
@@ -86,6 +93,9 @@ def phase1(entries: list[dict], workers: int = 8) -> int:
 def _one_source(entry: dict, fetch, parse, generalize, staging_path) -> tuple[int, int, int]:
     """One source end to end into staging lines. Returns (lines, leaks, dropped)."""
     from .. import embed
+    # local: matches `_report`'s own import (run.py, below) — kept off this module's
+    # top-level import chain the same way runlog keeps csv/argparse off `run.py`'s.
+    from . import runlog
 
     src, sections = fetch.fetch_source(entry)
     # The abstract rides in the section list as reference material for every call
@@ -106,9 +116,16 @@ def _one_source(entry: dict, fetch, parse, generalize, staging_path) -> tuple[in
     # pre-generalization text: candidates are gathered thesis-to-thesis (§4.5).
     vectors = embed.embed_docs([draft.text for draft in drafts])
     source = src.model_dump()
+    # MINOR (§9 p.9, second round): `fetch.py:396` accepts `stype == "run"`, so a run
+    # source CAN reach phase 1 (unlike `_report`'s recount, this call was never
+    # exercised by a real run today — but "inert until a caller does the one thing
+    # the type system allows" is not the same as "correct"). Same widening as
+    # `_report` (below): a `run` source's leakage check needs `runlog.leak_terms`,
+    # not the paper-shaped rule alone, or a leaked `program_id` reads clean.
+    extra_terms = runlog.leak_terms(source) if source.get("type") == "run" else ()
     lines, leaks = [], 0
     for section_id, draft, fields, vector in zip(section_ids, drafts, ideas, vectors):
-        leaks += bool(generalize.leakage(draft, fields))
+        leaks += bool(generalize.leakage(draft, fields, extra_terms=extra_terms))
         lines.append(json.dumps({
             "source": source,
             "section_id": section_id,
@@ -175,8 +192,8 @@ def phase2(staging_path=STAGING, limit: int | None = None) -> dict:
 def _phase2(staging_path, limit: int | None) -> dict:
     """The body of `phase2`, under the writer lock. Not an entry point — call `phase2`."""
     llm.assert_grammar_works(llm.QWEN_9B)       # rederive
-    llm.assert_grammar_works(llm.QWEN_35B)      # link arbiter
-    from . import generalize, link, rederive, split
+    llm.assert_grammar_works(llm.QWEN_35B)      # link arbiter AND the trust judge
+    from . import generalize, link, rederive, split, trust
 
     # Before a single arbiter call: an index that is empty while the store is not
     # makes step [1] return zero candidates for every thesis, and zero candidates
@@ -288,11 +305,26 @@ def _phase2(staging_path, limit: int | None) -> dict:
 
     split_sweep()       # see the docstring: `groups` can be empty and the node stays
 
+    # The judge, last: after every leaf of this pass is in, after re-derivations have
+    # rewritten what the ideas say, and after splits have decided which idea is which.
+    # Judging per source instead would pay 35B for an idea that the next source of the
+    # same run is about to change. The set comes from the STORE, not from this run, so
+    # an idea left dirty by an earlier failed judgement is picked up here — that is the
+    # retry, and it is the reason `dirty` is lowered nowhere else (`13` §3.3).
+    #
+    # `trust.run_pass()` (no args) is exactly this: `dirty_ideas()`, capped at
+    # `TRUST_PER_PASS`, `trust_due`/`trust_deferred` reported. Calling it here instead
+    # of inlining the same three lines keeps ONE definition of "how a pass runs" that
+    # both this end-of-phase-2 step and the operator-triggered `/admin/trust` share
+    # (finding, review 2026-07-31) — the thing `13` §3.3 warns a second entry point
+    # risks duplicating.
+    trust_report = trust.run_pass()
+
     report = _report(processed, generalize, cursor)
     report.update({"sources_processed": len(groups[:limit]), "theses_written": written,
                    "theses_skipped": skipped, "theses_refused": refused,
                    "rederived": rederived, "rederive_failed": rederive_failed,
-                   "splits": splits, "split_failed": split_failed,
+                   "splits": splits, "split_failed": split_failed, **trust_report,
                    # Read off the STORE, not off `split_failed`. The failure list counts
                    # attempts — one idea failing under ten sources is ten entries, and an
                    # idea nobody attempted is zero — so it answers "did a call raise",
@@ -424,18 +456,37 @@ def drain_one(staging_path, staged: dict | None = None) -> dict:
 
 def _report(processed: list[dict], generalize, cursor: int) -> dict:
     """The numbers §4.7 asks for, over the whole store, not only this run."""
+    # local: keeps runlog (csv/argparse, `13` §2.5's converter) off run.py's own
+    # import chain, the same way run.py's other ingest submodules are imported.
+    from . import runlog
+
     leaves = graph_client.all_theses()
     orphans = graph_client.ideas_without_leaves()
     ideas = graph_client.get_ideas(sorted({leaf["idea_id"] for leaf in leaves} | set(orphans)))
     multi = sum(1 for idea in ideas if len({t["source_id"] for t in idea["theses"]}) >= 2)
     sources = {t["source_id"] for idea in ideas for t in idea["theses"]}
+    # BLOCKER 1: a `run`-type row needs the run-specific term list (§2.2.1) —
+    # program id, run id, task, mutation model, the mutant's own code names —
+    # or this recount is the paper-shaped check re-run on a log, which the
+    # spec (§9 p.9) says means nothing: a leaked `program_id` would pass clean.
     leaked = sum(1 for row in processed
-                 if generalize.leakage(_draft_of(row), IdeaFields(**row["idea_fields"])))
+                 if generalize.leakage(
+                     _draft_of(row), IdeaFields(**row["idea_fields"]),
+                     extra_terms=(runlog.leak_terms(row["source"])
+                                  if row["source"].get("type") == "run" else ())))
+    # An idea with no leaves is two opposite things since `13` §5, and one number for
+    # both would hide each behind the other: a hypothesis is legal and carries no
+    # evidence by definition, an EXTRACTED idea with no leaves is the write that broke
+    # between `create_idea` and `write_theses`. Counted apart, named apart.
+    by_id = {idea["id"]: idea for idea in ideas}
+    hypotheses = [i for i in orphans if by_id.get(i, {}).get("origin") == "synthesized"]
+    broken = [i for i in orphans if i not in set(hypotheses)]
     return {"sources": len(sources), "theses": len(leaves), "ideas": len(ideas),
             "ideas_multi_source": _share(multi, len(ideas)),
             "pending_link": _count_lines(PENDING_LINK),
             "leakage_share": _share(leaked, len(processed)),
-            "ideas_without_leaves": len(orphans),
+            "ideas_without_leaves": len(broken),
+            "hypotheses": len(hypotheses),
             "cursor": cursor, **trace.totals()}
 
 
@@ -444,8 +495,21 @@ def _print_report(report: dict) -> None:
     for key, value in report.items():
         print(f"  {key}: {value}")
     if report["ideas_without_leaves"]:
-        # IDEA ||--|{ THESIS (`06:85`). Loud, not a number nobody reads.
-        print(f"  INVARIANT BROKEN: {report['ideas_without_leaves']} ideas have no leaves")
+        # `06:85` weakened by `13` §5: a leafless idea is legal exactly when it is a
+        # hypothesis (`origin="synthesized"`). Anything else with no leaves is still
+        # the broken write it always was. Loud, not a number nobody reads.
+        print(f"  INVARIANT BROKEN: {report['ideas_without_leaves']} extracted ideas "
+              "have no leaves")
+    if report.get("trust_failed"):
+        # Not folded into "judged": a refusal leaves the previous score standing and
+        # the idea dirty, which is the opposite of a score of 0.0 (`13` §9 p.4).
+        print(f"  trust: the judge refused on {report['trust_failed']} idea(s), "
+              "their scores are unchanged and they stay dirty")
+        for failure in report.get("trust_errors") or []:
+            print(f"    {failure['idea_id']}: {failure['error']}")
+    if report.get("trust_deferred"):
+        print(f"  trust: {report['trust_deferred']} dirty idea(s) not judged this pass "
+              f"(ceiling {TRUST_PER_PASS}), they are queued for the next one")
     # Two independent facts, each from its own source of truth. A split can fail with
     # nothing left over the ceiling (the store commit went through and only the index
     # rebuild raised), and an idea can be over the ceiling with nothing in `split_failed`
@@ -515,13 +579,20 @@ def _reconcile_index() -> tuple[int, int]:
 
 
 def _rederive_due(threshold: int = 3) -> list[str]:
-    """Ideas with `len(leaves) - rederived_at_leaf_count >= threshold` (§4.6)."""
+    """`dirty` AND `len(leaves) - rederived_at_leaf_count >= threshold` (§4.6, `13` §3.2).
+
+    Both conditions, because they are one definition in two representations: the flag
+    says the leaves moved at all, the counter says how far. Dropping the flag brings
+    back the state where an idea whose leaves were rolled back still looks due; dropping
+    the counter re-derives on every single leaf. The flag is also the cheap half — it is
+    a column read, the counter needs the leaf tally.
+    """
     counts: dict[str, int] = {}
     for row in graph_client.all_theses():
         counts[row["idea_id"]] = counts.get(row["idea_id"], 0) + 1
     due = []
     for idea in graph_client.get_ideas(sorted(counts)):
-        if counts[idea["id"]] - idea["rederived_at_leaf_count"] >= threshold:
+        if idea["dirty"] and counts[idea["id"]] - idea["rederived_at_leaf_count"] >= threshold:
             due.append(idea["id"])
     return due
 
@@ -678,7 +749,7 @@ def selfcheck() -> None:
         return IdeaFields(text=f"lever {lever}", applicability_conditions="ac",
                           limitations="lim", failure_modes=["fm"])
 
-    def leakage(draft, out):
+    def leakage(draft, out, extra_terms=()):
         return ["dataset name leaked"] if out.text.endswith("1") else []   # lever 1 leaks
 
     install(f"{__package__}.fetch",
@@ -721,8 +792,17 @@ def selfcheck() -> None:
 
     install(f"{__package__}.link", link_batch=link_batch)
 
+    judged: list[str] = []
+
     def complete(prompt, *, system, schema, op, max_tokens, timeout, model=None,
                  temperature=0.0):
+        if op == "trust":
+            # The judge runs on every dirty idea at the end of phase 2 (`13` §3.3).
+            # Its prompt is checked in `ingest/trust.py`; here it only has to be the
+            # 35B model and to answer inside the enum.
+            assert model == llm.QWEN_35B, model
+            judged.append(prompt)
+            return {"reason": "one source, no run evidence", "score": "5"}
         assert op == "rederive" and system.startswith("You re-derive"), op
         assert "LEAVES (4)" in prompt, prompt              # ALL leaves, not just the new ones
         assert "source_type: paper" in prompt and "source_type: run" in prompt, prompt
@@ -834,7 +914,12 @@ def selfcheck() -> None:
             assert idea["effect_claimed"] == "+3.1 pp on paper leaves"
             assert idea["effect_observed"] == "+1.0 pp on run leaves"
             assert idea["failure_modes"] == ["fm2"] and idea["limitations"] == "lim2"
-            assert not idea["dirty"] and idea["trust_score"] > 0, "dirty/trust_score are B's"
+            # `13` §3.2-3.3: both are A's now. Writing leaves raised `dirty`, the judge
+            # at the end of the pass stored a score and lowered it again — in that
+            # order, and only through `set_trust`.
+            assert idea["trust_score"] == 0.5, idea["trust_score"]
+            assert not idea["dirty"], "the judge ran and the flag is still up"
+            assert idea["origin"] == "extracted", idea["origin"]
             assert np.allclose(idea["vector"], embed_docs(["REDERIVED lever 0"])[0], atol=1e-6), \
                 "text changed and the vector did not follow it"
             assert rederive.maybe_rederive(cold) is False, "3 leaves needed, cold has 2"
@@ -940,6 +1025,46 @@ def selfcheck() -> None:
             assert after["text"] == before["text"], "idea changed on a failed re-derivation"
             assert after["rederived_at_leaf_count"] == 0, "the trigger moved on a failure"
             print("ok: failed re-derivation — idea untouched, counter not moved, raised")
+
+            # -- BLOCKER 1 (leakage plumbing): `_report`'s recount must widen with
+            # `runlog.leak_terms` for a `run`-type row, and invent nothing for a
+            # `paper` row. Driven directly, not through phase2, so a real store and
+            # index are not needed and the fake `leakage` above (which only looks at
+            # `out.text`) cannot mask a wiring bug in `extra_terms`. -----------------
+            from . import runlog as runlog_mod
+
+            leak_calls: dict[str, tuple] = {}
+
+            def recording_leakage(draft, out, extra_terms=()):
+                leak_calls[draft.locator] = tuple(extra_terms)
+                return []
+
+            run_src = Source(id=make_source_id("gigaevo://run1/prog1", "prog1"),
+                             url="gigaevo://run1/prog1", title="t", type="run",
+                             version="prog1", retrieved_at="2026-07-28T10:00:00Z",
+                             run_success=True,
+                             run_meta={"run": "run1", "program_id": "prog1", "task": "",
+                                       "mutation_model": "", "mutant_code_names": []})
+            paper_src = Source(id=make_source_id("https://arxiv.org/abs/x", "v1"),
+                               url="https://arxiv.org/abs/x", title="t2", type="paper",
+                               version="v1", retrieved_at="2026-07-28T10:00:00Z",
+                               run_success=None, run_meta=None)
+
+            def _row(src, locator):
+                return {"source": src.model_dump(),
+                        "thesis": {"text": "t", "context": "c", "effect": "e",
+                                  "locator": locator},
+                        "draft": {"draft_text": "d", "draft_applicability": "a",
+                                 "draft_limitations": "l"},
+                        "idea_fields": {"text": "x", "applicability_conditions": "",
+                                       "limitations": "", "failure_modes": []}}
+
+            _report([_row(run_src, "l1"), _row(paper_src, "l2")],
+                    types.SimpleNamespace(leakage=recording_leakage), cursor=0)
+            assert leak_calls["l1"] == ("prog1", "run1"), leak_calls
+            assert leak_calls["l2"] == (), leak_calls
+            print("ok: _report widens the leakage recount with leak_terms for a run "
+                  "row, and only a run row")
 
             index._CONNS.pop(str(idx)).close()
             stub_store._conn.close()

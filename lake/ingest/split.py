@@ -327,6 +327,16 @@ def demo() -> None:
             bystander, small = make_idea("one honest mechanism", [4])
             assert (len(big), len(small)) == (34, 14), (len(big), len(small))
 
+            # The live repro this closes: a judge cleared the idea BEFORE the split, same
+            # as `13`'s "judged to 0.5/clean and splitting 2 of 3 leaves" (review of
+            # 2026-07-31). Asserting dirty afterwards is only meaningful starting from
+            # clean — `create_idea_with_theses` already leaves a fresh idea dirty, so a
+            # split that did nothing to the flag would still read True by accident.
+            graph_client.set_trust(parent.id, 0.5)
+            graph_client.set_trust(bystander.id, 0.9)
+            assert not graph_client.get_ideas([parent.id])[0]["dirty"], \
+                "set_trust must leave the idea clean before the split proof below"
+
             def snapshot() -> dict:
                 """Every thesis row in the store, every column."""
                 return {row["id"]: graph_client.get_thesis(row["id"])
@@ -414,6 +424,13 @@ def demo() -> None:
                 assert body["text"] == f"mechanism of {themes.pop()}", body["text"]
                 assert np.allclose(body["vector"], vec(body["text"]), atol=1e-6), \
                     f"{pid}: text changed and the vector did not follow"
+                # `13` review 2026-07-31: every leaf-set that just changed must come out
+                # dirty — the parent lost 20 of its 34 leaves, each child owns leaves
+                # NOTHING has ever judged, and a clean part is one the sweep never visits.
+                assert body["dirty"] is True, \
+                    f"{pid}: split left a changed leaf set clean, invisible to the sweep"
+            assert graph_client.get_ideas([bystander.id])[0]["dirty"] is False, \
+                "the untouched bystander must not have been marked dirty as a side effect"
             assert len(seeds) == 3, f"{len(seeds)} derive calls for 3 parts"
             assert seeds[0] == "the whole research area", seeds[0]
             assert seeds[1:] == ["", ""], \

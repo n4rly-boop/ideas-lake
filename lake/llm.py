@@ -142,9 +142,15 @@ def assert_grammar_works(model) -> None:
         raise LLMError(f"canary failed on {model[0]}: schema ignored, got {out!r}")
 
 
-def load_prompt(step: str) -> str:
-    """`prompts/{step}/system.txt` — prompts are files, not strings in code."""
-    path = PROMPTS / step / "system.txt"
+def load_prompt(step: str, name: str = "system") -> str:
+    """`prompts/{step}/{name}.txt` — prompts are files, not strings in code.
+
+    `name` is for a step that has to say something different about a different kind of
+    input and must not do it with an `if` inside one text: `generalize/run.txt` is the
+    same step over an evolution log, where the concrete things that must not leak are
+    program ids and function names rather than dataset names (`13` §2.2.1).
+    """
+    path = PROMPTS / step / f"{name}.txt"
     text = path.read_text(encoding="utf-8")     # a missing file raises, no silent default
     if not text.strip():
         raise LLMError(f"empty prompt file: {path}")

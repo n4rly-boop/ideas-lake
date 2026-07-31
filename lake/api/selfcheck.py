@@ -9,6 +9,7 @@ Everything writes to a temporary directory. The real `data/` is fingerprinted
 before and after: a self-check that quietly edits the lake it is checking has
 happened here once already, and the guard is cheaper than finding out later.
 """
+import csv
 import functools
 import json
 import os
@@ -26,6 +27,7 @@ from fastapi.testclient import TestClient
 
 from .. import (graph_client, index, ops, queue, stub_store, trace, vault as vault_mod,
                 writer_lock)
+from .. import models as models_mod
 from ..ingest import run as run_mod
 from ..models import (DATA, EMBED_DIM, Idea, Source, Thesis, new_idea_id, new_thesis_id,
                       source_id as make_source_id, text_hash)
@@ -101,8 +103,8 @@ def main() -> None:
         saved[(module, name)] = getattr(module, name)
         setattr(module, name, value)
 
-    for name in ("count", "search_theses", "index_theses", "index_rows", "has", "reset",
-                 "reconcile"):
+    for name in ("count", "fts_count", "search_theses", "index_theses", "index_rows", "has",
+                 "reset", "reconcile"):
         bind(index, name, functools.partial(getattr(index, name), db=idx))
     # `search.search` takes db=INDEX_DB as a DEFAULT ARGUMENT, bound at def time, and
     # `rank` imported the function by name. So patching `index` alone leaves the read
@@ -131,6 +133,35 @@ def main() -> None:
     if stub_store._conn is not None:      # a live handle on the real lake: closed, not dropped
         stub_store._conn.close()
     real_db, stub_store._db_path, stub_store._conn = stub_store._db_path, tmp / "lake.db", None
+
+    # `RUN_DIR` is the converter's own addition to `lake.models` (`13` build note 2),
+    # landing in a parallel change. Bound the normal way if it is already there; set
+    # for the duration of this run and removed again — not left as `None`, which
+    # `bind`'s blanket restore would do — if it is not, so this check proves the
+    # `/run` contract offline without waiting on that file to exist.
+    run_dir_existed = hasattr(models_mod, "RUN_DIR")
+    if run_dir_existed:
+        bind(models_mod, "RUN_DIR", tmp / "run")
+    else:
+        models_mod.RUN_DIR = tmp / "run"
+
+    # `lake.ingest.runlog` is the other agent's file (§2.5 contract) and does not
+    # exist yet either. Faked the same way `lake.embed` is below: a module object
+    # registered in `sys.modules` AND set as an attribute of its parent package,
+    # because `from ..ingest import runlog` resolves through both.
+    #
+    # `payload_from_csv` is captured from the REAL module first, before the fake
+    # replaces it in `sys.modules`: it is pure CSV parsing (no LLM, no embed), and
+    # MAJOR 3's round-trip check needs the actual converter's output, not a stub's.
+    from ..ingest import runlog as real_runlog_module
+    real_payload_from_csv = real_runlog_module.payload_from_csv
+    fake_runlog = types.ModuleType("lake.ingest.runlog")
+    fake_runlog.from_payload = lambda payload, staging_path=None, **kw: _unexpected(
+        "runlog.from_payload")
+    fake_runlog.drain_run = lambda staging_path, staged=None: _unexpected("runlog.drain_run")
+    real_runlog_mod = getattr(sys.modules["lake.ingest"], "runlog", None)
+    sys.modules["lake.ingest.runlog"] = fake_runlog
+    setattr(sys.modules["lake.ingest"], "runlog", fake_runlog)
 
     fake_embed = types.ModuleType("lake.embed")
     fake_embed.embed_docs = lambda texts: np.stack([_vec(t) for t in texts])
@@ -163,13 +194,21 @@ def main() -> None:
 
     leaked: list[str] = []
     try:
-        _run(tmp, idx)
+        _run(tmp, idx, real_payload_from_csv)
     finally:
         for (module, name), value in saved.items():
             setattr(module, name, value)
         run_mod.phase1, run_mod.phase2 = real_phase1, real_phase2
         run_mod.ingest_one = real_ingest_one
         run_mod.stage_one, run_mod.drain_one = real_stage_one, real_drain_one
+        if not run_dir_existed:
+            del models_mod.RUN_DIR
+        if real_runlog_mod is None:
+            sys.modules.pop("lake.ingest.runlog", None)
+            delattr(sys.modules["lake.ingest"], "runlog")
+        else:
+            sys.modules["lake.ingest.runlog"] = real_runlog_mod
+            setattr(sys.modules["lake.ingest"], "runlog", real_runlog_mod)
         if real_embed_mod is None:
             sys.modules.pop("lake.embed", None)
             delattr(sys.modules["lake"], "embed")
@@ -206,7 +245,7 @@ def _unexpected(what: str):
                          f"fetch, call an LLM or write the real staging file")
 
 
-def _run(tmp: Path, idx: Path) -> None:
+def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
     # ---------------------------------------------------------------- the mock
     # `api_key=False` here and below: these two blocks check the shape of the API, and
     # the key gets its own block at the end, against a server that has one.
@@ -348,10 +387,12 @@ def _run(tmp: Path, idx: Path) -> None:
         assert np.allclose(stored["vector"], _vec("score cheaply, then pay"), atol=1e-6), \
             "text changed and the vector did not follow it"
         for bad in ({}, {"vector": [0.0] * EMBED_DIM}, {"id": "x"}, {"created_at": "now"},
-                    # trust_score is derived from the leaves on every read, so storing
-                    # it would answer 200 and never be read back — a no-op that reports
-                    # success.
-                    {"trust_score": 0.99},
+                    # `trust_score` and `dirty` move together, in one update by the
+                    # judge (`13` §3.2-3.3). Writing either one alone over HTTP leaves
+                    # the pair inconsistent — an idea clean with a stale score, or a
+                    # score nothing measured. `origin` is a fact of creation, not a
+                    # field to be edited later.
+                    {"trust_score": 0.99}, {"dirty": False}, {"origin": "synthesized"},
                     # An explicit null is not "leave it alone": it used to reach the
                     # store, write NULL into a non-nullable column, and make the row
                     # unreadable — taking /ideas and /retrieve down for the whole lake
@@ -486,6 +527,36 @@ def _run(tmp: Path, idx: Path) -> None:
         assert client.get("/search", params={"q": "freeze the encoder"}).json(), \
             "the index is not searchable after the repair"
 
+        # --- 2026-07-31 finding: `thesis_fts` dropped/emptied on its own ----
+        # `idx_thesis` still agrees with the store (`indexed == leaves` stays true),
+        # which is exactly why `/healthz`'s original check missed this: the hybrid
+        # had silently degraded to cosine alone (every hit's bm25_rank stuck at
+        # null) and nothing on the health surface said so.
+        con = index._con(idx)
+        con.execute("DELETE FROM thesis_fts")
+        con.commit()
+        sick_fts = client.get("/healthz").json()
+        assert sick_fts["status"] == "degraded" and sick_fts["in_sync"] is True, sick_fts
+        assert "thesis_fts" in sick_fts["detail"], sick_fts
+        assert client.get("/stats").json()["in_sync"] is False, \
+            "stats must not call the lake in_sync while thesis_fts is empty"
+        # And the read path itself: a broken index must not answer as an empty or
+        # degraded one — /search and /retrieve both raise through the store-error
+        # path (`sqlite3.DatabaseError`), not silently answer on cosine alone.
+        broken_search = client.get("/search", params={"q": "freeze the encoder"})
+        assert broken_search.status_code == 503, broken_search.text
+        assert "thesis_fts" in broken_search.json()["error"], broken_search.text
+        broken_retrieve = client.post("/retrieve", json={"query": "freeze the encoder",
+                                                          "rewrite": False})
+        assert broken_retrieve.status_code == 503, broken_retrieve.text
+        repaired_fts = client.post("/admin/reindex").json()
+        assert repaired_fts == {"indexed_before": 3, "leaves_in_store": 3,
+                                "indexed_after": 3, "in_sync": True}, repaired_fts
+        assert client.get("/healthz").json()["status"] == "ok"
+        healed = client.get("/search", params={"q": "freeze the encoder"}).json()
+        assert healed and any(h["bm25_rank"] for h in healed), \
+            "the repair must refill thesis_fts too, not just idx_thesis"
+
         # A repair that REFUSES must leave the suspect index in place. Dropping first
         # and filling second used to empty it — and an empty index does not raise:
         # /search answers 200 [] and ranking reads that as "the lake has nothing".
@@ -554,12 +625,59 @@ def _run(tmp: Path, idx: Path) -> None:
         assert client.post("/ingest/phase1", json={"sources": []}).status_code == 400
         assert client.get("/ingest/jobs/nope").status_code == 404
         listing = client.get("/ingest/jobs").json()
-        assert len(listing) == 4, listing        # 2 reindex (ok, failed), phase2, phase1
+        # 3 reindex (ok, ok, failed — the extra ok is the thesis_fts-only repair
+        # above), phase2, phase1.
+        assert len(listing) == 5, listing
         # Newest first, checked by identity: `created_at` has second resolution and
-        # the two reindex jobs share a timestamp, so a sort on it proves nothing.
-        assert [j["kind"] for j in listing] == ["phase1", "phase2", "reindex", "reindex"], listing
+        # the reindex jobs share a timestamp, so a sort on it proves nothing.
+        assert [j["kind"] for j in listing] == \
+            ["phase1", "phase2", "reindex", "reindex", "reindex"], listing
         assert listing[0]["status"] == "failed" and listing[-1]["status"] == "ok", listing
         assert client.get("/stats").json()["job_running"] is None
+
+        # --- /admin/trust: operator-triggered judging pass (13 §3.3 review note) ---
+        # Queued like phase1/phase2 (dozens of 35B calls, same cost profile as phase
+        # 2's own end-of-pass step), unlike the synchronous /admin/reindex above.
+        # `trust.run_pass` is stubbed the same way `run_mod.phase1/phase2` are: this
+        # check must never call the school's LLM.
+        from ..ingest import trust as trust_mod
+        real_run_pass = trust_mod.run_pass
+        seen_trust: dict = {}
+
+        def fake_run_pass(idea_ids=None):
+            seen_trust["idea_ids"] = idea_ids
+            return {"trust_scored": 1, "trust_failed": 0, "trust_leaves_capped": 0,
+                    "trust_errors": [], "trust_mean": 0.7, "trust_due": 1, "trust_deferred": 0}
+
+        trust_mod.run_pass = fake_run_pass
+        try:
+            named = client.post("/admin/trust", json={"idea_ids": [idea_a]})
+            assert named.status_code == 202, named.text
+            assert named.json()["kind"] == "trust" and named.json()["args"] == {
+                "idea_ids": [idea_a]}, named.text
+            named_job = _await(client, named.json()["id"])
+            assert named_job["status"] == "ok" and named_job["report"]["trust_scored"] == 1, \
+                named_job
+            assert seen_trust["idea_ids"] == [idea_a], \
+                "a named idea must reach run_pass exactly as posted"
+
+            # Body omitted entirely: `idea_ids` must reach `run_pass` as None (whatever
+            # is already dirty), never as an empty list — the two mean different things.
+            omitted = client.post("/admin/trust")
+            assert omitted.status_code == 202, omitted.text
+            _await(client, omitted.json()["id"])
+            assert seen_trust["idea_ids"] is None, seen_trust
+
+            # Empty idea_ids is refused at the door, same reasoning as IdeaPatch's
+            # empty patch: "name at least one, or omit the field" — not silently
+            # treated as either "all" or "none".
+            assert client.post("/admin/trust", json={"idea_ids": []}).status_code == 400
+            assert client.post("/admin/trust", json={"oops": 1}).status_code == 400
+        finally:
+            trust_mod.run_pass = real_run_pass
+        print("ok: /admin/trust — named ideas or (idea_ids omitted) whatever is "
+              "already dirty, queued like phase1/phase2 rather than blocking like "
+              "/admin/reindex, empty idea_ids and an unknown field both 400")
 
         # This route starts minutes of LLM spend: an entry nothing can fetch is a 400
         # at the door, not a job that discovers it later.
@@ -657,6 +775,367 @@ def _run(tmp: Path, idx: Path) -> None:
         print("ok: /fetch — a non-arXiv link is 400 at the door, the version survives, "
               "the article gets its own staging file, fetch_step/write_step drain the "
               "queue exactly as the real fetch pool and writer would")
+
+        # --- /run: a batch of mutants, one job per run (13 §2.5) ------------
+        def _mutant(program_id: str, **over) -> dict:
+            base = {"program_id": program_id, "parent_ids": [], "state": "done",
+                    "fitness": 0.5, "mutation_output": {
+                        "archetype": "swap_layer", "justification": "j",
+                        "insights_used": [],
+                        "changes": [{"description": "d", "explanation": "e"}]}}
+            base.update(over)
+            return base
+
+        # `limit`/`min_abs_delta` are RunRequest's own fields (§2.4) — set to
+        # non-default values here so every assertion below that reads them back
+        # (JobOut.args, the payload on disk, the kwargs the converter actually
+        # received) proves the seam and not just that a default survived.
+        run_body = {"run_id": "run-selfcheck-1", "task_id": "aime-seed1",
+                   "limit": 5, "min_abs_delta": 0.2,
+                   "mutants": [_mutant("p1"),
+                              _mutant("p2", parent_ids=["p1"], fitness=None,
+                                      mutation_output=None,
+                                      mutation_output_raw='{"archetype": "y"}')]}
+        run_dir_before = (sorted(p.name for p in models_mod.RUN_DIR.iterdir())
+                          if models_mod.RUN_DIR.exists() else [])
+
+        # 400 before the queue and before any spend: no run_id, empty mutants, an
+        # unknown field, a mutant with no program_id, a mutant with neither form of
+        # its mutation output.
+        for bad in ({**run_body, "mutants": []},
+                    {k: v for k, v in run_body.items() if k != "run_id"},
+                    {**run_body, "oops": 1},
+                    {**run_body, "mutants": [{**_mutant("p3"), "program_id": ""}]},
+                    {**run_body, "mutants": [
+                        {k: v for k, v in _mutant("p4").items()
+                         if k != "mutation_output"}]},
+                    # Same numeric-input door as every other field in this file
+                    # (schemas.py): `limit` is a count, `min_abs_delta` is a
+                    # non-negative threshold, and 0/negative reach a 400 before
+                    # the queue, not a job that discovers it later.
+                    {**run_body, "limit": 0}, {**run_body, "min_abs_delta": -0.5}):
+            before_counts = queue.counts()
+            answer = client.post("/run", json=bad)
+            assert answer.status_code == 400, (bad, answer.status_code, answer.text)
+            assert set(answer.json()) == {"error"}, answer.text
+            assert queue.counts() == before_counts, f"a refused /run enqueued a job: {bad}"
+        after_bad = (sorted(p.name for p in models_mod.RUN_DIR.iterdir())
+                    if models_mod.RUN_DIR.exists() else [])
+        assert after_bad == run_dir_before, "a refused /run wrote a payload file"
+
+        # --- BLOCKER 1: run_id reaches a filesystem path — validated at the door, and
+        # again where the path is built. Reproduced without the fix: `run_id:
+        # "../../pwned"` answered 202 and created a file two directories above
+        # RUN_DIR, `mkdir(parents=True)` building the way there. A slash, "..", a
+        # null byte, a leading dash, and an over-long id — each 400, nothing written.
+        for bad_id in ("../../pwned", "a/b", "..", "\x00evil", "-x", "x" * 100):
+            before_dir = (sorted(p.name for p in models_mod.RUN_DIR.iterdir())
+                         if models_mod.RUN_DIR.exists() else [])
+            answer = client.post("/run", json={**run_body, "run_id": bad_id})
+            assert answer.status_code == 400, (bad_id, answer.status_code, answer.text)
+            assert set(answer.json()) == {"error"}, answer.text
+            after_dir = (sorted(p.name for p in models_mod.RUN_DIR.iterdir())
+                        if models_mod.RUN_DIR.exists() else [])
+            assert after_dir == before_dir, f"a rejected run_id {bad_id!r} wrote a file"
+        # Defense in depth, at the second door: `workers.payload_for` refuses a
+        # traversal on its own, for a future non-HTTP caller with no request model
+        # standing in front of it (the schema pattern is bypassable by any caller
+        # that builds a job without going through `RunRequest`).
+        try:
+            workers.payload_for("../../pwned")
+        except ValueError as exc:
+            assert "outside RUN_DIR" in str(exc), exc
+        else:
+            raise AssertionError("workers.payload_for let a path traversal through")
+
+        # `_RUN_ID_RE` is a SECOND, independent guard inside `payload_for` (the
+        # resolved-path check above is the first) — and every shape the route-level
+        # loop just posted is ALSO rejected by `RunRequest.run_id`'s own pattern
+        # before it ever reaches this helper, so that loop cannot prove `_RUN_ID_RE`
+        # does anything. These five stay INSIDE `RUN_DIR` once resolved — `"a/b"` is
+        # a subdirectory, `".."` becomes the literal filename `"...json"`, `""`
+        # becomes `".json"`, `".hidden"` and the 100-char id are ordinary dotfiles —
+        # so the resolved-path check alone waves all of them through; only the slug
+        # regex objects. Reproduced without the fix: deleting the `_RUN_ID_RE.match`
+        # branch (keeping the path check) left this whole file green.
+        for bad_slug in ("a/b", "..", "", ".hidden", "x" * 100):
+            try:
+                workers.payload_for(bad_slug)
+            except ValueError as exc:
+                assert "valid slug" in str(exc), (bad_slug, exc)
+            else:
+                raise AssertionError(f"workers.payload_for accepted {bad_slug!r} "
+                                     "with no _RUN_ID_RE check to stop it")
+        valid_path = workers.payload_for("run-slug-check-1")
+        assert valid_path == (models_mod.RUN_DIR / "run-slug-check-1.json").resolve(), valid_path
+        assert valid_path.parent.is_dir(), "payload_for must mkdir its own parent"
+
+        # --- MAJOR 3: module == HTTP parity — the CLI's own payload must not 400 ---
+        # `real_payload_from_csv` is the actual converter (`lake.ingest.runlog`,
+        # captured in `main()` before the module was faked): the exact body
+        # `python3 -m lake.ingest.runlog` would push over HTTP, byte for byte,
+        # must clear `RunRequest`/`MutantIn` at the door. Reproduced without the
+        # fix: `generation`, `iteration` and `mutation_model` — the three keys
+        # `payload_from_csv` emits for every mutant — made this a 400.
+        csv_path = tmp / "round_trip.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=[
+                "program_id", "parent_ids", "state", "generation", "iteration",
+                "metric_fitness", "metadata_mutation_model", "metadata_mutation_output"])
+            writer.writeheader()
+            writer.writerow({
+                "program_id": "csv-p1", "parent_ids": "[]", "state": "done",
+                "generation": "3", "iteration": "7", "metric_fitness": "0.5",
+                "metadata_mutation_model": "qwen3.6-35b-a3b",
+                "metadata_mutation_output": json.dumps({
+                    "archetype": "swap_layer",
+                    "changes": [{"description": "d", "explanation": "e"}]})})
+        csv_payload = real_payload_from_csv(csv_path, run_id="run-selfcheck-csv")
+        assert {"generation", "iteration", "mutation_model"} <= set(
+            csv_payload["mutants"][0]), csv_payload
+        round_trip = client.post("/run", json=csv_payload)
+        assert round_trip.status_code == 202, round_trip.text
+        with queue._LOCK:
+            queue._con().execute("DELETE FROM job WHERE id = ?",
+                                 (round_trip.json()["id"],))
+
+        # `mutation_output_raw` accepted alongside the parsed form; the batch rides in
+        # a file, not `args`; dedup by `run_id`, checked BEFORE draining so the first
+        # job is still live. `lake.ingest.runlog` is stubbed the same way
+        # `run.stage_one`/`drain_one` are above — offline, no real converter.
+        run_seen: dict = {}
+
+        def fake_from_payload(payload, staging_path=None, **kw):
+            run_seen.update(payload=payload, staging_path=Path(staging_path), kwargs=kw)
+            return {"staging_lines": len(payload["mutants"]), "rows_unparsed": 0}
+
+        def fake_drain_run(staging_path, staged=None):
+            run_seen.update(drain_staging_path=Path(staging_path), drain_staged=staged)
+            return {"run_sources": 1, "run_theses": 2,
+                    "staging_lines": (staged or {}).get("staging_lines", 0)}
+
+        from ..ingest import runlog
+        runlog.from_payload = fake_from_payload
+        runlog.drain_run = fake_drain_run
+
+        submitted = client.post("/run", json=run_body)
+        assert submitted.status_code == 202, submitted.text
+        assert submitted.json()["kind"] == "run" and submitted.json()["status"] == "queued", \
+            submitted.text
+        run_job_id = submitted.json()["id"]
+        args = submitted.json()["args"]
+        # `limit`/`min_abs_delta` must be visible in JobOut.args too, not only
+        # inside the payload file: a caller polling /ingest/jobs while the job is
+        # still queued or running has no other way to see what was asked for.
+        assert sorted(args) == ["limit", "min_abs_delta", "payload", "payload_hash",
+                                "run_id", "task_id"], args
+        assert (args["run_id"], args["task_id"], args["limit"], args["min_abs_delta"]) == \
+            ("run-selfcheck-1", "aime-seed1", 5, 0.2), args
+        payload_path = Path(args["payload"])
+        assert payload_path.exists(), "the batch body must be on disk before the job is queued"
+        on_disk = json.loads(payload_path.read_text(encoding="utf-8"))
+        assert on_disk["mutants"][1]["mutation_output_raw"] == '{"archetype": "y"}', on_disk
+        assert (on_disk["limit"], on_disk["min_abs_delta"]) == (5, 0.2), on_disk
+
+        again = client.post("/run", json=run_body)
+        assert again.status_code == 202 and again.json()["id"] == run_job_id, \
+            "the same run_id twice must not open a second job"
+
+        # MINOR 4: the SAME run_id with a DIFFERENT body must not be served silently.
+        # Reproduced without the fix: a second POST with a live run_id both got 202
+        # AND overwrote the first job's payload file — the accepted batch and the
+        # converted batch differed with no error anywhere.
+        conflicting = client.post("/run", json={**run_body, "task_id": "a-different-task"})
+        assert conflicting.status_code == 409, conflicting.text
+        assert "error" in conflicting.json(), conflicting.text
+        assert json.loads(payload_path.read_text(encoding="utf-8"))["task_id"] == \
+            "aime-seed1", "a refused conflicting /run overwrote the live job's payload"
+
+        assert workers.fetch_step() is True, "phase 1 found nothing queued to claim"
+        staged_run = client.get(f"/ingest/jobs/{run_job_id}").json()
+        assert staged_run["status"] == "staged" and staged_run["stage"] == "phase1", staged_run
+        assert not payload_path.exists(), \
+            "a successfully staged run must not keep its payload file"
+        assert run_seen["payload"]["mutants"][0]["program_id"] == "p1", run_seen
+        # DEFECT 1: `_stage_run` must read `limit`/`min_abs_delta` back off the
+        # payload it just parsed and forward BOTH to `runlog.from_payload` — the
+        # whole reason §2.4's ordering-by-|delta| means anything on an
+        # interrupted load. Reproduced without the fix: `_stage_run` calling
+        # `runlog.from_payload(payload, staging_for(job))` with neither keyword
+        # left `run_seen["kwargs"] == {}` here, and every /run job over HTTP
+        # converted everything regardless of what `RunRequest` asked for.
+        assert run_seen["kwargs"] == {"limit": 5, "min_abs_delta": 0.2}, run_seen
+
+        assert workers.write_step() is True, "phase 2 found nothing staged to claim"
+        run_job = client.get(f"/ingest/jobs/{run_job_id}").json()
+        assert run_job["status"] == "ok" and run_job["report"]["run_theses"] == 2, run_job
+        assert run_seen["drain_staged"]["staging_lines"] == 2, run_seen
+        assert run_seen["drain_staging_path"] == run_seen["staging_path"], run_seen
+
+        # --- MAJOR 2 probe: a transient queue.stage() failure must not lose the ---
+        # payload `_stage_run` already read — the retry needs it back. Reproduced
+        # without the fix: `stage()` raising after `_stage_run` had already unlinked
+        # the file burned all three attempts on a FileNotFoundError, never actually
+        # retrying the parse it already knew how to do.
+        probe_submit = client.post("/run", json={**run_body, "run_id": "run-selfcheck-probe"})
+        assert probe_submit.status_code == 202, probe_submit.text
+        probe_job_id = probe_submit.json()["id"]
+        probe_payload_path = Path(probe_submit.json()["args"]["payload"])
+        assert probe_payload_path.exists()
+
+        real_stage = queue.stage
+
+        def _boom_stage(*a, **kw):
+            raise sqlite3.OperationalError("database is locked")
+
+        queue.stage = _boom_stage
+        try:
+            assert workers.fetch_step() is True, "phase 1 found nothing to claim for the probe"
+        finally:
+            queue.stage = real_stage
+        after_boom = client.get(f"/ingest/jobs/{probe_job_id}").json()
+        assert after_boom["status"] == "queued", \
+            f"a transient stage() failure must retry, not fail for good: {after_boom}"
+        assert probe_payload_path.exists(), \
+            "MAJOR 2: the payload was gone before queue.stage() committed, so the retry has nothing to read"
+
+        assert workers.fetch_step() is True, "the retry found nothing queued to claim"
+        probe_staged = client.get(f"/ingest/jobs/{probe_job_id}").json()
+        assert probe_staged["status"] == "staged", probe_staged
+        assert not probe_payload_path.exists(), \
+            "a successfully staged run must not keep its payload file"
+        assert workers.write_step() is True, "phase 2 found nothing staged for the probe"
+        probe_final = client.get(f"/ingest/jobs/{probe_job_id}").json()
+        assert probe_final["status"] == "ok", probe_final
+
+        # --- terminal failure: `_fail`'s cleanup branch, and "no changes[] anywhere"
+        # ends the JOB `failed`, not `ok` with zeros --------------------------------
+        # MAJOR 2 (above) proved the TRANSIENT half: a retryable error keeps the
+        # payload. This is the other ending `_fail` has — a PERMANENT error
+        # (`_permanent`: FetchError, ValueError, KeyError) fails the job for good on
+        # the FIRST attempt, and only THAT branch drops the payload file; nothing
+        # above reaches it, because every failure exercised so far was transient.
+        # Reproduced without the fix: deleting `_fail`'s `if final_status ==
+        # "failed": cleanup(job)` branch, or making `_permanent` always return
+        # `False` (nothing ever fails for good, everything retries), both left this
+        # entire file green. `runlog.from_payload` raising `ValueError` is also
+        # §9's fourth way to end up with an unchanged lake — "a batch in which no
+        # mutant has a single changes[] ends failed with a reason, not ok with
+        # zeros" (`13` §2.5) — proved here through the real queue/worker wiring, not
+        # just `runlog.from_payload`'s own raise (`lake/ingest/runlog.py`'s
+        # `__main__`, MAJOR 3 there).
+        dead_submit = client.post(
+            "/run", json={**run_body, "run_id": "run-selfcheck-nochanges"})
+        assert dead_submit.status_code == 202, dead_submit.text
+        dead_job_id = dead_submit.json()["id"]
+        dead_payload_path = Path(dead_submit.json()["args"]["payload"])
+        assert dead_payload_path.exists()
+
+        def dying_from_payload(payload, staging_path=None, **kw):
+            raise ValueError(f"runlog {payload['run_id']}: 1 mutant(s) had a "
+                             "computable delta but none carried a changes[]")
+
+        runlog.from_payload = dying_from_payload
+        try:
+            assert workers.fetch_step() is True, "nothing queued to claim for the dead batch"
+        finally:
+            runlog.from_payload = lambda payload, staging_path=None, **kw: _unexpected(
+                "runlog.from_payload")
+        dead_job = client.get(f"/ingest/jobs/{dead_job_id}").json()
+        assert dead_job["status"] == "failed", \
+            f"a batch with no changes[] anywhere must fail, not retry or report ok: {dead_job}"
+        assert dead_job["report"] is None, dead_job
+        assert "changes" in dead_job["error"], dead_job
+        assert not dead_payload_path.exists(), \
+            "a terminally failed run job must not keep its payload file (_fail's cleanup)"
+
+        runlog.from_payload = lambda payload, staging_path=None, **kw: _unexpected(
+            "runlog.from_payload")
+        runlog.drain_run = lambda staging_path, staged=None: _unexpected("runlog.drain_run")
+
+        # 429 at the ceiling, with Retry-After — same mechanism as /fetch, same queue.
+        # `ceiling=0` is falsy and SKIPS the check inside `queue.enqueue` (`if
+        # ceiling:`), so the ceiling needs a real queued row to count, not zero.
+        filler = queue.enqueue("run", {"run_id": "run-selfcheck-filler", "task_id": None,
+                                       "payload": "/does/not/matter"},
+                               dedup_key="run-selfcheck-filler")
+        real_queue_max = workers.QUEUE_MAX
+        workers.QUEUE_MAX = queue.counts()["queued"]      # the filler, already at ceiling
+        try:
+            over = client.post("/run", json={**run_body, "run_id": "run-selfcheck-2"})
+            assert over.status_code == 429, over.text
+            assert over.headers.get("retry-after"), over.headers
+            assert "error" in over.json(), over.text
+            # MINOR 4: a 429 must leave no orphan — the payload is only written once
+            # `queue.enqueue` has actually accepted the job (`on_accept=`).
+            assert not (models_mod.RUN_DIR / "run-selfcheck-2.json").exists(), \
+                "a 429'd /run left a payload file nobody will ever read"
+        finally:
+            workers.QUEUE_MAX = real_queue_max
+            with queue._LOCK:
+                queue._con().execute("DELETE FROM job WHERE id = ?", (filler["id"],))
+
+        # --mock never accepts, and never enqueues, exactly like /fetch (checked
+        # against the mock app earlier in this file — repeated against THIS run's
+        # queue file to prove it is not a coincidence of the other app's temp db).
+        with TestClient(create_app(mock=True, warmup=False, api_key=False,
+                                   workers=False)) as mock_client:
+            mock_run = mock_client.post("/run", json={**run_body,
+                                                       "run_id": "run-selfcheck-mock"})
+        assert mock_run.status_code == 503, mock_run.text
+        assert "mock" in mock_run.json()["error"], mock_run.text
+        assert not any(job["args"].get("run_id") == "run-selfcheck-mock"
+                       for job in queue.listing(200)), "the mock /run enqueued a job"
+
+        # A run job must not be claimed off a fetch-only path, and a fetch job must
+        # not be claimed off a run-only one — even with BOTH sitting `queued` at the
+        # same time. MINOR 5: `queue.claim` no longer takes a `kind=` filter (it was
+        # a second, duplicated `UPDATE ... RETURNING` branch nothing real ever called
+        # — both `fetch_step` and `write_step` claim any kind and dispatch on
+        # `job["kind"]` themselves via `_STAGE`/`_DRAIN`, §2.5 build note 4). That
+        # dispatch table is what is actually asserted: a fetch job and a run job,
+        # queued together, each reach the RIGHT handler through `fetch_step`.
+        another_fetch = client.post(
+            "/fetch", json={"url": "https://arxiv.org/abs/2412.00001"}).json()
+        another_run_submit = client.post(
+            "/run", json={**run_body, "run_id": "run-selfcheck-dispatch"})
+        assert another_run_submit.status_code == 202, another_run_submit.text
+        another_run_id = another_run_submit.json()["id"]
+
+        dispatch_seen: dict = {"fetch": False, "run": False}
+
+        def fake_stage_one_dispatch(entry, staging_path):
+            dispatch_seen["fetch"] = True
+            return {"staging_lines": 1, "leakage": 0, "theses_dropped": 0,
+                    "source": entry["arxiv_id"]}
+
+        def fake_from_payload_dispatch(payload, staging_path=None, **kw):
+            dispatch_seen["run"] = True
+            return {"staging_lines": len(payload["mutants"]), "rows_unparsed": 0}
+
+        run_mod.stage_one = fake_stage_one_dispatch
+        runlog.from_payload = fake_from_payload_dispatch
+        try:
+            assert workers.fetch_step() is True
+            assert workers.fetch_step() is True
+        finally:
+            run_mod.stage_one = lambda entry, staging_path: _unexpected("stage_one")
+            runlog.from_payload = lambda payload, staging_path=None, **kw: _unexpected(
+                "runlog.from_payload")
+        assert dispatch_seen == {"fetch": True, "run": True}, \
+            f"a fetch job or a run job reached the wrong handler: {dispatch_seen}"
+        assert client.get(f"/ingest/jobs/{another_run_id}").json()["stage"] == "phase1"
+        with queue._LOCK:
+            queue._con().execute("DELETE FROM job WHERE id IN (?, ?)",
+                                 (another_fetch["id"], another_run_id))
+        print("ok: /run — a batch is one job, mutation_output_raw travels with the "
+              "parsed form, the same run_id dedups while the job is still live, a "
+              "different body under a live run_id is 409, 400 before the queue and "
+              "before any spend, a transient stage() failure keeps the payload for "
+              "the retry, 429 at the ceiling with Retry-After and no orphan payload, "
+              "--mock enqueues nothing, the payload survives a pending job and is "
+              "gone once staged, and fetch_step/write_step dispatch a fetch job and "
+              "a run job queued together to their own handlers")
 
         # --- the durable queue: dedup, ceiling, restart, merged listing, health ---
         # (a) dedup: the same url twice must not open a second job.

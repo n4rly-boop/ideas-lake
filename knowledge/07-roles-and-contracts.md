@@ -114,12 +114,14 @@ POST /retrieve
   { query, k=5, run_id?, budget?, rewrite=true, allow_web=false }
 ->
   { ideas: [ { idea_id, text, applicability_conditions, limitations, failure_modes,
-               effect_claimed, effect_observed, trust_score, score, via,
+               effect_claimed, effect_observed, trust_score, score, cosine_similarity, via,
                theses: [ { text, url, title, effect, locator } ] } ],
     log_id, cost: { tokens_in, tokens_out, wall_ms } }
 ```
 
 **[изменено 2026-07-28]** `concept` → `text`, `url_or_doi` → `url`, `claimed_effect` → `effect`; добавлены `failure_modes`, `title`, `locator`, `via`. `via` показывает, как идея попала в выдачу: `thesis` \| `edge` \| `padding` — без него не отличить найденное от дозаполненного.
+
+**[добавлено 2026-07-31, ревью «нет абсолютного сигнала релевантности»]** `cosine_similarity` — аддитивное поле, ничего не переименовано и не убрано. `score` нормирован min-max по списку кандидатов ЭТОГО вызова (§0.1.17 `10`) и потому у лучшего элемента всегда 1.0, каким бы ни был запрос: запрос "sourdough bread fermentation temperature and hydration ratio", которого в озере нет вообще, вернул `score: 1.0` наравне с релевантным. `raw_score` (варианта не решает — RRF почти не зависит от релевантности, `lake/README.md` §8.1: 0.0305 против 0.0323 на живом озере). `cosine_similarity` — косинус между вектором запроса и **собственным вектором идеи** (`text` → vector, §1.3), в [-1, 1], НЕ перенормируется на запрос и потому сравним МЕЖДУ вызовами `/retrieve`. Измерено на живом озере (127.0.0.1:8077, 43 тезиса/18 идей): у sourdough лучший кандидат — 0.44–0.48, у релевантного запроса ("population evolutionary search math reasoning") — 0.75–0.76. Не порог 0 = «нет отношения»: универсальный энкодер держит ненулевой пол между несвязанными текстами (анизотропия), поэтому C сравнивает число со своей измеренной базой, не с нулём. Реализация и самопроверка — `lake/retrieve/rank.py` (`_cosine`), контракт — `lake/api/schemas.py` (`RetrieveIdea.cosine_similarity`).
 
 - Запрос формулируется **как решение, а не как задача** (`06` §5.3). **[открыто]** кто переписывает контекст эволюции в query — эволюция или LLM внутри ретрива.
 - Политика recall-first: пустой выдачи нет, дозаполняем до k; всё выданное и отсечённое пишется в лог по `log_id`.

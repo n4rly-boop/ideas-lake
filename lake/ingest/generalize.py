@@ -37,20 +37,33 @@ gpu gpus cpu cpus tpu tpus
 
 
 @trace(component="ingest", op="generalize")
-def generalize(draft: DraftThesis) -> IdeaFields:
-    """One LLM call. LLMError is not caught: run.py decides what a failed thesis costs."""
-    obj = llm.complete(_user_message(draft), system=llm.load_prompt("generalize"),
+def generalize(draft: DraftThesis, *, prompt: str = "system") -> IdeaFields:
+    """One LLM call. LLMError is not caught: run.py decides what a failed thesis costs.
+
+    `prompt` names the variant inside `prompts/generalize/` — `run` for a mutation log,
+    whose concrete embodiment is code, not a dataset (`13` §2.2.1).
+    """
+    obj = llm.complete(_user_message(draft), system=llm.load_prompt("generalize", prompt),
                        schema=GENERALIZE_SCHEMA, op="generalize", max_tokens=800,
                        timeout=60, model=llm.QWEN_9B, temperature=0.0)
     return IdeaFields(**obj)
 
 
-def leakage(draft: DraftThesis, out: IdeaFields) -> list[str]:
+def leakage(draft: DraftThesis, out: IdeaFields, extra_terms=()) -> list[str]:
     """§4.4 — automatic check that the concrete embodiment did not survive.
 
     Two rules: a number from `draft.effect` in `out.text`, and a dataset / model /
     benchmark name from `draft.context` in `out.text`. Returns one string per
     violation; an empty list means clean. Never raises and never blocks a run.
+
+    `extra_terms` is the third rule, and it exists because the first two are shaped for
+    a paper. In an evolution log the concrete thing is a program id, a function name out
+    of the mutant's source, a task name — none of which `_names` recognises: they are
+    snake_case, so they carry neither a capital nor a digit and the heuristic drops them.
+    A green check written for papers says nothing about a log (`13` §9 p.9), so the
+    caller that knows the log passes the terms it knows. Terms shorter than 3 characters
+    are ignored: a one-letter name matches everywhere and would make the check useless
+    by firing constantly.
     """
     violations = []
     leaked_numbers = set(_NUMBER.findall(draft.effect)) & set(_NUMBER.findall(out.text))
@@ -59,6 +72,9 @@ def leakage(draft: DraftThesis, out: IdeaFields) -> list[str]:
     for lowered, original in sorted(_names(draft.context).items()):
         if _mentions(out.text, lowered):
             violations.append(f"name {original!r} from context leaked into text")
+    for term in sorted({t for t in extra_terms if len(t) >= 3}):
+        if _mentions(out.text, term):
+            violations.append(f"term {term!r} from the source leaked into text")
     return violations
 
 

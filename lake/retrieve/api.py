@@ -53,6 +53,7 @@ MOCK_RESPONSE = {
             "effect_observed": "4.2x on the reported benchmark suite",
             "trust_score": 0.62,
             "score": 0.81,
+            "cosine_similarity": 0.71,
             "via": "thesis",
             "theses": [
                 {
@@ -89,6 +90,7 @@ MOCK_RESPONSE = {
             "effect_observed": "",
             "trust_score": 0.41,
             "score": 0.57,
+            "cosine_similarity": 0.55,
             "via": "edge",
             "theses": [
                 {
@@ -116,6 +118,7 @@ MOCK_RESPONSE = {
             "effect_observed": "",
             "trust_score": 0.28,
             "score": 0.33,
+            "cosine_similarity": 0.46,
             "via": "padding",
             "theses": [
                 {
@@ -180,6 +183,21 @@ def retrieve(query: str, k: int = K_DEFAULT, *, budget: int | None = None,
                 # the guard, so an unimportable ranker is a logged 503, not a dropped
                 # connection.
                 from . import rank
+                from .. import graph_client, index
+                # 2026-07-31 finding: `index.search_theses` on an EMPTY index answers
+                # `[]` on purpose (§6.12's own self-check asserts exactly that) — the
+                # right behaviour for a genuinely empty lake. But an index wiped by a
+                # bad rebuild or a file mutated outside this process is also an empty
+                # `idx_thesis`, and nothing before this point told the two apart: the
+                # store still holding theses is a broken index answering as an empty
+                # one, not the "the lake has nothing on this query" that a 200 means
+                # (§5.4). A few theses of lag while phase 2 is mid-write is NOT this —
+                # only the all-or-nothing wipe is refused here; `/admin/reindex` (§6.19)
+                # is the repair either way.
+                if index.count() == 0 and graph_client.counts()["theses"] > 0:
+                    raise RuntimeError(
+                        "index is empty but the store holds theses — index and store "
+                        "diverged (§6.19); refusing to answer as an empty lake")
                 ideas, payload = rank.rank(record["query_rewritten"], k=k)
                 record["returned"], record["cut_off"] = payload["returned"], payload["cut_off"]
                 # The body is validated HERE, inside the guard, and not left to the

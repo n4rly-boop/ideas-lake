@@ -24,6 +24,7 @@ calls — lives in `lake.ops` and not here, so that importing the modules reache
 the same behaviour as calling the port. The routes below shape the wire and
 nothing else; `lake.ops` exceptions become statuses in ONE place, `app.py`.
 """
+import hashlib
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -35,8 +36,9 @@ from . import jobs
 from ..models import FETCH_DIR
 from .schemas import (MAX_K, MAX_PAGE, EdgeOut, ErrorResponse, FetchRequest, Health, IdeaOut,
                       IdeaPatch, JobOut, Page, PendingLinkOut, Phase1Request, Phase2Request,
-                      ReindexResult, RetrieveRequest, RetrieveResponse, SearchHit, SourceIn,
-                      SourceOut, StagingOut, Stats, ThesisOut, VaultExportResult)
+                      ReindexResult, RetrieveRequest, RetrieveResponse, RunRequest, SearchHit,
+                      SourceIn, SourceOut, StagingOut, Stats, ThesisOut, TrustRequest,
+                      VaultExportResult)
 
 SOURCES_YAML = Path(__file__).resolve().parents[1] / "sources.yaml"
 
@@ -51,6 +53,11 @@ _BUSY = {409: {"model": ErrorResponse, "description":
                "Another ingest or repair holds the single slot. Ingest is sequential by "
                "design (§4.5); this is a refusal, not a queue. `/fetch` is the exception "
                "— it has a queue and answers 202."}}
+_RUN_CONFLICT = {409: {"model": ErrorResponse, "description":
+                       "`run_id` is already queued, running or staged with a DIFFERENT "
+                       "body. Serving back the first job, the way a same-body repost "
+                       "does, would silently drop the second body with nothing saying "
+                       "so — wait for the live job to finish or use a different run_id."}}
 _QUEUE_FULL = {429: {"model": ErrorResponse, "description":
                      "The ingest backlog is at `LAKE_QUEUE_MAX`. Carries `Retry-After`. "
                      "Accepting past the ceiling would hand out a `queued` status that "
@@ -286,6 +293,81 @@ def fetch_article(body: FetchRequest, request: Request):
         raise HTTPException(429, str(full), headers={"Retry-After": "60"})
 
 
+@fetch_router.post("/run", response_model=JobOut, status_code=202,
+                   responses={**_BAD, **_QUEUE_FULL, **_RUN_CONFLICT, 503: {
+                       "model": ErrorResponse,
+                       "description": "Either `data/jobs.db` raised — the job was NOT "
+                                      "accepted — or the server runs in `--mock`, where "
+                                      "this route would be the one thing that converts "
+                                      "an evolution log and writes the graph."}},
+                   summary="Прогон эволюции: пачка мутантов -> тезисы -> идеи в графе (13 §2.5)")
+def submit_run(body: RunRequest, request: Request):
+    """One evolution run, batched (`13` §2.5): the unit of outcome is the mutant, but
+    they arrive as a batch, and a job per mutant would put up to 182 rows against a
+    queue ceiling of 100 (`LAKE_QUEUE_MAX`). One job = one batch, mirroring `/fetch`'s
+    202 + `JobOut` shape — same queue, same two phases, same single writer.
+
+    The batch rides in a file under `data/run/`, not the `args` column: `JobOut.args`
+    is echoed on every `/ingest/jobs` call, and a multi-MB payload would ride along on
+    every poll. `args` carries `{run_id, task_id, payload: "<path>", payload_hash,
+    limit, min_abs_delta}` — the last two are small enough to ride directly and are
+    what §2.4 asks to be "logged in the report" even while the job is still queued
+    or running, not only once it finishes. The file is read once, by the phase-1
+    handler (`api/workers._stage_run`), which reads `limit`/`min_abs_delta` back off
+    THAT payload (not `args`) before calling the converter — the payload is what a
+    non-HTTP caller of `runlog.from_payload` would build directly, with no `args`
+    row in front of it at all. The file is deleted only once phase 1's
+    `queue.stage()` has committed — a job that fails keeps it for the retry
+    (MAJOR 2, `api/workers.py`).
+
+    The write itself only happens once `queue.enqueue` has actually decided to accept
+    the job (`on_accept=`, MINOR 4): a 429 or a `run_id` still live from an earlier
+    post must not leave a multi-MB orphan under `data/run/`, and must not let a
+    second, DIFFERENT body silently ride on the first job's id — `queue.enqueue`
+    compares `payload_hash` against the live job's and raises `DedupConflict` (409)
+    on a mismatch, rather than serving back a body the caller never sent. The write
+    is tmp + replace (like `run._drop_source`), not a bare `write_text`: a torn
+    overwrite lands mid-read as a `JSONDecodeError`, which `_permanent` treats as
+    unretryable and fails the job for good instead of retrying it.
+
+    Dedup by `run_id`, exactly like `/fetch` dedups by `arxiv_id`: re-posting the
+    SAME body under a live run returns the SAME job rather than opening a second one.
+    """
+    from .. import queue
+    from . import workers
+    if request.app.state.mock:
+        # Same reasoning as `/fetch` (above): `--mock` starts no workers, so an
+        # accepted row here would be a 202 for a conversion nothing will ever run.
+        raise HTTPException(503, "mock mode: /run is the one route that converts an "
+                                 "evolution log and writes the graph, and a mock server "
+                                 "touches neither — start without --mock")
+    # `payload_for` both computes the path and (BLOCKER 1) refuses one that would
+    # resolve outside RUN_DIR — belt to `RunRequest.run_id`'s pattern's suspenders.
+    path = workers.payload_for(body.run_id)
+    payload_json = body.model_dump_json()
+    payload_hash = hashlib.sha1(payload_json.encode("utf-8")).hexdigest()
+
+    def _write_payload() -> None:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(payload_json, encoding="utf-8")
+        tmp.replace(path)
+
+    try:
+        # `limit`/`min_abs_delta` also ride here, not only inside the payload file:
+        # `JobOut.args` is what `/ingest/jobs` echoes on every poll (§2.4 — "logged
+        # in the report"), and a caller watching a queued or running job should see
+        # what was asked for without fetching the multi-MB payload to find out.
+        return queue.enqueue("run", {"run_id": body.run_id, "task_id": body.task_id,
+                                     "payload": str(path), "payload_hash": payload_hash,
+                                     "limit": body.limit, "min_abs_delta": body.min_abs_delta},
+                             dedup_key=body.run_id, ceiling=workers.QUEUE_MAX,
+                             on_accept=_write_payload)
+    except queue.Full as full:
+        raise HTTPException(429, str(full), headers={"Retry-After": "60"})
+    except queue.DedupConflict as conflict:
+        raise HTTPException(409, str(conflict))
+
+
 @ingest.post("/phase1", response_model=JobOut, status_code=202, responses={**_BUSY, 400:
              {"model": ErrorResponse, "description": "Nothing to ingest."}},
              summary="Фаза 1: fetch → parse → generalize → staging.jsonl (граф не трогается)")
@@ -406,6 +488,22 @@ def stats():
                  summary="Пересобрать индекс тезисов из хранилища (§6.19)")
 def reindex():
     return ops.reindex()
+
+
+@ops_router.post("/admin/trust", response_model=JobOut, status_code=202,
+                 responses={**_BAD, **_BUSY},
+                 summary="Судить идеи по запросу: явным списком либо всё уже грязное (13 §3.3)")
+def request_trust(body: TrustRequest | None = None):
+    """Queued like phase1/phase2, unlike `/admin/reindex`: a pass is dozens of 35B
+    calls (`ingest/trust.MAX_TOKENS`-sized each), the exact profile phase 2's own
+    end-of-pass step already has, and answering inside the request would hang the
+    caller for minutes. `trust.run_pass` is the single definition both this route
+    and phase 2 call — see its docstring for why an operator-triggered pass calls
+    that directly rather than only flagging ideas dirty for the next ingest.
+    """
+    body = body or TrustRequest()
+    from ..ingest import trust
+    return _start("trust", lambda: trust.run_pass(body.idea_ids), {"idea_ids": body.idea_ids})
 
 
 @ops_router.post("/vault/export", response_model=VaultExportResult,

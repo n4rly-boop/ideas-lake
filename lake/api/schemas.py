@@ -91,9 +91,18 @@ class IdeaOut(BaseModel):
     differentiation: str | None = None
     effect_claimed: str
     effect_observed: str
-    trust_score: float = Field(..., description="Derived from the leaves by the stub store, "
-                                                "not stored — see IdeaPatch.")
-    dirty: bool
+    origin: str = Field("extracted",
+                        description="`extracted` — derived from theses of papers or runs; "
+                                    "`synthesized` — a hypothesis built out of other ideas "
+                                    "and carrying no evidence of its own. An idea with no "
+                                    "leaves is legal only in the second case.")
+    trust_score: float = Field(..., description="0..1, written by the judge over the idea "
+                                                "and its leaves. 0.0 means either "
+                                                "\"judged, and there is little to trust\" "
+                                                "or \"nothing to judge, no leaves\" — never "
+                                                "\"the judge failed\", that leaves the "
+                                                "previous value and the idea dirty.")
+    dirty: bool = Field(..., description="Leaves changed since the idea was last judged.")
     rederived_at_leaf_count: int
     created_at: str = Field(..., description="ISO-8601, or \"\": timestamps on Idea are "
                                              "block B's columns and the ingest leaves them "
@@ -113,11 +122,14 @@ class IdeaPatch(BaseModel):
     away from what the idea says. Patch `text` and the server re-embeds it.
     `id` and `created_at` are absent because they are identity, not content.
 
-    `trust_score` is absent too, and that one is not an oversight: the stub store
-    recomputes it from the leaves on every read (`stub_store._stub_trust`), so a
-    write would land in the column, answer 200, and never be read again — a
-    success that is a no-op. It comes back the day the value is stored rather
-    than derived.
+    `trust_score` is absent too, and that one is not an oversight either. Since
+    `13` §3.3 the value IS stored — but it is written by the judge together with
+    `dirty`, in one update (`graph_client.set_trust`), because an idea that is
+    clean with a score from before its current leaves is the exact lie the flag
+    exists to prevent. A hand-written score over HTTP would break that pair.
+
+    `origin` is absent for the same class of reason: it says where the idea came
+    from, which is a fact about its creation, not a field to be edited afterwards.
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -128,7 +140,11 @@ class IdeaPatch(BaseModel):
     differentiation: str | None = None
     effect_claimed: str | None = None
     effect_observed: str | None = None
-    dirty: bool | None = Field(None, description="Written by block B.")
+    # `dirty` is gone from the patch on purpose (`13` §3.2). It is raised with the
+    # leaves, in their transaction, and lowered only by the judge in the same update
+    # that stores the score. A hand-written `dirty: false` would leave an idea clean
+    # with a stale score — precisely the state the flag exists to make impossible.
+    # Asking for a re-judge is `dirty` going UP, and that happens by writing leaves.
     rederived_at_leaf_count: int | None = Field(None, ge=0)
 
     # `None` is the "not sent" marker for every field above, so only these may be
@@ -244,7 +260,24 @@ class RetrieveIdea(BaseModel):
     effect_claimed: str
     effect_observed: str
     trust_score: float
-    score: float
+    score: float = Field(..., description="Min-max normalized over THIS call's candidate "
+                                          "list (§5.3). Always 1.0 for the best of whatever "
+                                          "was found, on a query the lake has nothing on "
+                                          "exactly as much as on one it answers well — use "
+                                          "it to ORDER this answer's ideas, not to judge "
+                                          "whether the answer is any good.")
+    cosine_similarity: float = Field(
+        ..., description="Review finding, 2026-07-31: cosine similarity between the query "
+                         "embedding and this idea's own embedding (`text` -> vector, §1.3), "
+                         "in [-1, 1]. NOT renormalized per request, so — unlike `score` and "
+                         "`raw_score` — it is comparable across different /retrieve calls: "
+                         "this is the signal for 'is this actually relevant, or the best of "
+                         "a bad set'. Measured live: ~0.48 for a query the lake has nothing "
+                         "on, ~0.75 for one it has a real answer to (`lake/README.md` §8.1). "
+                         "Not a probability and not zero-centered on 'unrelated' — general-"
+                         "purpose sentence encoders keep a nonzero floor between unrelated "
+                         "text, so a caller judging relevance should compare this number "
+                         "against its own measured baseline, not against 0.")
     via: str = Field(..., description="thesis | edge | padding — how this idea reached the "
                                       "answer. Without it, 'found' and 'padded' are "
                                       "indistinguishable in the metrics (§5.5).")
@@ -292,6 +325,84 @@ class SourceEntry(BaseModel):
         if self.type is None:
             raise ValueError("entry has no type: paper | doc | run")
         return self
+
+
+class MutantIn(BaseModel):
+    """One mutant of an evolution run (`13` §2.1/§2.5). `program_id` becomes
+    `Source.version`; `parent_ids` and `parent_fitness` let the converter compute
+    a fitness delta by joining within the batch when `parent_fitness` is omitted.
+
+    Either `mutation_output` (already parsed) or `mutation_output_raw` (the JSON
+    string exactly as it sits in the CSV's `metadata_mutation_output` column) must
+    be present — the converter parses the raw form, not this route, so a mutant
+    with neither is 400 at the door rather than a job that discovers it empty-handed.
+
+    `generation`, `iteration` and `mutation_model` are exactly the three keys
+    `runlog.payload_from_csv` emits for every mutant alongside the ones below
+    (`10` §2.5 module == HTTP parity). Missing them made the CLI's own payload a
+    400 over HTTP, and a caller who stripped them to get past that would have fed
+    `from_payload` an empty `mutation_model` and a null `generation` — a run
+    ingested through HTTP writing different `Source` rows than the same log through
+    the CLI, with no error saying so.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    program_id: str = Field(..., min_length=1)
+    parent_ids: list[str] = Field(default_factory=list)
+    state: str = Field(..., min_length=1)
+    generation: int | None = None
+    iteration: int | None = None
+    fitness: float | None = None
+    parent_fitness: float | None = None
+    mutation_model: str = ""
+    mutation_output: dict | None = None
+    mutation_output_raw: str | None = Field(
+        None, description="`metadata_mutation_output` as it sits in the CSV — the "
+                          "converter parses it, this route does not.")
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.mutation_output is None and self.mutation_output_raw is None:
+            raise ValueError("mutant needs mutation_output or mutation_output_raw")
+        return self
+
+
+class RunRequest(BaseModel):
+    """One evolution run, batched (`13` §2.5): the unit of outcome is the mutant
+    (§2.1), but they arrive as a batch, and a job per mutant would put 182 rows
+    against a queue ceiling of 100. One job = one batch."""
+    model_config = ConfigDict(extra="forbid")
+
+    # A run id is a short slug, not a path: it becomes a filename under `RUN_DIR`
+    # (`workers.payload_for`), and `/../../pwned` in a JSON body used to reach the
+    # filesystem two directories above it, with `mkdir(parents=True)` happily
+    # building the way there. Anchored, so partial matches (`re.search` semantics)
+    # cannot slip a "/" in past the end; charset excludes it and ".." outright, a
+    # leading dash, and a null byte, and the length ceiling stops an absurd one.
+    # `workers.payload_for` repeats the check against the resolved path — defense
+    # in depth for any future non-HTTP caller of the same helper (`10 §BLOCKER 1`).
+    run_id: str = Field(..., pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+                        description="Дедуп-ключ задания, как `arxiv_id` у /fetch. "
+                                    "Короткий слаг: [A-Za-z0-9][A-Za-z0-9_.-]{0,63}, "
+                                    "не путь.")
+    task_id: str | None = None
+    mutants: list[MutantIn] = Field(..., min_length=1)
+    # §2.4: order is descending |delta|, so a truncated load still keeps the most
+    # informative mutants; `limit`/`min_abs_delta` are the two filters that decide
+    # WHICH slice survives an interrupted or deliberately partial load. Absent from
+    # the wire before this round — `RunRequest` had no field for either, so a
+    # caller could never ask for "only the top 50 by |delta|" over HTTP, only the
+    # CLI (`runlog.main`) could. Both ride in the SAME body `payload_for` writes to
+    # disk, so `_stage_run` reads them back off `payload["limit"]`/
+    # `payload["min_abs_delta"]` with no second field to keep in sync.
+    limit: int | None = Field(
+        None, gt=0, description="Оставить только первые N мутантов по убыванию |delta| "
+                                "после отсева и min_abs_delta (§2.4). Отсутствует — "
+                                "конвертируются все прошедшие отсев.")
+    min_abs_delta: float = Field(
+        0.0, ge=0.0, description="Мутант с |fitness_delta| меньше порога в конверсию "
+                                 "не попадает (§2.4); отсев считается отдельным числом "
+                                 "в отчёте (`dropped_min_delta`), не молчит.")
 
 
 class FetchRequest(BaseModel):
@@ -350,6 +461,33 @@ class Phase2Request(BaseModel):
                               description="First N sources of the remaining staging.")
 
 
+class TrustRequest(BaseModel):
+    """An on-demand judging pass (`13` §3.3, finding of the 2026-07-31 review):
+    `trust.run_pass`, queued like phase1/phase2 rather than blocking like
+    `/admin/reindex` — a pass is dozens of 35B calls, the same cost profile phase 2's
+    own end-of-pass step already has.
+
+    Exists because an idea ingested before the judge existed has `dirty=0` and can
+    never appear in the ordinary sweep's worklist (`dirty_ideas()`) on its own —
+    nothing ever raises its flag. `idea_ids` names it directly, bypassing that list
+    rather than adding a second way to decide it.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    idea_ids: list[str] | None = Field(
+        None, description="Ideas to (re)judge regardless of their dirty flag. Omit to "
+                          "judge whatever is already dirty instead — the same worklist "
+                          "phase 2's own end-of-pass step reads, just run now rather "
+                          "than deferred to the next ingest.")
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.idea_ids is not None and not self.idea_ids:
+            raise ValueError("idea_ids is empty: name at least one id, or omit the "
+                             "field entirely to judge whatever is already dirty")
+        return self
+
+
 class JobOut(BaseModel):
     """One ingest run.
 
@@ -364,7 +502,7 @@ class JobOut(BaseModel):
     # served, and `/ingest/jobs` dies later on response validation — a 500 on the only
     # operator view of an ingest that is in fact healthy, for every record until the
     # slot log evicts it.
-    kind: Literal["fetch", "phase1", "phase2", "reindex", "vault-export"]
+    kind: Literal["fetch", "run", "phase1", "phase2", "reindex", "vault-export", "trust"]
     # `queued` and `staged` are `/fetch`'s, and they are separate statuses rather than
     # one "running" with a note: queued means no worker has taken it, staged means
     # phase 1 is done and the article is parsed but the single writer has not linked it

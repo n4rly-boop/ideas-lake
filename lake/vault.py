@@ -575,7 +575,7 @@ type: "idea"
 id: "{first.id}"
 leaves: 2
 sources: 1
-trust_score: 0.6931
+trust_score: 0.0
 rederived_at_leaf_count: 0
 ---
 

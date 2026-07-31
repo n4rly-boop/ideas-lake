@@ -138,14 +138,28 @@ def _chunks(rows: list, size: int = BATCH):
 def push(payload: dict, wipe: bool = False) -> dict:
     from neo4j import GraphDatabase
 
+    from .neo4j_store import _require_local_target
+
     missing = [name for name in ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD")
                if not os.environ.get(name)]
     if missing:
         raise SystemExit(f"not in the environment: {', '.join(missing)}")
 
-    driver = GraphDatabase.driver(os.environ["NEO4J_URI"],
-                                  auth=(os.environ["NEO4J_USERNAME"],
-                                        os.environ["NEO4J_PASSWORD"]))
+    # Captured once and reused for both the guard and the driver below, so the two
+    # can never diverge the way a re-read of `os.environ` could (`13` MAJOR 4).
+    uri = os.environ["NEO4J_URI"]
+    if wipe:
+        # BLOCKER (second round): this was the one reachable place `--wipe` ran
+        # with NO target guard at all — `neo4j_store.migrate(wipe=True)` has zero
+        # callers, this script is what an operator actually runs, and
+        # `.env.local.example` points `NEO4J_*` straight at Aura, block B's
+        # database. Reusing `neo4j_store`'s guard (not a second copy of it) means
+        # `--wipe` here can now only ever hit the lake's own local instance —
+        # never Aura, never "whatever the environment happens to name" (07:79).
+        _require_local_target(uri)
+
+    driver = GraphDatabase.driver(uri, auth=(os.environ["NEO4J_USERNAME"],
+                                             os.environ["NEO4J_PASSWORD"]))
     written = {}
     try:
         with driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
@@ -209,6 +223,29 @@ def demo() -> None:
     refuses(Thesis, {**full_leaf, "vector": None}, "vector")
     refuses(Idea, {**full_idea, "vector": None}, "vector")
     print("ok: nested -> JSON, None dropped, False kept, every required field demanded")
+
+    # BLOCKER (second round): push(wipe=True) used to have no target guard at
+    # all — the reachable destructive path, since neo4j_store.migrate(wipe=True)
+    # has zero callers. Verified without a live connection: the guard runs
+    # before the driver is even built, so a fake Aura-shaped URI must refuse
+    # before any network call is attempted (no seeded database at risk here).
+    saved = {k: os.environ.get(k) for k in ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD")}
+    os.environ["NEO4J_URI"] = "neo4j+s://deadbeef00.databases.neo4j.io"
+    os.environ["NEO4J_USERNAME"] = "x"
+    os.environ["NEO4J_PASSWORD"] = "x"
+    try:
+        push({"Source": [], "Thesis": [], "Idea": [], "edges": []}, wipe=True)
+    except RuntimeError as exc:
+        assert "deadbeef00" in str(exc), exc
+    else:
+        raise AssertionError("push(wipe=True) against a non-local URI must refuse, not wipe")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("ok: push(wipe=True) refuses a non-local NEO4J_URI before connecting (BLOCKER)")
     print("neo4j_load self-check OK — nothing connected, nothing written")
 
 

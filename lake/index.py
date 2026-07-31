@@ -172,6 +172,37 @@ def index_theses(theses: list[Thesis], db=INDEX_DB) -> None:
         _MATS.pop(str(db), None)  # invalidate the in-memory matrix
 
 
+def fts_count(db=INDEX_DB) -> int:
+    """Rows actually searchable via BM25 — kept apart from `count()` (§6.19's own
+    before/after bookkeeping) so a `thesis_fts` dropped or emptied outside this
+    module shows up on its own. `_insert` always writes both tables in the same
+    transaction (§3.5 DDL comment), so the two counts diverging is never a smaller
+    corpus — it is one of them touched directly, and the caller here is `ops.health`
+    (§6.19), not the search path itself."""
+    with _LOCK:
+        return _con(db).execute("SELECT count(*) FROM thesis_fts").fetchone()[0]
+
+
+def _assert_fts_consistent(con: sqlite3.Connection) -> None:
+    """`idx_thesis` and `thesis_fts` must hold exactly the same row count (see
+    `fts_count`). A gap means `thesis_fts` (or `idx_thesis`) was dropped or
+    truncated outside this module — 2026-07-31 review: a query against the
+    survivor used to answer with whatever it still had (BM25 alone if `idx_thesis`
+    empties, cosine alone if `thesis_fts` empties) and nothing raised, so the
+    hybrid silently degraded and `/healthz` (indexed vs. store leaves) never
+    looked at `thesis_fts` at all to notice. `sqlite3.DatabaseError` — a
+    `sqlite3.Error` subclass — so the existing STORE_ERRORS handler answers 503
+    without either route needing to know this check exists (`app.py`).
+    """
+    n_idx = con.execute("SELECT count(*) FROM idx_thesis").fetchone()[0]
+    n_fts = con.execute("SELECT count(*) FROM thesis_fts").fetchone()[0]
+    if n_idx != n_fts:
+        raise sqlite3.DatabaseError(
+            f"index corrupt: idx_thesis has {n_idx} rows, thesis_fts has {n_fts} — "
+            "one of the two was touched outside lake.index (dropped or truncated); "
+            "POST /admin/reindex (§6.19)")
+
+
 def search_theses(query: str, k: int, query_vec=None, db=INDEX_DB) -> list[dict]:
     """Hybrid BM25 + cosine, fused with RRF k=60 (§5.2).
 
@@ -184,6 +215,7 @@ def search_theses(query: str, k: int, query_vec=None, db=INDEX_DB) -> list[dict]
     qv = np.asarray(query_vec, dtype=np.float32)
     with _LOCK:
         con = _con(db)
+        _assert_fts_consistent(con)
         rowids, mat = _matrix(db, con)
         bm25_ids = bm25_search(con, query, k)
         vec_ids = [rowids[i] for i in cosine_search(mat, qv, k)]
@@ -421,6 +453,23 @@ def demo() -> None:
         assert count(db=db) == 5
         assert search_theses("graph databases", 5, query_vec=query_vec, db=db), \
             "index must be searchable right after a rebuild"
+
+        # 2026-07-31 finding: a `thesis_fts` dropped or emptied outside this module
+        # (the file mutated directly, or a corrupted rebuild) used to answer with
+        # whatever the surviving table still had — cosine alone, no exception, no
+        # sign anywhere that the hybrid had quietly become a different search.
+        assert fts_count(db=db) == count(db=db) == 5
+        con.execute("DELETE FROM thesis_fts")
+        con.commit()
+        assert fts_count(db=db) == 0 and count(db=db) == 5, \
+            "fixture broken: idx_thesis must still hold its 5 rows"
+        try:
+            search_theses("graph databases", 5, query_vec=query_vec, db=db)
+        except sqlite3.DatabaseError as exc:
+            assert "idx_thesis has 5 rows, thesis_fts has 0" in str(exc), exc
+        else:
+            raise AssertionError("thesis_fts emptied out from under idx_thesis "
+                                 "must raise, not silently answer on cosine alone")
 
         _CONNS.pop(str(db)).close()
 

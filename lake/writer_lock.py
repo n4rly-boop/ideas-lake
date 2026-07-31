@@ -20,6 +20,20 @@ instead of locking again.
 NOT this module's job: two threads of one process. `jobs.exclusive` is that guard —
 one slot, claimed and released in the same frame — and this one would let them both
 through on the same depth counter.
+
+**Stopped binding all writers once the store moved off this disk (`13` §4.4 p2).**
+`flock` is a guarantee about *this machine*: two processes on the same host,
+racing for the same open file, and one of them loses. The store `graph_client`
+now writes through is Bolt over the network (`13` §4) — reachable from anywhere
+that can open a TCP connection to it, not only from whatever host holds
+`data/writer.lock`. A second writer process on a different machine, pointed at
+the same `NEO4J_URI`, never touches this file and never finds out this lock
+exists; it opens two ideas under one mechanism exactly like the two-processes
+case this module was built to stop (§4.5), and nothing here can see it happen.
+This is a known limitation, not a bug to route around here: the fix is a lock
+that lives where the store does (a lease row in Neo4j, an advisory lock the
+driver takes), and it is out of scope for this file, which only ever promised
+"on one host".
 """
 import contextlib
 import errno
