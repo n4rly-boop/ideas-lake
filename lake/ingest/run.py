@@ -710,6 +710,19 @@ def selfcheck() -> int:
 
     import numpy as np
 
+    # The canary this module runs before every phase (lines 51, 194-195) must never be
+    # stricter than the steps it gates. It was 30s against `link`'s 60s and `trust`'s
+    # 90s, and on 2026-07-31 a 35B pool busy with our own cost ablation answered a
+    # 4-token request in 32.5s: the canary timed out, the queue retried three times,
+    # and every article came back `failed` with nothing having been attempted. Static
+    # and offline on purpose — the skew is a constant, so no live server is needed to
+    # see it, and the failure it causes only appears when the pool is slow.
+    from . import trust
+    assert llm.CANARY_TIMEOUT_S >= trust.TIMEOUT_S, (
+        f"canary timeout {llm.CANARY_TIMEOUT_S}s is shorter than the trust step's "
+        f"{trust.TIMEOUT_S}s it gates: a slow pool would fail runs that would pass"
+    )
+
     from .. import neo4j_store
     from ..models import (EMBED_DIM, Idea, Section, Thesis, new_idea_id,
                           new_thesis_id, source_id as make_source_id)

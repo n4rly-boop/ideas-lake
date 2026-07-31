@@ -127,17 +127,35 @@ def complete(prompt: str, *, system: str, schema: dict, op: str, max_tokens: int
                    f"{type(last_error).__name__}: {last_error}") from last_error
 
 
+CANARY_TIMEOUT_S = 90.0
+"""As long as the slowest step the canary gates — never shorter.
+
+It was 30s, which is less than `link`'s 60s and `trust`'s 90s, and that skew is a
+defect on its own: a gate stricter than what it guards fails runs the guarded steps
+would have completed. Measured 2026-07-31, with our own `tools/cost_ablation`
+occupying all eight llama slots on the 35B pool, a 4-token request to
+`82.202.156.206:8080` took 32.5s — so the canary timed out by ~2.5s, both `ATTEMPTS`,
+and the fetch job died after three queue retries reporting `canary ... TimeoutError`.
+Every article looked rejected while nothing had been attempted.
+
+Raise this with `trust.TIMEOUT_S`, not on its own.
+"""
+
+
 def assert_grammar_works(model) -> None:
     """Canary. Raises if the server silently ignores the schema.
 
     One call catches all three causes of a silent ignore at once: the flat
     `response_format`, unquenched thinking and a schema dropped on the floor
     (probe-results.md:38-43). Run at the start of every run, per model used.
+
+    The timeout is `CANARY_TIMEOUT_S`, deliberately as generous as the real steps:
+    a slow pool must delay a run, not fail it before the first real call.
     """
     out = complete("Say hello in one sentence.",
                    system="Answer with JSON matching the schema.",
-                   schema=CANARY_SCHEMA, op="canary", max_tokens=64, timeout=30,
-                   model=model)
+                   schema=CANARY_SCHEMA, op="canary", max_tokens=64,
+                   timeout=CANARY_TIMEOUT_S, model=model)
     if out.get("canary") != "llamacpp":
         raise LLMError(f"canary failed on {model[0]}: schema ignored, got {out!r}")
 
