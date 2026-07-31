@@ -53,6 +53,42 @@ from typing import get_args
 
 from .models import Idea, Source, Thesis
 
+# --------------------------------------------------------------------- timeouts
+# 2026-07-31 finding (live prod, stopped Neo4j container): POST /retrieve answered
+# the right 503 — but only after 120+ seconds. Root cause, read off the driver
+# source (`neo4j` 6.2, `_sync/work/session.py::_run_transaction`, the code every
+# `execute_read`/`execute_write` call below goes through): a managed transaction
+# retries a `ServiceUnavailable`, but only checks the `max_transaction_retry_time`
+# budget AFTER a full attempt has already completed — the retry timer starts the
+# instant the FIRST attempt fails, so `elapsed since timer start` is ~0 right then
+# and never exceeds a positive budget, which means at least a SECOND full attempt
+# always happens no matter how small that budget is. With the driver's own
+# defaults (`connection_acquisition_timeout`=60s, `max_transaction_retry_time`=30s)
+# one failed attempt alone can burn 60s, two of them are 120s, and the 30s retry
+# budget only gets checked (and only stops a THIRD attempt) after that — exactly
+# the "several attempts to resolve the name and connect" this finding describes.
+#
+# `/retrieve` is the hot path block C polls in a 12h loop (`08:293`) — a slow 503
+# there is worse than a fast one the caller can retry itself next cycle, so reads
+# get a short acquisition window and NO retry budget (`0.0`: per the math above,
+# any positive number still forces a second full attempt, so `0.0` is the only
+# value that actually caps a read at one attempt). Writes (phase 2 batch insert,
+# the judge's `set_trust`, `split_idea`) keep the driver's own patience instead —
+# aborting a batch on one transient blip is expensive to redo; a slow `/retrieve`
+# reply is not.
+CONNECTION_TIMEOUT = 3.0  # seconds, TCP handshake only — shared by both profiles
+# below (it is a Pool-level setting, fixed at driver construction, `neo4j` has no
+# per-session override). A live Neo4j on the same docker network answers in
+# single-digit milliseconds, so 3s is generous for a live host and tiny next to
+# "several minutes" for a dead one.
+READ_CONNECTION_ACQUISITION_TIMEOUT = 5.0  # seconds; kept above CONNECTION_TIMEOUT
+# per the driver's own guidance (acquisition wraps the connect attempt plus the
+# Bolt handshake, so it must leave room for both).
+READ_MAX_TRANSACTION_RETRY_TIME = 0.0  # no retry — see the timer-math above.
+WRITE_CONNECTION_ACQUISITION_TIMEOUT = 60.0  # the driver's own default, named here
+# so it sits next to the read profile instead of being an invisible library default.
+WRITE_MAX_TRANSACTION_RETRY_TIME = 30.0  # the driver's own default, same reason.
+
 # --------------------------------------------------------------------- connection
 
 _lock = threading.Lock()
@@ -99,7 +135,16 @@ def _get_driver():
         auth = (user, password) if user else None
         with _lock:
             if _driver is None:
-                _driver = GraphDatabase.driver(uri, auth=auth)
+                # `connection_timeout` is Pool-level (this call only) — session-level
+                # `connection_acquisition_timeout`/`max_transaction_retry_time` are set
+                # to the READ (fast-fail) profile here as the driver-wide default, since
+                # this same driver also opens the constraint-check session right below,
+                # which does not go through `_session()`'s write override. Writes ask
+                # for the patient profile explicitly, per call, in `_session(write=True)`.
+                _driver = GraphDatabase.driver(
+                    uri, auth=auth, connection_timeout=CONNECTION_TIMEOUT,
+                    connection_acquisition_timeout=READ_CONNECTION_ACQUISITION_TIMEOUT,
+                    max_transaction_retry_time=READ_MAX_TRANSACTION_RETRY_TIME)
                 _database = os.environ.get("NEO4J_DATABASE", "neo4j")
                 _uri = uri  # snapshot at connection time, see the module-level comment
     if not _schema_ready:
@@ -112,7 +157,16 @@ def _get_driver():
     return _driver
 
 
-def _session():
+def _session(*, write: bool = False):
+    """`write=True` (batch inserts, `set_trust`, `split_idea`, the two edge writers)
+    gets the patient profile — worth the wait, an aborted batch is expensive to
+    redo. Every other caller is on `/retrieve`'s read path or close to it and gets
+    the driver's fast-fail default (module timeouts section above)."""
+    if write:
+        return _get_driver().session(
+            database=_database,
+            connection_acquisition_timeout=WRITE_CONNECTION_ACQUISITION_TIMEOUT,
+            max_transaction_retry_time=WRITE_MAX_TRANSACTION_RETRY_TIME)
     return _get_driver().session(database=_database)
 
 
@@ -244,7 +298,7 @@ def _leaf_out(t: dict, s: dict, idea_id: str | None) -> dict:
 
 def write_source(src: Source) -> str:
     row = _source_row(src)
-    with _session() as session:
+    with _session(write=True) as session:
         def txn(tx):
             # `seq` assigned once, at first creation, and kept across re-fetches of
             # the same (url, version) — a MERGE that reassigned it on every upsert
@@ -292,13 +346,13 @@ def write_theses(source_id: str, theses: list[Thesis]) -> list[str]:
             _mark_dirty(tx, idea_id, True)
         return ids
 
-    with _session() as session:
+    with _session(write=True) as session:
         return session.execute_write(txn)
 
 
 def create_idea(idea: Idea) -> str:
     row = _idea_row(idea)
-    with _session() as session:
+    with _session(write=True) as session:
         def txn(tx):
             row["seq"] = _next_seq(tx)
             tx.run("CREATE (n:Idea $row)", row=row).consume()
@@ -325,7 +379,7 @@ def create_idea_with_theses(idea: Idea | None, source_id: str, theses: list[Thes
             _mark_dirty(tx, idea_id, True)
         return ids
 
-    with _session() as session:
+    with _session(write=True) as session:
         return session.execute_write(txn)
 
 
@@ -361,7 +415,7 @@ def _update_idea(tx, idea_id: str, fields: dict) -> None:
 
 
 def update_idea(idea_id: str, fields: dict) -> None:
-    with _session() as session:
+    with _session(write=True) as session:
         session.execute_write(lambda tx: _update_idea(tx, idea_id, fields))
 
 
@@ -413,14 +467,14 @@ def split_idea(parent_id: str, parent_fields: dict,
                 "MERGE (new)-[:HAS_LEAF]->(t)",
                 ids=thesis_ids, new_id=idea.id).consume()
 
-    with _session() as session:
+    with _session(write=True) as session:
         session.execute_write(txn)
 
 
 def set_trust(idea_id: str, score: float) -> None:
     if not 0.0 <= score <= 1.0:
         raise ValueError(f"trust_score out of [0, 1]: {score!r}")
-    with _session() as session:
+    with _session(write=True) as session:
         session.execute_write(lambda tx: _update_idea(
             tx, idea_id, {"trust_score": float(score), "dirty": False}))
 
@@ -886,7 +940,7 @@ def write_cocitation_edges(source_id: str, min_ideas: int = DEFAULT_MIN_IDEAS,
     it possible; `_write_cocite_pair` guarantees that case leaves neither
     direction written (BLOCKER 3).
     """
-    with _session() as session:
+    with _session(write=True) as session:
         pairs = session.execute_read(lambda tx: [
             dict(r) for r in tx.run(_COCITE_PAIRS, source_id=source_id, min_ideas=min_ideas)])
 
@@ -935,7 +989,7 @@ def write_derived_from_edges(child_id: str, parent_ids: list[str],
     # response (review, 2026-07-31). The locator convention itself (`13` §6) is unchanged.
     evidence = ["synthesis/" + "+".join(parent_ids)]
     outcomes = []
-    with _session() as session:
+    with _session(write=True) as session:
         for parent_id in parent_ids:
             weight = session.execute_write(lambda tx, p=parent_id: _upsert_related(
                 tx, child_id, p, type_=DERIVED_FROM, note="синтез", query=_DERIVED_UPSERT,
