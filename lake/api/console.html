@@ -1073,18 +1073,76 @@ function layout(nodes, links, w, h, iters = 320) {
   }
 }
 
+const LOOKS_LIKE_ID = /^idea_[0-9a-f]{6,}$/i;
+
+/* Free text -> идеи, через тот же гибридный индекс, что и read path: BM25 + косинус,
+   слитые RRF (`GET /search`). Не `/retrieve`: тот тратит вызов 9B на rewrite и, главное,
+   оставляет строку в `retrieve.jsonl` — а этот лог и есть замер A/B, операторская
+   навигация по графу в нём загрязнение.
+
+   Поиск идёт по ТЕЗИСАМ, поэтому найденное — идея-родитель лучшего листа, а не
+   ближайшая по своему тексту идея. Векторов идей в браузере нет и энкодера тут нет,
+   так что честнее так и сказать в интерфейсе, чем сделать вид, что сравниваем идеи. */
+async function resolveIdea(text, k = 12) {
+  if (LOOKS_LIKE_ID.test(text)) return { id: text, exact: true, candidates: [] };
+  const hits = await api(`/search?q=${encodeURIComponent(text)}&k=${k}`);
+  const candidates = [];
+  for (const hit of hits) {
+    if (candidates.some((c) => c.id === hit.idea_id)) continue;
+    candidates.push({ id: hit.idea_id, score: hit.score, bm25: hit.bm25_rank,
+                      vec: hit.vec_rank, thesis: hit.thesis_id });
+  }
+  return { id: candidates.length ? candidates[0].id : null, exact: false, candidates };
+}
+
+/* Which arm of the hybrid found this row. `—` in one column is not a detail: a hit the
+   vector arm alone returned is a semantic match, and one only BM25 returned is a word
+   match — the operator picking a root should see which they are getting. */
+function armBadge(candidate) {
+  const both = candidate.bm25 !== null && candidate.vec !== null;
+  const label = both ? "слова + смысл" : candidate.vec !== null ? "смысл" : "слова";
+  return el("span", { class: "badge", title:
+    `BM25 rank ${candidate.bm25 ?? "—"} · vector rank ${candidate.vec ?? "—"} · RRF ${candidate.score.toFixed(5)}` },
+    label);
+}
+
 view("graph", "Граф", (host) => {
   const statusHost = el("div"), wrap = el("div", { class: "graphwrap" }), info = el("div");
-  const seed = el("input", { class: "mono grow", placeholder: "idea_… (пусто = всё озеро)" });
+  const picks = el("div", { class: "legend wrap", style: "margin-top:10px" });
+  const seed = el("input", { class: "grow", placeholder: "запрос словами, или idea_… (пусто = всё озеро)" });
   const hops = el("select", {}, ...[1, 2, 3].map((n) => el("option", {}, n)));
   const minW = el("input", { type: "number", min: 0, step: 1, placeholder: "любой" });
   const cap = el("input", { type: "number", min: 10, max: 400, value: 200 });
 
-  async function draw() {
-    const rootId = seed.value.trim();
+  // Two draws can be in flight — a whole-lake sweep takes 261 requests, an ego graph a
+  // handful — and without this the slow one lands last and overwrites the picture the
+  // operator actually asked for, status line included. Every await re-checks its turn.
+  let generation = 0;
+
+  async function draw(forcedRoot) {
+    const mine = ++generation;
+    const stale = () => mine !== generation;
+    const typed = (forcedRoot || seed.value).trim();
     const limit = Math.min(200, Math.max(10, Number(cap.value) || 200));
     const params = new URLSearchParams({ hops: hops.value });
     if (minW.value) params.set("min_weight", minW.value);
+    picks.replaceChildren();
+
+    let rootId = "", found = null;
+    if (typed) {
+      found = await run(statusHost, "ищу корень по смыслу…", () => resolveIdea(typed));
+      if (stale()) return;
+      if (!found) return;
+      if (!found.id) {
+        // NOT a fall-through to the whole lake: drawing 200 unrelated ideas after a
+        // query that matched nothing would look like the search had worked.
+        wrap.replaceChildren();
+        setStatus(statusHost, "warn", 200, `индекс ничего не нашёл по «${typed}» — корня нет, `
+          + "граф не построен. Пустое поле нарисует всё озеро.");
+        return;
+      }
+      rootId = found.id;
+    }
 
     const data = await run(statusHost, rootId ? "тяну окрестность идеи…"
       : "тяну идеи и рёбра каждой из них…", async () => {
@@ -1118,7 +1176,7 @@ view("graph", "Граф", (host) => {
       return { bodies, edges, total: page.total, shown: bodies.size,
                truncated: page.total > bodies.size };
     });
-    if (!data) return;
+    if (stale() || !data) return;
 
     const nodes = [...data.bodies.values()].map((idea) => ({
       id: idea.id, idea, r: 4 + 1.5 * Math.sqrt(Math.max(0, idea.theses.length - 1)) }));
@@ -1134,10 +1192,48 @@ view("graph", "Граф", (host) => {
     setStatus(statusHost, data.truncated ? "warn" : "ok", 200, rootId
       ? `окрестность: ${nodes.length} узлов, ${links.length} связей на ${hops.value} хоп(а); `
         + `в озере всего ${fmt(LAST_STATS ? LAST_STATS.ideas : data.total)} идей`
+        + (found && !found.exact
+            ? `. Корень выбран по смыслу: «${typed}» → ${rootId}, лучший из `
+              + `${found.candidates.length} идей в ответе индекса`
+            : "")
+        + (links.length === 0
+            ? ". Рёбер у неё нет: co-citation возникает, только когда два листа пришли из "
+              + "одного источника — больше хопов тут не помогут, попробуй другое совпадение ниже"
+            : "")
       : `узлов ${nodes.length} из ${fmt(data.total)} идей в озере, связей ${links.length}`
         + (data.truncated
             ? ` — СПИСОК ОБРЕЗАН до ${nodes.length}: рёбра к идеям вне выборки не нарисованы`
             : " — обрезки нет"));
+
+    // The other candidates stay on screen: the top hit of a hybrid search is a guess,
+    // and the operator is the one who can tell which idea they meant. Rendered AFTER the
+    // graph, deliberately: the labels cost six more requests, and the picture must not
+    // wait on a convenience.
+    const drawPicks = async () => {
+    if (found && !found.exact && found.candidates.length > 1) {
+      const shortlist = found.candidates.slice(0, 6);
+      // The ids are hex; what the operator recognises is the text. Bodies of candidates
+      // outside the drawn neighbourhood are not on hand, so they are fetched — six
+      // requests, through the same pool, and a failure costs that one label, not the row.
+      const missing = shortlist.filter((c) => !data.bodies.has(c.id)).map((c) => c.id);
+      const labels = new Map([...data.bodies].map(([id, body]) => [id, body.text]));
+      for (const [id, body] of await pool(missing, (id) =>
+          api(`/ideas/${encodeURIComponent(id)}`).catch(() => null)))
+        if (body) labels.set(id, body.text);
+      if (stale()) return;
+      picks.append(el("span", { class: "dim" }, "другие совпадения индекса:"));
+      for (const candidate of shortlist) {
+        const text = labels.get(candidate.id);
+        picks.append(el("button", {
+          class: "ghost sm",
+          style: candidate.id === rootId ? "border-color:var(--s2);color:var(--ink)" : null,
+          title: `${candidate.id}\n${text || "(текст не прочитан)"}`,
+          onclick: () => draw(candidate.id),
+        }, candidate.id === rootId ? "● " : "", text ? cut(text, 64) : candidate.id),
+          armBadge(candidate));
+      }
+    }
+    };
 
     // Everything below is rendering, and a throw here used to leave an empty box under
     // a green "200" — the picture missing while the status said it arrived. Same class
@@ -1191,6 +1287,7 @@ view("graph", "Граф", (host) => {
     }
     svg.append(gEdges, gNodes, gLabels);
     wrap.replaceChildren(svg);
+    drawPicks();                     // not awaited: the graph is already on screen
     } catch (err) {
       wrap.replaceChildren();
       setStatus(statusHost, "err", null,
@@ -1202,17 +1299,23 @@ view("graph", "Граф", (host) => {
   host.replaceChildren(
     el("div", { class: "panel" },
       el("h2", {}, "Граф идея—идея"),
+      el("p", { class: "help" }, "Корень задаётся словами, а не id: текст уходит в тот же "
+        + "гибридный индекс, что и read path (BM25 + косинус, слитые RRF), и корнем берётся "
+        + "идея лучшего попадания. Поиск идёт по тезисам, поэтому это идея-родитель "
+        + "ближайшего листа, а не ближайшая по своему тексту идея. Точный id, если он есть под "
+        + "рукой, тоже принимается. Ничего не нашлось — граф не строится, а не подменяется "
+        + "всем озером."),
       el("p", { class: "help" }, "Рёбра читаются через /ideas/{id}/neighbors — по одной идее за вызов, "
-        + "массового чтения рёбер в API нет. Поэтому «всё озеро» это N+1 запросов: при 225 идеях "
-        + "терпимо, при полном корпусе понадобится отдельная ручка. Раскладка force-directed в "
-        + "браузере, цвет — trust, размер — число листьев."),
+        + "массового чтения рёбер в API нет. Поэтому «всё озеро» это N+1 запросов (по 6 в полёте): "
+        + "при 261 идее терпимо, при полном корпусе понадобится отдельная ручка. Раскладка "
+        + "force-directed в браузере, цвет — trust, размер — число листьев."),
       el("div", { class: "row" },
-        el("label", { class: "f grow" }, "корневая идея", seed),
+        el("label", { class: "f grow" }, "корень: запрос или id", seed),
         el("label", { class: "f" }, "хопов", hops),
         el("label", { class: "f" }, "min_weight", minW),
         el("label", { class: "f" }, "идей максимум", cap),
-        el("button", { class: "act", onclick: draw }, "Нарисовать")),
-      statusHost,
+        el("button", { class: "act", onclick: () => draw() }, "Нарисовать")),
+      statusHost, picks,
       el("div", { class: "legend" },
         el("span", {}, el("span", { class: "ramp" },
           ...TRUST_RAMP.map((c) => el("i", { style: "background:" + c }))), " trust 0.0 → 0.8"),
@@ -1221,7 +1324,10 @@ view("graph", "Граф", (host) => {
           " размер — число листьев"),
         el("span", { class: "dim" }, "клик по узлу — карточка идеи ниже"))),
     wrap, el("div", { style: "height:14px" }), info);
-  draw();
+  // Nothing is drawn on mount on purpose: the whole-lake view is one request per idea,
+  // and spending 261 of them because a tab was opened is not a default anybody asked for.
+  setStatus(statusHost, "", null, "Введи запрос словами — корень найдётся по смыслу. "
+    + "Пустое поле нарисует всё озеро, и это по одному запросу на идею.");
 });
 
 /* ------------------------------------------------------------------- 8. raw */
