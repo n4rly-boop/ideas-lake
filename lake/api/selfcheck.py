@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 from fastapi.testclient import TestClient
 
-from .. import (graph_client, index, ops, queue, stub_store, trace, vault as vault_mod,
+from .. import (graph_client, index, neo4j_store, ops, queue, trace, vault as vault_mod,
                 writer_lock)
 from .. import models as models_mod
 from ..ingest import run as run_mod
@@ -91,7 +91,13 @@ def _fixture(tmp: Path) -> dict:
     return made
 
 
-def main() -> None:
+def main() -> int:
+    """Exit code, not `None`: `SKIPPED` (no Neo4j) and `REFUSED` (not empty) must
+    both leave a nonzero code behind them, or `if __name__ == "__main__": main()`
+    reads the process's own $? as 0 regardless — a check that never ran a single
+    assertion looking exactly like one that ran and passed, in CI or by hand.
+    D11 made this reachable for the first time: before it, the isolated fixture
+    store meant nothing could ever skip or refuse in the first place."""
     before = _fingerprint()
     tmp = Path(tempfile.mkdtemp(prefix="lake-api-selfcheck-"))
     idx = tmp / "index.db"
@@ -114,7 +120,7 @@ def main() -> None:
     bind(ops, "STAGING", tmp / "staging.jsonl")
     bind(ops, "STAGING_CURSOR", tmp / "staging.cursor")
     bind(ops, "PENDING_LINK", tmp / "pending_link.jsonl")
-    # `queue.py`'s own db, not a table in `stub_store`'s (queue.py:1-30) — bound the
+    # `queue.py`'s own db, not part of format B (queue.py:1-30) — bound the
     # same way, or `_fingerprint()` catches this check writing to the real
     # `data/jobs.db` the moment any test touches `/fetch` or the durable queue.
     bind(queue, "DB", tmp / "jobs.db")
@@ -130,9 +136,36 @@ def main() -> None:
     bind(vault_mod, "export", functools.partial(vault_mod.export, dest=tmp / "vault"))
     # Every graph call is @trace'd, and trace appends to TRACES_DIR/<run_id>.jsonl.
     bind(trace, "TRACES_DIR", tmp / "traces")
-    if stub_store._conn is not None:      # a live handle on the real lake: closed, not dropped
-        stub_store._conn.close()
-    real_db, stub_store._db_path, stub_store._conn = stub_store._db_path, tmp / "lake.db", None
+    # D11 removed the isolated store this check used to swap in (a fresh SQLite
+    # file). Neo4j has no equivalent disposable target, so the fixture below is
+    # written into whatever `NEO4J_URI` names for real — guarded by the same two
+    # checks `neo4j_store`'s own self-check uses: the host must be local/scratch
+    # (`neo4j_store._require_local_target`) and the graph must be confirmed empty
+    # (`MATCH (n)`, not just the labels this file reads) before anything is written.
+    # Everything is wiped again in the `finally`, safe exactly because the
+    # emptiness was already confirmed.
+    # BLOCKER (review 2026-07-31): checked `os.environ.get("NEO4J_URI")` here and
+    # unconditionally `DETACH DELETE`d below — one variable checked, a different
+    # one (whatever the driver connected with, possibly set before an env change)
+    # wiped. `_get_driver()` first, then the URI it actually snapshotted
+    # (`neo4j_store._uri`), same as `lake.selfcheck._wipe_graph`.
+    try:
+        neo4j_store._get_driver()  # so `_uri` below reflects what the driver really used
+        neo4j_store._require_local_target(neo4j_store._uri)
+        with neo4j_store._session() as _s:
+            _existing = _s.execute_read(
+                lambda tx: tx.run("MATCH (n) RETURN count(n) AS c").single()["c"])
+    except graph_client.STORE_ERRORS as exc:
+        print(f"SKIPPED: no Neo4j reachable at {os.environ.get('NEO4J_URI')} "
+              f"({type(exc).__name__}: {exc}). Bring one up with "
+              "`docker compose up -d neo4j` and rerun.")
+        return 1
+    if _existing:
+        print(f"REFUSED: the graph is not empty ({_existing} node(s) total) — this "
+              "self-check only ever runs against an empty scratch instance, never one "
+              "that might hold data it did not create. Point NEO4J_URI at an empty "
+              "instance and rerun.")
+        return 1
 
     # `RUN_DIR` is the converter's own addition to `lake.models` (`13` build note 2),
     # landing in a parallel change. Bound the normal way if it is already there; set
@@ -219,9 +252,10 @@ def main() -> None:
         if con is not None:
             con.close()
         index._MATS.pop(str(idx), None)
-        if stub_store._conn is not None:
-            stub_store._conn.close()
-        stub_store._db_path, stub_store._conn = real_db, None
+        # The graph was confirmed empty above, so wiping it outright on the way out
+        # cannot touch anything this run did not itself write.
+        with neo4j_store._session() as _s:
+            _s.execute_write(lambda tx: tx.run("MATCH (n) DETACH DELETE n").consume())
         jobs._reset_for_tests()
         queue.close()          # drop the cached handle on the temp db before it is rmtree'd
         # Compared in the `finally`, not after it. Outside, a failing assertion
@@ -238,6 +272,7 @@ def main() -> None:
     # the report and re-raising would bury the failure the operator came for.
     assert not leaked, f"the self-check wrote to real data/: {leaked}"
     print("api self-check OK — real data/ untouched")
+    return 0
 
 
 def _unexpected(what: str):
@@ -317,6 +352,12 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
     # ------------------------------------------------------------- the real app
     made = _fixture(tmp)
     idea_a, idea_b = made["ideas"]
+    # D14: `_fixture`'s ideas would otherwise sit at the judge's 0.0 default
+    # (unjudged, not "judged and found untrustworthy") — this check is about the
+    # HTTP layer, not the quota (that is `rank.demo`'s job), so both are marked
+    # judged here to keep `/retrieve`'s `via` unaffected by trust_score == 0.
+    for idea_id in made["ideas"]:
+        graph_client.set_trust(idea_id, 0.8)
     client = TestClient(create_app(mock=False, warmup=False, api_key=False, workers=False))
     with client:
         stats = client.get("/stats").json()
@@ -376,8 +417,29 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
         assert client.get(f"/ideas/{idea_a}/theses").status_code == 200
         assert len(client.get(f"/ideas/{idea_a}/theses").json()) == 2
         assert client.get("/ideas/nope/theses").status_code == 404
-        assert client.get(f"/ideas/{idea_a}/neighbors").json() == []      # edges are B's
+        assert client.get(f"/ideas/{idea_a}/neighbors").json() == []      # none written yet
         assert client.get("/ideas/nope/neighbors").status_code == 404
+
+        # D12 review, 2026-07-31: a REAL co-citation edge through this same route used
+        # to 500 on FastAPI response validation — `EdgeOut.evidence` was `str | None`
+        # while `write_cocitation_edges` writes the LIST of contributing source ids
+        # (`neo4j_store._COCITE_UPSERT`). `_fixture`'s `idea_a`/`idea_b` already share
+        # one source (2 leaves / 1 leaf, BLOCKER 2's own shape — not 2 leaves each),
+        # so writing the edge here and hitting `/neighbors` for real is what proves the
+        # schema fix, not just a unit check on the model in isolation.
+        cocite_outcomes = graph_client.write_cocitation_edges(made["source_id"])
+        assert len(cocite_outcomes) == 1 and cocite_outcomes[0]["missing"] is False, \
+            cocite_outcomes
+        answer = client.get(f"/ideas/{idea_a}/neighbors")
+        assert answer.status_code == 200, answer.text     # used to be 500 (review)
+        edges = answer.json()
+        assert len(edges) == 1 and edges[0]["target_id"] == idea_b, edges
+        assert edges[0]["type"] == "related_via_source", edges
+        assert isinstance(edges[0]["evidence"], list) and edges[0]["evidence"] == \
+            [made["source_id"]], edges
+        assert client.get("/stats").json()["edges"] == 2, "one pair, both directions"
+        print("ok: GET /ideas/{id}/neighbors serializes a real co-citation edge instead "
+              "of 500ing on response validation (D12 review, 2026-07-31)")
 
         # --- patch --------------------------------------------------------
         patched = client.patch(f"/ideas/{idea_b}", json={"text": "score cheaply, then pay"}).json()
@@ -410,7 +472,7 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
         except ValueError as exc:
             assert "NULL" in str(exc), exc
         else:
-            raise AssertionError("stub_store.update_idea wrote NULL into a non-nullable field")
+            raise AssertionError("neo4j_store.update_idea wrote NULL into a non-nullable field")
         assert client.patch("/ideas/nope", json={"text": "x"}).status_code == 404
 
         # --- the same two guards without HTTP ------------------------------
@@ -466,8 +528,14 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
                                                 "rewrite": False})
         assert answer.status_code == 200, answer.text
         assert [i["via"] for i in answer.json()["ideas"]] == ["thesis", "thesis"], answer.json()
-        assert len(json.loads(retrieve_api.RETRIEVE_LOG.read_text(encoding="utf-8")
-                              .splitlines()[-1])["returned"]) == 2
+        retrieve_line = json.loads(retrieve_api.RETRIEVE_LOG.read_text(encoding="utf-8")
+                                   .splitlines()[-1])
+        assert len(retrieve_line["returned"]) == 2
+        # D14: both candidates are judged (trusted) above, so k=2's quota (0) never
+        # engages — the log must say so, not just stay silent about it.
+        assert retrieve_line["trust_quota"] == 0, retrieve_line
+        assert (retrieve_line["untrusted_returned"], retrieve_line["untrusted_over_quota"]) \
+               == (0, 0), retrieve_line
 
         # --- 503: a broken store is not an empty answer --------------------
         real_rank = rank_mod.rank
@@ -475,7 +543,9 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
         try:
             dead = client.post("/retrieve", json={"query": "anything", "rewrite": False})
             assert dead.status_code == 503 and set(dead.json()) == {"error", "log_id"}
-            rank_mod.rank = lambda *a, **k: ([], {"returned": [], "cut_off": []})
+            rank_mod.rank = lambda *a, **k: ([], {"returned": [], "cut_off": [],
+                                                  "trust_quota": 0, "untrusted_returned": 0,
+                                                  "untrusted_over_quota": 0})
             empty = client.post("/retrieve", json={"query": "nothing", "rewrite": False})
             assert empty.status_code == 200 and empty.json()["ideas"] == [], empty.json()
         finally:
@@ -1317,10 +1387,9 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
         # A thesis whose source row is gone is invisible to /theses, /ideas and
         # /retrieve. It must be invisible to the counts as well, or /stats and
         # /healthz report `in_sync: false` forever over rows nobody can reach.
-        with stub_store._lock:
-            con = stub_store._c()
-            with con:
-                con.execute("DELETE FROM source WHERE id=?", (made["source_id"],))
+        with neo4j_store._session() as _s:
+            _s.execute_write(lambda tx: tx.run(
+                "MATCH (s:Source {id: $id}) DETACH DELETE s", id=made["source_id"]).consume())
         orphaned = client.get("/stats").json()
         assert orphaned["theses"] == 0 and orphaned["sources"] == 1, orphaned
         assert sorted(orphaned["ideas_without_leaves"]) == sorted(made["ideas"]), orphaned
@@ -1430,4 +1499,4 @@ def _await(client, job_id: str, timeout: float = 10.0) -> dict:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

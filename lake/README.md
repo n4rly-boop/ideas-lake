@@ -46,9 +46,8 @@ Python 3.12. Платных API нет: LLM — серверы школы (llama
 
 Каждый модуль дополнительно исполняем: `python3 -m lake.index`, `python3 -m lake.embed`,
 `python3 -m lake.ingest.link`, `python3 -m lake.ingest.trust`, `python3 -m lake.ingest.runlog`,
-`python3 -m lake.stub_store`, `python3 -m lake.graph_client`, `python3 -m lake.retrieve.rank`
-и т.д. — свой `__main__` self-check без сети (кроме `graph_client`, у которого один пункт
-поднимает недоступный порт `127.0.0.1:1`, тоже без реального Neo4j).
+`python3 -m lake.neo4j_store`, `python3 -m lake.graph_client`, `python3 -m lake.retrieve.rank`
+и т.д. — свой `__main__` self-check. `graph_client` требует живого Neo4j на `bolt://localhost:7687` (т.е. `docker compose` должен быть запущен). `neo4j_store` тоже требует графа. Остальные работают без сети.
 
 **Ключи** читаются из окружения в момент вызова, не на импорте: `LAKE_KEY_9B`, `LAKE_KEY_35B`.
 Без них модули импортируются и не падают на импорте — сколько проверок при этом реально
@@ -66,9 +65,8 @@ lake/
   embed.py          # snowflake-arctic-embed-s, 384d, на CPU
   trace.py          # C5: JSONL-трейс каждого вызова
   index.py          # индекс тезисов: FTS5 + numpy + RRF. Мой навсегда, на Neo4j не едет
-  graph_client.py   # ЕДИНСТВЕННОЕ место, знающее формат B; выбор бэкенда LAKE_STORE=stub|neo4j (`13` §4.1)
-  stub_store.py     # SQLite-бэкенд того же интерфейса — держит офлайновый selfcheck и CI
-  neo4j_store.py    # второй бэкенд: тот же набор функций, Cypher вместо SQL (`13` §4)
+  graph_client.py   # ЕДИНСТВЕННОЕ место, знающее формат B; Neo4j единственный бэкенд (D11, 2026-07-31), NEO4J_URI обязателен
+  neo4j_store.py    # Neo4j-бэкенд: Cypher, пишет рёбра A (cocitation в фазе 2, derived_from при синтезе, D12, 2026-07-31)
   queue.py          # долговечная очередь /fetch и /run: своя SQLite-база data/jobs.db, переживает рестарт
   writer_lock.py    # flock на data/writer.lock: один писатель фазы 2 на озеро, поверх процессов
   selfcheck.py      # assert-проверки офлайн-слоя, один запуск — точный счёт и статус см. §6
@@ -77,8 +75,8 @@ lake/
   vault.py          # выгрузка в Obsidian-vault (спека 11): граф рисует Obsidian, не мы
   neo4j_load.py     # односторонняя заливка в Neo4j блока B; уйдёт, когда B сдаст адаптер
   ingest/  fetch parse generalize link rederive split run trust runlog
-                    # trust.py  — судья 35B: idea + <=16 листьев -> 0..10, пишет через set_trust (`13` §3.3)
-                    # runlog.py — CSV/HTTP-пуш прогона эволюции -> строки staging формата фазы 1 (`13` §2)
+                    # trust.py  — судья 35B: idea + <=16 листьев -> trust_score 0..10, пишет через set_trust (D14, 2026-07-31)
+                    # runlog.py — конвертер логов эволюции GigaEvo: CSV/HTTP -> staging фазы 1 (D14, 2026-07-31)
   retrieve/ rewrite search rank api        # api.py — ядро чтения, без транспорта
   api/     app routes schemas jobs workers selfcheck   # HTTP-слой на всё, единственный сервер
                     # workers.py — пул фазы 1 + единственный писатель фазы 2 поверх queue.py
@@ -154,7 +152,7 @@ lake/
 записанные листья.
 
 **Очередь `/fetch` — `lake/queue.py`, своя SQLite-база `data/jobs.db`, живёт отдельно от
-`stub_store`/`lake.db` и переживает рестарт процесса** (в отличие от словаря `api/jobs.py`,
+графа Neo4j и переживает рестарт процесса** (в отличие от словаря `api/jobs.py`,
 который умирает вместе с процессом). Статусы и переходы:
 
 ```
@@ -257,11 +255,17 @@ POST /retrieve
            → score = norm_score + TRUST_WEIGHT · trust_norm (шкала фиксирована 1.0;
              TRUST_WEIGHT = 0.0 с 2026-07-31 — доверие теперь от судьи и ещё не
              откалибровано, см. §8 п.8)
-           → мало идей → neighbors(hops=1), via="edge" → дозаполнение, via="padding"
+           → отбор сверху вниз, но не более floor(0.2·k) идей с trust_score == 0
+             в выдаче (D14, `TRUST_QUOTA_FRACTION`) — квота, не вес: отсеянные
+             недоверенные не выбрасываются, а ждут внизу на случай нехватки
+           → мало идей → neighbors(hops=1), via="edge" (рёбра реальны с D12) →
+             дозаполнение, via="padding" → если доверенных так и не хватило —
+             добор недоверенными СВЕРХ квоты, а не более короткая выдача
+             (recall-first сильнее квоты); факт добора — в логе
            → cosine_similarity = query_vec · idea.vector (собственный, §1.3) — абсолютный,
              не перенормируется по вызову (см. п.1 ниже)
   → лог в data/logs/retrieve.jsonl: score, raw_score, cosine_similarity, via, cut_off,
-    rewrite_failed, cost
+    rewrite_failed, cost, trust_quota, untrusted_returned, untrusted_over_quota (D14)
 ```
 
 Запрос обязан пройти `fts_escape()` перед `MATCH`: у FTS5 своя грамматика **и неявный AND**,
@@ -299,7 +303,7 @@ POST /retrieve
 | `POST /sources` | upsert: сюда блок C пишет исход прогона. id = f(url, version), повтор заменяет строку. Повтор с другим `title`/`type` → `409`: это провенанс уже записанных листьев |
 | `GET /ideas`, `GET /ideas/{id}` | идеи с листьями; `?include_vector=true` — 384 float, иначе их нет в ответе |
 | `PATCH /ideas/{id}` | правка полей. Меняешь `text` — сервер пересчитывает вектор (§1.3), порознь нельзя |
-| `GET /ideas/{id}/theses`, `/neighbors` | листья и рёбра. Рёбра пусты: это блок B |
+| `GET /ideas/{id}/theses`, `/neighbors` | листья и рёбра. Рёбра — co-citation и derived_from, A пишет в пайплайне (D12, 2026-07-31) |
 | `GET /theses?idea_id&source_id`, `GET /theses/{id}` | листья постранично |
 | `POST /fetch` | одна статья arXiv по ссылке: обе фазы в одном задании, кладёт в очередь (`data/jobs.db`) и отдаёт `202` + задание, статус `queued`. В теле только `url` (`/abs/`, `/pdf/`, `/html/`, версия уважается). Не-arXiv ссылка → `400` на входе, до фетча и трат на LLM; **старый формат id** (`hep-th/9901001`) тоже `400` и с указанием причины: `fetch_metadata` теряет класс архива, и все три пути фетча отвечают 404. Свой `data/fetch/{id}.jsonl`: корпусный файл приёмки не трогается. **Никогда `409`** — слот один на писателя, но у `/fetch` перед ним очередь, а не отказ; дедуп по `arxiv_id` возвращает уже существующее задание вместо второго. Переполнение очереди (`LAKE_QUEUE_MAX`) → `429` + `Retry-After` |
 | `POST /run` | прогон эволюции (GigaEvo) батчем мутантов, тем же путём, что `/fetch` (`13` §2.5): `202` + задание, `queued`, очередь `data/jobs.db`. Тело — `{run_id, task_id?, mutants: [...]}` (`RunRequest`/`MutantIn`, `api/schemas.py`), каждый мутант — `mutation_output` уже разобранным **или** `mutation_output_raw` строкой JSON как в CSV, конвертер разбирает сам. Батч пишется файлом под `data/run/{run_id}.json` (не в `args`: там он эхом уходил бы на каждый опрос `/ingest/jobs`), удаляется только когда фаза 1 приняла его. Дедуп — по `run_id`: повтор той же ссылки/тела возвращает то же задание, а **другое** тело под тем же `run_id`, пока задание живо, — `409` (`DedupConflict`, не как у `/fetch`, где второе тело такого дедупа не бывает). Переполнение очереди → `429` + `Retry-After` |
@@ -384,18 +388,17 @@ neighbors(ids, hops=1, min_weight=None) -> list[dict]
 all_theses() -> list[dict] ; ideas_without_leaves() -> list[str] ; trust_scale() -> float
 dirty_ideas(limit=None) -> list[str]       # dirty=1, старейшие первыми (`13` §3.2)
 set_trust(idea_id, score) -> None          # ЕДИНСТВЕННОЕ место, где dirty снимается
-backend_name() -> "stub" | "neo4j"         # какой бэкенд ответил — для лога и /healthz
+backend_name() -> "neo4j"                  # для лога и /healthz (D11, 2026-07-31)
 get_source(id) ; list_sources(limit, offset) ; list_idea_ids(limit, offset)
 list_theses(idea_id, source_id, limit, offset) ; count_theses(idea_id, source_id) ; get_thesis(id)
 counts() -> {source, idea, thesis, edge}   # постраничное чтение для HTTP-слоя
-# LAKE_STORE=stub|neo4j (умолч. stub) выбирает бэкенд один раз при импорте.
-# Отказ на старте: LAKE_STORE=neo4j без NEO4J_URI; и NEO4J_URI при LAKE_STORE
-# НЕ НАЗВАННОМ ВООБЩЕ (не то же самое, что LAKE_STORE=stub, написанное явно —
-# так выглядит .env.local с NEO4J_URI только для neo4j_load.py, и это легально).
-# NEO4J_URI (обязателен при LAKE_STORE=neo4j, дефолта нет), NEO4J_USERNAME и
-# NEO4J_PASSWORD (умолч. отсутствуют — локальный контейнер поднят с NEO4J_AUTH=none
-# и их игнорирует), NEO4J_DATABASE (умолч. "neo4j") — те же четыре переменные, что
-# уже нужны neo4j_load.py.
+# [D11, 2026-07-31] NEO4J_URI обязателен, SQLite-бэкенд удалён целиком. Отказ на старте,
+# если переменная не задана (новая конфигурация, забыли переменную = падение, не молча).
+# NEO4J_URI (умолч. "bolt://localhost:7687" для локальной разработки, проверяется при импорте),
+# NEO4J_USERNAME и NEO4J_PASSWORD (умолч. отсутствуют — контейнер поднят с NEO4J_AUTH=none),
+# NEO4J_DATABASE (умолч. "neo4j") — это ЧТЕНИЕ (локальное озеро). neo4j_load.py --wipe/push
+# в Aura пишет через ОТДЕЛЬНЫЕ NEO4J_TARGET_URI/USERNAME/PASSWORD/DATABASE (BLOCKER
+# третьего раунда: одна переменная на чтение и запись позволяла залить граф сам в себя).
 # update_thesis НЕТ и не будет: иммутабельность тезиса держится отсутствием метода (§3.4).
 # `split_idea` — не он: §1.2 про то, что сказал ИСТОЧНИК (text, context, effect, locator,
 # text_hash, source_id), а `idea_id` — решение арбитра фазы 2, и оно обязано быть чинибельным,
@@ -518,8 +521,7 @@ workers.POLL_S = float(os.environ["LAKE_QUEUE_POLL_S"] or 1.0)
 | судье на вход идёт вся идея целиком — на идее с 92 листьями (§8 п.3) это упор в контекст и `LLMError` ровно там, где судья нужнее всего | потолок 16 листьев, детерминированный отбор (сначала `run`-листья с исходом, потом по `created_at`); оба числа — `leaves_shown`/`leaves_total` — в трейсе и в ответе (`ingest/trust.py`) |
 | свод судьи без потолка — на большом озере один проход фазы 2 повесится на сотнях вызовов 35B за одним `/fetch` | `LAKE_TRUST_PER_PASS` (умолч. 50); остаток не потерян — остаётся `dirty` и виден числом `trust_deferred`, а не тонет в «doing my best» |
 | `-1000.0` в логе эволюции читается как настоящий провальный фитнес и утаскивает формулу/дельту в минус тысячу на одном мутанте | `DEAD_FITNESS = -1000.0` в `runlog.py`: не участвует ни в `run_success`, ни в `effect`, ни в дельте — отдельный счётчик `dropped_dead` |
-| забытый `LAKE_STORE` рядом с настроенным `NEO4J_URI` (например, унаследованным от `neo4j_load`) тихо пишет в SQLite, а выглядит как рабочий граф | отказ на старте, но только когда `LAKE_STORE` НЕ НАЗВАН ВООБЩЕ — `LAKE_STORE=stub`, написанный явно рядом с тем же `NEO4J_URI`, стартует, это легальный деплой (`graph_client._select_backend`) |
-| Neo4j-бэкенд выбран, а `STORE_ERRORS` собран только из `sqlite3.Error` — недоступный граф отвечает `500` вместо `503` | `STORE_ERRORS` несёт `sqlite3.Error`, `ServiceUnavailable` и `Neo4jError` безусловно, а не по выбранному бэкенду (`graph_client.py`) |
+| **[D11, 2026-07-31]** забытый `NEO4J_URI` (дефолта нет) — отказ на старте с явной ошибкой (`graph_client.py:91`) | отказ на старте, не тихое падение в графе. `sqlite3.Error` не читается как ошибка графа из-за работы индекса и очереди отдельно |
 | батч логов эволюции, где ни у одного мутанта нет `changes[]`, отчитывается `ok` с нулями вместо `failed` | `from_payload` `raise`ит с одним из трёх разных сообщений (всё умерло до измерения / измерено, но `changes[]` нет / всё срезано `limit`/`min_abs_delta`) — пустой отчёт никогда не возвращается |
 | в батче логов первый мутант отказан арбитром целиком, а остальные легли в граф — `drain_one`-стиль проверки по первому источнику решил бы, что это провал | `drain_run` проверяет наличие листа по **каждому** `source_id` батча, а не только по первому (`runlog.py`) |
 | `score` — min-max по кандидатам ЭТОГО вызова: лучший элемент всегда `1.0`, у запроса про закваску для хлеба (в озере нет ничего похожего) ровно как у релевантного — звонящий не может отличить «нашли» от «ничего не нашли и это лучшее из худшего» (`13` §7, ревью 2026-07-31) | аддитивное поле `cosine_similarity` (`rank.py`) — косинус запрос·идея, не перенормируется по вызову; самопроверка ловит красным, если оно перестаёт различать два разных запроса (`rank.demo`, §8 п.1) |
@@ -631,8 +633,7 @@ HTTP-слой прогнан на этих же данных: `/healthz` и `/st
    Путь реконсиляции — `index.reset()` + `index.index_rows(graph_client.all_theses())`.
 5. **§4.1 врёт в одном числе**: evo_search = 26, не 27 (сумма 84 сходится, значит неверно слагаемое).
 6. FunSearch (Nature) недостижим ни одним из трёх путей фетча — помечен `skip` с причиной.
-7. `differentiation` — `null` до появления рёбер у B: рёбра целиком строит B, A их только
-   читает (`neighbors()`, пусто пока `edge` пуста).
+7. **[D12, 2026-07-31] Рёбра `(:Idea)-[:RELATED]->(:Idea)` пишет A в пайплайне:** cocitation в фазе 2 после создания идей источника (`lake/ingest/run.py:274`, `graph_client.write_cocitation_edges`), и `derived_from` при синтезе гипотезы (`lake/idea_merger.py:265`, `write_derived_from_edges`). Возникнув, ребра используются на дозаполнении выдачи (`neighbors()`, `via="edge"` в `/retrieve`). До D12 таблица `edge` была пуста (рёбра были за B), теперь полна.
 8. **`trust_score` считается судьёй (`13` §3.3), но не влияет на ранжирование.**
    `TRUST_WEIGHT = 0.0` в `lake/retrieve/rank.py` — решение, а не недосмотр: доверие
    раньше было формулой (`log(1 + число источников)`), теперь — few-shot оценка 35B, и
@@ -640,6 +641,11 @@ HTTP-слой прогнан на этих же данных: `/healthz` и `/st
    не измерить ни один. Число едет в ответе `/retrieve`, участвует в формуле счёта с
    нулевым множителем, и есть отдельная самопроверка (`rank.demo`, п.4b), что при
    ненулевом весе оно реально двигает порядок — то есть механизм жив, просто выключен.
+   **D14 (2026-07-31):** вместо веса — квота на СОСТАВ выдачи, не на формулу: не более
+   `floor(0.2·k)` идей с `trust_score == 0` (гипотезы попадают под неё по определению,
+   `13` §5). Recall-first сильнее квоты — если доверенных физически не хватает, выдача
+   всё равно длины `k`, добор идёт недоверенными сверх квоты, и это видно в логе полями
+   `trust_quota`/`untrusted_returned`/`untrusted_over_quota` (`rank.demo`, п.9-11).
 9. **Судья не откалиброван боевым прогоном.** Few-shot промпт (`prompts/trust/system.txt`)
    несёт 8 отработанных примеров и явную шкалу 0-10, но живого прогона на корпусе — того
    же рода, что описан в §7 для остального пайплайна, — с судьёй в этом README не

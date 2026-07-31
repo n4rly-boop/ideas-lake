@@ -300,6 +300,7 @@ def _now() -> str:
 # -------------------------------------------------------------------- self-check
 
 if __name__ == "__main__":
+    import os
     import sys
     import tempfile
     import types
@@ -317,7 +318,7 @@ if __name__ == "__main__":
     _fake_embed.embed_docs = _embed_docs
     sys.modules["lake.embed"] = _fake_embed
 
-    from .. import stub_store
+    from .. import neo4j_store
     from ..models import Source, source_id as make_source_id
 
     trace.set_run_id("selfcheck-link")
@@ -380,8 +381,34 @@ if __name__ == "__main__":
     assert _first_per_idea([("a", "t1"), ("b", "t2"), ("a", "t3")]) == [("a", "t1"), ("b", "t2")]
     print("ok (g) issue #2: 4 hits of one idea do not outrank a single closer hit")
 
+    # D11 removed the isolated store this check used to swap in (a fresh SQLite
+    # file). Neo4j has no equivalent disposable target, so the fixture below is
+    # written into whatever `NEO4J_URI` names for real — guarded the same way
+    # `vault.demo`/`lake.api.selfcheck` are: the host must be local/scratch
+    # (`neo4j_store._require_local_target`) and the graph confirmed empty first.
+    # BLOCKER (review 2026-07-31): checked `os.environ.get("NEO4J_URI")` here and
+    # unconditionally `DETACH DELETE`d below — one variable checked, a different
+    # one (whatever the driver connected with, possibly set before an env change)
+    # wiped. `_get_driver()` first, then the URI it actually snapshotted
+    # (`neo4j_store._uri`), same as `lake.selfcheck._wipe_graph`.
+    try:
+        neo4j_store._get_driver()  # so `_uri` below reflects what the driver really used
+        neo4j_store._require_local_target(neo4j_store._uri)
+        with neo4j_store._session() as _s:
+            _existing = _s.execute_read(
+                lambda tx: tx.run("MATCH (n) RETURN count(n) AS c").single()["c"])
+    except graph_client.STORE_ERRORS as exc:
+        print(f"SKIPPED: no Neo4j reachable at {os.environ.get('NEO4J_URI')} "
+              f"({type(exc).__name__}: {exc}). Bring one up with "
+              "`docker compose up -d neo4j` and rerun.")
+        raise SystemExit(1)
+    if _existing:
+        print(f"REFUSED: the graph is not empty ({_existing} node(s) total) — this "
+              "self-check only ever runs against an empty scratch instance. Point "
+              "NEO4J_URI at an empty instance and rerun.")
+        raise SystemExit(1)
+
     with tempfile.TemporaryDirectory() as tmp:
-        stub_store._db_path = Path(tmp) / "lake.db"          # temp store, never data/lake.db
         # Every graph call is @trace'd into TRACES_DIR/<run_id>.jsonl. Deleting that
         # file afterwards was not enough: it still CREATED data/traces/, and an
         # otherwise-absent data/ that exists but holds no file is what makes
@@ -498,4 +525,8 @@ if __name__ == "__main__":
 
         index._CONNS.pop(str(DB)).close()
 
+    # The graph was confirmed empty above, so wiping it outright on the way out
+    # cannot touch anything this run did not itself write.
+    with neo4j_store._session() as _s:
+        _s.execute_write(lambda tx: tx.run("MATCH (n) DETACH DELETE n").consume())
     print("link self-check OK")

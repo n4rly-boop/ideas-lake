@@ -3,13 +3,19 @@ the vault export of §11.6, which the spec asks for in the same shape, and the s
 of the Neo4j load (C1, `07-roles-and-contracts.md:72`).
 
     python3 -m lake.selfcheck             # 6.1 talks to both school servers
-    python3 -m lake.selfcheck --offline   # 24 of 25, no network, no key in the env
+    python3 -m lake.selfcheck --offline   # 34 of 35, no LLM network, no key in the env
+
+Both forms need a live, empty, LOCAL Neo4j (D11: the only backend, not a `stub`
+default some checks used to reach past on purpose) — checked once, loudly, before
+either form runs a single check (`_require_neo4j_up`). `--offline` is only ever
+about the school's LLM servers, never about the graph.
 
 Only `assert`, no framework. Every check gets its own temporary directory and the
-writers are pointed at it: the real `data/lake.db`, `data/index.db`,
-`data/staging.jsonl`, `data/pending_link.jsonl`, `data/traces/` and `data/logs/`
-are never opened for writing — they hold the results of real runs. The one thing
-read from `data/` is the parse cache, and only as the §6.2 fixture.
+writers are pointed at it, and wipes the shared live graph clean going in and
+coming out (`_open`/`_cleanup`): the real `data/index.db`, `data/staging.jsonl`,
+`data/pending_link.jsonl`, `data/traces/` and `data/logs/` are never opened for
+writing — they hold the results of real runs. The one thing read from `data/` is
+the parse cache, and only as the §6.2 fixture.
 
 Checks that already exist inside a module are CALLED, never copied: `index.demo`
 (§6.12, §6.13), `search.demo`, `rank.demo` (§6.4), `hybrid_recipe.demo` (§6.3),
@@ -26,6 +32,7 @@ import functools
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import sqlite3
@@ -39,8 +46,8 @@ from pathlib import Path
 
 import numpy as np
 
-from . import (graph_client, index, llm, neo4j_load, neo4j_store, queue, stub_store, trace,
-               vault, writer_lock)
+from . import (graph_client, idea_merger, index, llm, neo4j_load, neo4j_store, queue,
+               trace, vault, writer_lock)
 from .api import jobs, workers
 from .ingest import generalize, link, parse, rederive, run, runlog, split, trust
 from .models import (CACHE_DIR, EMBED_DIM, GENERALIZE_SCHEMA, PARSE_SCHEMA,
@@ -84,6 +91,69 @@ def _thesis_update_columns(source: str) -> list[set[str]]:
             head = re.split(r"\bwhere\b", match.group("rest"), maxsplit=1, flags=re.IGNORECASE)[0]
             out.append(set(_SET_COLUMN.findall(head)))
     return out
+
+
+# D11's Cypher-side counterpart: `neo4j_store` has no `UPDATE` keyword to grep for —
+# Cypher's only property-mutation syntax is `SET`, on a node bound by `MATCH`, `MERGE`
+# or `CREATE` alike. Unlike the SQL side there is no legal exception left at all:
+# `neo4j_store.split_idea` re-homes a leaf by moving the `HAS_LEAF` edge, never by
+# writing `idea_id` as a Thesis property (module docstring) — so every hit this finds
+# is a violation, not "check the one permitted column".
+_CYPHER_THESIS_ALIAS = re.compile(r"\(\s*(\w+)\s*:\s*Thesis\b")
+_CYPHER_SET = re.compile(r"\bSET\s+(\w+)\b")
+
+
+def _cypher_query_strings(source: str) -> list[str]:
+    """Every run of Python string literals Python itself would implicitly
+    concatenate into one value — the unit a single `tx.run("...")`/`session.run(f"...")`
+    call passes as its Cypher text. Scoping to THIS, not the whole file, is the
+    difference between a real violation and noise: single-letter aliases like `n` or
+    `t` are reused across dozens of unrelated statements (`CREATE CONSTRAINT ... FOR
+    (n:Thesis)`, `MERGE (n:Source {id: $id}) SET n = $row`, ...) for completely
+    different labels, and a whole-file alias scan flags every one of them the moment
+    ANY statement anywhere binds that same letter to `:Thesis`. `tokenize`, not a
+    second regex heuristic: string-literal adjacency is a real Python grammar rule,
+    not a pattern worth re-approximating.
+    """
+    import io
+    import tokenize
+
+    chunks: list[str] = []
+    run: list[str] = []
+
+    def flush():
+        if run:
+            chunks.append("".join(run))
+            run.clear()
+
+    for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+        if tok.type == tokenize.STRING:
+            body = tok.string
+            i = 0
+            while i < len(body) and body[i] not in "'\"":
+                i += 1                                    # skip f/r/b/u prefix letters
+            quote = body[i:i + 3] if body[i:i + 3] in ('"""', "'''") else body[i]
+            run.append(body[i + len(quote):-len(quote)])
+        elif tok.type not in (tokenize.NL, tokenize.COMMENT, tokenize.INDENT,
+                              tokenize.DEDENT, tokenize.ENCODING):
+            flush()
+    flush()
+    return chunks
+
+
+def _cypher_thesis_sets(source: str) -> list[str]:
+    """Every `SET <alias>` where `<alias>` is bound, in the SAME query string, to
+    `:Thesis`. A node's initial `CREATE (t:Thesis $row)` never contains the token
+    `SET` at all, so this cannot flag creation — only a later mutation."""
+    hits = []
+    for chunk in _cypher_query_strings(source):
+        aliases = set(_CYPHER_THESIS_ALIAS.findall(chunk))
+        if not aliases:
+            continue
+        for m in _CYPHER_SET.finditer(chunk):
+            if m.group(1) in aliases:
+                hits.append(chunk[max(0, m.start() - 40):m.start() + 60])
+    return hits
 
 
 def check(number: int, what: str):
@@ -139,23 +209,84 @@ def _fake_embed():
             package.embed = had
 
 
+def _wipe_graph() -> None:
+    """`MATCH (n) DETACH DELETE n`, guarded exactly like `neo4j_load.py --wipe`
+    (`neo4j_store._require_local_target`, reused rather than a second copy):
+    it checks the URI the DRIVER actually connected with,
+    never `os.environ` re-read at call time (`13` MAJOR 4) — this can never
+    land on a host that is not localhost/127.0.0.1/the compose service name,
+    no matter what `NEO4J_URI` says by the time some check runs. This is the
+    isolation `stub_store._db_path` swapping used to give for free with a fresh
+    SQLite file per check (D11): there is one shared live graph now, and
+    "isolated" means "wiped clean by us, who already own everything in it" —
+    `main()`'s `_require_neo4j_up` is what confirms that ownership once, before
+    any check runs at all.
+    """
+    neo4j_store._get_driver()  # so `_uri` below reflects what the driver really used
+    neo4j_store._require_local_target(neo4j_store._uri)
+    with neo4j_store._session() as session:
+        session.run("MATCH (n) DETACH DELETE n").consume()
+
+
+def _require_neo4j_up() -> None:
+    """The whole suite's precondition after D11 (`13` §4.1): Neo4j is the only
+    backend now, so every check needs a live one, not just the two that used to
+    reach past a `stub` default on purpose. Checked ONCE, before any check
+    runs: a single clear abort here beats the same `ServiceUnavailable`
+    traceback surfacing under 25 near-identical `FAIL 6.N` lines, and this must
+    never print so much as one `ok` line before it — "no graph" quietly
+    reading as partial success is exactly the shape CLAUDE.md's fail-open ban
+    exists to catch.
+
+    Unreachable and reachable-but-not-empty are two different refusals and
+    must not read the same way (the reasoning `neo4j_store`'s own self-check
+    gives for its BLOCKER 1): the checks below wipe the graph freely BETWEEN
+    themselves once they own it, but this gate is the one place that decides
+    whether they get to own it at all — a database that already has something
+    in it might be a stale fixture, or might not be this suite's to erase, and
+    only a human reading this message can tell which.
+    """
+    uri = os.environ.get("NEO4J_URI")
+    try:
+        with neo4j_store._session() as session:
+            existing = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
+    except graph_client.STORE_ERRORS as exc:
+        raise SystemExit(
+            f"ABORT: Neo4j is required for the whole suite now (D11) and is not "
+            f"reachable at NEO4J_URI={uri!r} ({type(exc).__name__}: {exc}). Bring "
+            "one up (`docker compose up -d neo4j`, or a bare `docker run -d --rm "
+            "-p 7687:7687 -e NEO4J_AUTH=none neo4j:5-community`) and rerun.") from exc
+    if existing:
+        raise SystemExit(
+            f"ABORT: NEO4J_URI={uri!r} is reachable but NOT EMPTY ({existing} "
+            "node(s), MATCH (n)) — this suite wipes the graph between its own "
+            "checks once it owns it, but refuses to make that call about a "
+            "database it did not confirm empty first. Wipe it by hand "
+            "(`MATCH (n) DETACH DELETE n`) if it really is scratch, or point "
+            "NEO4J_URI at an empty instance, and rerun.")
+
+
 def _open(tmp: Path) -> Path:
-    """Point the store at `tmp` and hand back the index path. Returns tmp/index.db."""
-    if stub_store._conn is not None:
-        stub_store._conn.close()
-    stub_store._conn = None
-    stub_store._db_path = tmp / "lake.db"
+    """Wipe the graph and hand back the index path. Returns tmp/index.db.
+
+    D11: one live Neo4j, shared by every check in this file — there is no
+    per-check file to swap in for isolation the way `stub_store._db_path` gave
+    for free. `_wipe_graph` is the replacement: every check starts clean
+    because it just cleaned the graph itself, not because it got a private
+    file nobody else could see.
+    """
+    _wipe_graph()
     return tmp / "index.db"
 
 
 def _cleanup() -> None:
-    """Close every cached handle between checks: each check owns its own files."""
+    """Close every cached index handle between checks, and leave the graph
+    wiped: a check that fails partway must not poison the next one's fixtures
+    with rows it never got to clean up itself."""
     for key in list(index._CONNS):
         index._CONNS.pop(key).close()
     index._MATS.clear()
-    if stub_store._conn is not None:
-        stub_store._conn.close()
-        stub_store._conn = None
+    _wipe_graph()
 
 
 # ------------------------------------------------------------------- fixtures
@@ -188,6 +319,23 @@ def _row(tag: str, text: str, idea_text: str, effect: str = "+3.1 pp") -> dict:
                         "failure_modes": ["encoder too weak -> semantics lost"]},
         "vector": _vec(text),
     }
+
+
+def _seed_idea(source_id: str, text: str, trust: float) -> str:
+    """One Idea with one real leaf under `source_id` — for checks that mock
+    `rank.search`'s hits directly (bypassing FTS/embedding entirely, `check_32`'s own
+    pattern) and only need `graph_client.get_ideas` (via `rank._bodies`) to resolve a
+    real body for each `idea_id` the mock hands back."""
+    idea_id = new_idea_id()
+    idea = Idea(id=idea_id, text=text, applicability_conditions="ac", limitations="lim",
+               failure_modes=[], effect_claimed="+1 pp", effect_observed="", vector=_vec(text))
+    leaf = Thesis(id=new_thesis_id(), source_id=source_id, idea_id=idea_id, text=text,
+                 context="ctx", effect="+1 pp", locator="Table 1", text_hash=text_hash(text),
+                 vector=_vec(text + " leaf"), created_at="2026-07-28T10:00:00Z")
+    graph_client.create_idea_with_theses(idea, source_id, [leaf])
+    if trust:
+        graph_client.set_trust(idea_id, trust)
+    return idea_id
 
 
 FREEZE = "freeze the pretrained encoder before finetuning"
@@ -297,6 +445,22 @@ def _phase2(tmp: Path, rows: list[dict], answers: list, *, limit: int | None = N
     return report, ops, staging
 
 
+def _cocite_edges(idea_ids: list[str]) -> dict[frozenset, list[dict]]:
+    """`RELATED` edges among `idea_ids`, grouped by unordered pair.
+
+    The shape both `_corpus` and check_06 need to confirm `write_cocitation_edges`
+    wrote BOTH directions (mutation M6: the reverse call silently repeats the
+    forward one) and, on a replay, did not move the weight (M7: the
+    already-recorded-`source_id` guard is dropped and every reload adds another
+    increment). One `graph_client.neighbors` call, not two — hop 1 already
+    matches both directions once both endpoints are in the seed list.
+    """
+    by_pair: dict[frozenset, list[dict]] = {}
+    for edge in graph_client.neighbors(idea_ids, hops=1):
+        by_pair.setdefault(frozenset((edge["source_id"], edge["target_id"])), []).append(edge)
+    return by_pair
+
+
 def _corpus(tmp: Path) -> tuple[Path, dict]:
     """Two sources through the real phase 2: 5 leaves, 4 ideas, temp store + index."""
     idx = _open(tmp)
@@ -309,6 +473,32 @@ def _corpus(tmp: Path) -> tuple[Path, dict]:
     assert report["trust_scored"] == 4 and report["trust_failed"] == 0, report
     assert report["ideas_without_leaves"] == 0 and report["pending_link"] == 0, report
     assert index.count(db=idx) == 5, index.count(db=idx)
+    # D12 (review 2026-07-31, mutation agent): `write_cocitation_edges` runs inside
+    # `run.phase2` for every check that calls `_corpus` (6.5, 6.6, 6.7, 6.10, 6.12,
+    # 6.13, 6.17, 6.19...), but until now nothing here asserted anything about its
+    # OUTPUT — the report field was printed and never read, exactly the "checked
+    # but not read" shape that lets a broken write stay green (this file's own
+    # docstring on 6.34 names the general failure). After BLOCKER 2's fix the gate
+    # is the source's own distinct-idea count, and this fixture clears it without
+    # any change: s1 alone already touches 2 ideas (freeze, island), s2 touches 2
+    # (mixed precision, cheap proxy) — one pair per source, checked on the GRAPH
+    # itself below, not only on the self-reported count (M6/M7 would keep this
+    # report field printing correctly while the graph under it went wrong).
+    assert report["cocitation_pairs"] == 2, report
+    assert report["cocitation_missing"] == [], report
+    leaves = {leaf["text"]: leaf["idea_id"] for leaf in graph_client.all_theses()}
+    freeze_idea = leaves[CORPUS[0]["thesis"]["text"]]
+    island_idea = leaves[CORPUS[2]["thesis"]["text"]]
+    mixed_idea = leaves[CORPUS[3]["thesis"]["text"]]
+    proxy_idea = leaves[CORPUS[4]["thesis"]["text"]]
+    by_pair = _cocite_edges([freeze_idea, island_idea, mixed_idea, proxy_idea])
+    assert set(by_pair) == {frozenset((freeze_idea, island_idea)),
+                            frozenset((mixed_idea, proxy_idea))}, by_pair
+    for pair, rows in by_pair.items():
+        assert len(rows) == 2, f"co-citation must write both directions (M6): {rows}"
+        assert {r["source_id"] for r in rows} == set(pair), \
+            f"both ideas of a pair must each appear once as the edge's source (M6): {rows}"
+        assert all(r["weight"] == 1.0 for r in rows), rows   # min(leaf counts) == 1 both pairs
     return idx, report
 
 
@@ -436,9 +626,13 @@ def check_03(tmp: Path) -> str:
 def check_04(tmp: Path) -> None:
     real_search = rank.search                    # demo() repoints it at its own temp index
     try:
-        rank.demo()
+        status = rank.demo()
     finally:
         rank.search = real_search
+    # `demo()` returns 1 and prints SKIPPED/REFUSED instead of raising when it never
+    # touched the graph (D14's quota, sections 9-11, is only ever exercised here) —
+    # a bare call reads that as "ok" the same as a real pass. Assert, do not just call.
+    assert status == 0, f"rank.demo() did not run (status={status}); see captured output"
 
 
 @check(5, "every /retrieve leaves a log line with score, raw_score, cosine_similarity, "
@@ -480,8 +674,14 @@ def check_05(tmp: Path) -> None:
 
         line = lines()[-1]
         assert set(line) == {"log_id", "ts", "query_raw", "query_rewritten", "rewrite_failed",
-                             "k", "returned", "cut_off", "cost"}, sorted(line)
+                             "k", "returned", "cut_off", "cost", "trust_quota",
+                             "untrusted_returned", "untrusted_over_quota"}, sorted(line)
         assert line["log_id"] == body["log_id"] and line["k"] == 2
+        # D14: k=2 -> quota floor(0.2*2)=0. `_corpus`'s phase 2 already judged every
+        # idea (`report["trust_scored"] == 4`, trust_score 0.5 each) before this
+        # call, so the two returned here are trusted and the quota never engages.
+        assert line["trust_quota"] == 0, line
+        assert line["untrusted_returned"] == 0 and line["untrusted_over_quota"] == 0, line
         assert line["query_rewritten"].endswith("frozen encoder")
         assert line["rewrite_failed"] is False
         assert [r["rank"] for r in line["returned"]] == [1, 2], line["returned"]
@@ -514,6 +714,9 @@ def check_05(tmp: Path) -> None:
 @check(6, "idempotency: the same source through phase 2 twice -> zero new theses")
 def check_06(tmp: Path) -> None:
     idx, first = _corpus(tmp)
+    leaves = {leaf["text"]: leaf["idea_id"] for leaf in graph_client.all_theses()}
+    pair = frozenset((leaves[CORPUS[0]["thesis"]["text"]], leaves[CORPUS[2]["thesis"]["text"]]))
+    before = _cocite_edges(list(pair))[pair]
     (tmp / "staging.cursor").write_text("0\n", encoding="utf-8")   # replay from the top
     second, ops, _ = _phase2(tmp, CORPUS, [])                      # no answer may be needed
     assert ops == [], f"a replayed corpus cost {len(ops)} LLM calls"
@@ -522,6 +725,17 @@ def check_06(tmp: Path) -> None:
     assert second["theses"] == first["theses"] == 5, (first, second)
     assert second["ideas"] == first["ideas"] == 4, (first, second)
     assert index.count(db=idx) == 5, index.count(db=idx)
+    # D12/M7 (review 2026-07-31): the same source recomputes the same co-citation
+    # pair on replay and must not move the weight — `write_cocitation_edges` is
+    # idempotent per source because `source_id` is already in `evidence`. Checked
+    # on the GRAPH before/after, not on `second["cocitation_pairs"]` alone: that
+    # field recomputes to the same number (2) whether or not the write underneath
+    # re-accumulated, so a broken idempotency guard would leave it unchanged.
+    assert second["cocitation_pairs"] == 2, second
+    after = _cocite_edges(list(pair))[pair]
+    assert {r["weight"] for r in before} == {r["weight"] for r in after} == {1.0}, (before, after)
+    assert {tuple(r["evidence"]) for r in before} == {tuple(r["evidence"]) for r in after}, \
+        (before, after)
 
 
 @check(7, "not idempotent between sources: the same wording from another source -> "
@@ -576,7 +790,11 @@ def check_08(tmp: Path) -> None:
 
 @check(9, "immutability: no method anywhere changes Thesis.text, in either module")
 def check_09(tmp: Path) -> None:
-    for module in (graph_client, stub_store):
+    # D11: `stub_store` is gone, `neo4j_store` is the only module that actually talks
+    # to the store now. Parsing `graph_client` alone here would have gone green for
+    # the wrong reason the moment the second file disappeared — this must name the
+    # module that replaced it, not just drop the second entry from the tuple.
+    for module in (graph_client, neo4j_store):
         tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
         defined = {node.name for node in ast.walk(tree)
                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
@@ -584,23 +802,27 @@ def check_09(tmp: Path) -> None:
                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
         assert "update_thesis" not in defined, f"{module.__name__} grew an update_thesis"
         assert not hasattr(module, "update_thesis"), module.__name__
-    # A direct UPDATE would bypass the missing method. Exactly ONE is allowed in all of
-    # block A — `stub_store.split_idea` re-homing a leaf — and it may write exactly one
-    # column. §1.2 immutability is about what the source said (text, context, effect,
-    # locator, text_hash, source_id); `idea_id` is the arbiter's decision from §4.5 and
-    # has to be repairable, or a mislinked leaf can only be fixed by deleting it.
-    # `UPDATE thesis SET text=?` anywhere, including in that one function, still fails.
+    # A direct UPDATE (SQL) or SET (Cypher) would bypass the missing method. On SQLite
+    # exactly one used to be legal — `stub_store.split_idea` re-homing a leaf's
+    # `idea_id` column. That exception does not exist on Neo4j at all: `split_idea`
+    # moves the `HAS_LEAF` edge instead of writing a Thesis property (`neo4j_store`
+    # module docstring), so a Thesis node has literally zero legal writes after its
+    # own creation. §1.2 immutability is about what the source said (text, context,
+    # effect, locator, text_hash, source_id); with `idea_id` gone as a Thesis property
+    # too, there is nothing left that a repair could legitimately touch.
     found = 0
     for path in sorted((REPO / "lake").rglob("*.py")):
         if path.name == "selfcheck.py" and path.parent.name == "lake":
             continue
-        for columns in _thesis_update_columns(path.read_text(encoding="utf-8")):
+        text = path.read_text(encoding="utf-8")
+        for columns in _thesis_update_columns(text):
             found += 1
-            assert path == REPO / "lake" / "stub_store.py", f"{path}: direct UPDATE on thesis"
-            assert columns == {"idea_id"}, \
-                f"{path}: UPDATE thesis assigns {sorted(columns) or '(unparsed)'} — " \
-                "only idea_id may move"
-    assert found == 1, f"the one allowed UPDATE on thesis is now {found}"
+            raise AssertionError(f"{path}: direct SQL UPDATE on thesis assigns "
+                                 f"{sorted(columns) or '(unparsed)'} — no backend has a "
+                                 "legal exception left (D11)")
+        cypher_hits = _cypher_thesis_sets(text)
+        assert not cypher_hits, f"{path}: Cypher SET on a :Thesis-bound variable — {cypher_hits}"
+    assert found == 0, f"the SQL-side scan found {found} UPDATE(s) on thesis; want 0 (D11)"
     # And the one update the store does expose refuses to touch anything but an idea.
     _open(tmp)
     sid = _write_source("s1")
@@ -756,19 +978,23 @@ def check_16(tmp: Path) -> None:
 @check(17, "phase 2 with a stubbed write failure leaves zero ideas without leaves")
 def check_17(tmp: Path) -> None:
     idx = _open(tmp)
-    real_insert = stub_store._insert_theses
+    real_insert = neo4j_store._insert_theses
 
-    def boom(conn, source_id, theses):
+    def boom(tx, source_id, theses):
         # Inside the transaction, after the idea row: exactly the window that would
         # leave IDEA ||--|{ THESIS broken if the two were not one transaction (§3.4).
+        # A plain RuntimeError is enough — what is under test is that ANY exception
+        # from inside `session.execute_write`'s callback rolls back everything the
+        # driver already sent it, same guarantee `sqlite3.OperationalError` proved
+        # on the SQLite side, not the exception's type.
         if any(t.text.startswith("mixed precision") for t in theses):
-            raise sqlite3.OperationalError("disk I/O error")
-        return real_insert(conn, source_id, theses)
+            raise RuntimeError("simulated write failure")
+        return real_insert(tx, source_id, theses)
 
-    with _swap(stub_store, "_insert_theses", boom):
+    with _swap(neo4j_store, "_insert_theses", boom):
         try:
             _phase2(tmp, CORPUS, CORPUS_ANSWERS)
-        except sqlite3.OperationalError:
+        except RuntimeError:
             pass
         else:
             raise AssertionError("the stubbed write failure did not reach the caller")
@@ -795,9 +1021,11 @@ def check_18(tmp: Path) -> None:
     fake, ops = _arbiter([])
 
     def restart() -> None:
-        """Everything in memory is dropped; the store file is all that is left."""
-        stub_store._conn.close()
-        stub_store._conn = None
+        """Everything in this process's memory is dropped; the driver reconnects on
+        the next call, and whatever it reads comes back from Neo4j itself, not from
+        a cached Python object — the same proof `stub_store._conn.close()` gave by
+        dropping SQLite's open handle."""
+        neo4j_store.close()
 
     restart()
     assert graph_client.get_ideas([idea.id])[0]["rederived_at_leaf_count"] == 0
@@ -882,7 +1110,10 @@ def check_19(tmp: Path) -> str:
            "a store that contradicts itself is refused (vault.demo, §11.6)")
 def check_20(tmp: Path) -> None:
     # Owns its temp store and its own data/ fingerprint, like the demos above.
-    vault.demo()
+    # `demo()` returns 1 and prints SKIPPED/REFUSED instead of raising when it never
+    # touched the graph — a bare call reads that as "ok" the same as a real pass.
+    status = vault.demo()
+    assert status == 0, f"vault.demo() did not run (status={status}); see captured output"
 
 
 @check(21, "Neo4j load: a required model field the reader did not carry is refused, "
@@ -899,7 +1130,10 @@ def check_21(tmp: Path) -> None:
            "re-derived over its own leaves, and the split writes idea_id and nothing "
            "else on a thesis (split.demo, issue #2)")
 def check_22(tmp: Path) -> None:
-    split.demo()
+    # `demo()` returns 1 and prints SKIPPED/REFUSED instead of raising when it never
+    # touched the graph — a bare call reads that as "ok" the same as a real pass.
+    status = split.demo()
+    assert status == 0, f"split.demo() did not run (status={status}); see captured output"
 
 
 @check(23, "phase 2 runs the split sweep and reports the ceiling off the STORE: an idea "
@@ -2021,25 +2255,28 @@ def check_29(tmp: Path) -> None:
 
     # -- 1. the transaction, not the flag. An idea already sits in the store, clean.
     # The SAME call that appends a leaf to it also raises `dirty`
-    # (`create_idea_with_theses`, `stub_store.py:186-193`, through the real
-    # `_update_idea`) — made here to blow up right after it has actually run, forcing
+    # (`create_idea_with_theses`, `neo4j_store.py:308-328`, through the real
+    # `_mark_dirty`) — made here to blow up right after it has actually run, forcing
     # a rollback of everything the transaction touched. A `dirty` that survives this
-    # was never really written inside the leaf's transaction.
+    # was never really written inside the leaf's transaction. `_mark_dirty`, not
+    # `_update_idea`: `create_idea_with_theses` calls the former directly (the
+    # latter is `update_idea`/`split_idea`/`set_trust`'s function, exercised in
+    # part 2 below through the real API instead of a swap).
     clean = _blank_idea("already in the store")
     graph_client.create_idea(clean)
     assert not graph_client.get_ideas([clean.id])[0]["dirty"], "a fresh idea starts clean"
 
-    real_update_idea = stub_store._update_idea
+    real_mark_dirty = neo4j_store._mark_dirty
 
-    def boom(conn, idea_id, fields):
-        real_update_idea(conn, idea_id, fields)          # the flag really is raised...
-        raise sqlite3.OperationalError("disk I/O error")  # ...then the write fails
+    def boom(tx, idea_id, value):
+        real_mark_dirty(tx, idea_id, value)       # the flag really is raised...
+        raise RuntimeError("simulated write failure")  # ...then the write fails
 
     leaf = _thesis("s1", clean.id, "a fresh leaf")
-    with _swap(stub_store, "_update_idea", boom):
+    with _swap(neo4j_store, "_mark_dirty", boom):
         try:
             graph_client.create_idea_with_theses(None, sid, [leaf])
-        except sqlite3.OperationalError:
+        except RuntimeError:
             pass
         else:
             raise AssertionError("the stubbed write failure did not reach the caller")
@@ -2134,98 +2371,10 @@ def _rederive_would_fire(idea_id: str, threshold: int = 3) -> bool:
 
 # ---------------------------------------------------------- neo4j fixtures (`13` §4)
 
-class _Skip(Exception):
-    """Raised by a check whose subject is not present to run against. NEVER caught
-    as a failure and never swallowed into a quiet `ok` either: the runner (below)
-    prints a `skip 6.N` line for it, the same shape as the existing `--offline`
-    skip of 6.1 — "a check that quietly turns green when its subject is absent is
-    the thing this repo bans" (`13` §10, points 31/33)."""
-
-
-def _require_neo4j() -> None:
-    """Probe bolt://localhost:7687 and require it reachable AND empty.
-
-    Two different reasons to refuse, and they must not read the same way (review,
-    `13` §10, point 2): no driver / nothing listening is the ROUTINE offline state
-    — the same shape as `--offline`'s skip of 6.1 — and raises `_Skip`, which the
-    runner prints as `skip` and never counts as broken.
-
-    A REACHABLE-but-non-empty database is not that. It almost always means an
-    earlier check (or 6.31a's own subprocess, killed by its `timeout=180` before
-    its internal `finally` ever ran) left rows behind — a real defect, not an
-    absent subject. Reusing `_Skip` for it was the bug this fixes: a mutation
-    that crashed 6.31a before cleanup left one node, and 6.33's turn at this same
-    gate then read the leftover as "no Neo4j here" and skipped — one broken check
-    silently disabling an unrelated, otherwise-passing one, with the summary line
-    folding the disabled check into the same skip count as the routine `--offline`
-    skip a reader already expects and skims past. Raising a plain `AssertionError`
-    here instead means the runner has no special case for it: it can only land in
-    FAILED, next to a message that says which of the two things actually happened,
-    never quietly merged into "skipped, as usual".
-
-    (Weighed against giving 31/31a/33 their own database or namespace: that would
-    also stop one check's leftovers from reaching another, but it needs a second
-    Neo4j database or a per-check label threaded through every query these checks
-    share with `neo4j_store`'s own self-check — a bigger, riskier change for the
-    same guarantee this gate already gives for free once "dirty" stops hiding
-    behind "absent".)
-    """
-    try:
-        from neo4j import GraphDatabase
-    except ImportError as exc:
-        raise _Skip(f"the neo4j driver package is not importable ({exc})") from exc
-    try:
-        driver = GraphDatabase.driver("bolt://localhost:7687", auth=None)
-        driver.verify_connectivity()
-    except Exception as exc:
-        raise _Skip(
-            f"no Neo4j reachable at bolt://localhost:7687 ({type(exc).__name__}: {exc}). "
-            "Bring one up with `docker compose up -d neo4j` and rerun.") from exc
-    with driver.session(database="neo4j") as session:
-        existing = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
-    driver.close()
-    if existing:
-        raise AssertionError(
-            f"bolt://localhost:7687 is reachable but NOT EMPTY ({existing} node(s), "
-            "MATCH (n)) — this is a DIRTY scratch database, not an absent one, and must "
-            "not read as the routine 'no Neo4j here' skip. Almost always the leftover of "
-            "an earlier check (or its subprocess, 6.31a) that crashed before its own "
-            "cleanup ran. Wipe it (`MATCH (n) DETACH DELETE n`) and rerun.")
-
-
-@contextlib.contextmanager
-def _neo4j_backend():
-    """Point `graph_client` at the live local Neo4j for the duration, then wipe
-    everything this left behind and restore whichever backend the process chose
-    at import (`13` §4.1) — every check after this one must find the suite back
-    on its normal stub default, not stuck pointed at a container."""
-    old_env = {k: os.environ.get(k) for k in
-               ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD", "NEO4J_DATABASE")}
-    os.environ["NEO4J_URI"] = "bolt://localhost:7687"
-    os.environ.pop("NEO4J_USERNAME", None)
-    os.environ.pop("NEO4J_PASSWORD", None)
-    os.environ["NEO4J_DATABASE"] = "neo4j"
-    neo4j_store.close()
-    with _swap(graph_client, "_backend", neo4j_store), \
-            _swap(graph_client, "_BACKEND_NAME", "neo4j"):
-        try:
-            yield neo4j_store
-        finally:
-            with neo4j_store._session() as session:
-                session.run("MATCH (n) DETACH DELETE n").consume()
-            neo4j_store.close()
-            for key, value in old_env.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-
-
 def _leaf_groups() -> list[frozenset[str]]:
     """Leaves partitioned by idea, keyed by TEXT rather than id: ids are fresh
-    random uuids per run and would never match between the stub run and the
-    neo4j run even when the grouping — which arbiter decisions were made — is
-    identical (`13` §10 point 31)."""
+    random uuids per run and would never match a re-run's even when the grouping
+    — which arbiter decisions were made — is identical (`13` §10 point 31)."""
     by_idea: dict[str, set[str]] = {}
     for leaf in graph_client.all_theses():
         by_idea.setdefault(leaf["idea_id"], set()).add(leaf["text"])
@@ -2236,16 +2385,9 @@ def _raw_delete(ids: list[str]) -> None:
     """Storage-level delete of `ids` out of source/idea/thesis — nothing is ever
     deleted through the public API (`13`). Used only to free lower internal ids
     on Neo4j and reproduce the ordering bug the `neo4j_store` module docstring
-    describes; harmless on stub_store, whose rowid allocation restarts from the
-    top of an emptied table regardless of what came before it."""
-    if graph_client.backend_name() == "neo4j":
-        with graph_client._backend._session() as session:
-            session.run("MATCH (n) WHERE n.id IN $ids DETACH DELETE n", ids=ids).consume()
-    else:
-        placeholders = ",".join("?" * len(ids))
-        with stub_store._lock, stub_store._c() as conn:
-            for table in ("source", "idea", "thesis"):
-                conn.execute(f"DELETE FROM {table} WHERE id IN ({placeholders})", ids)
+    describes."""
+    with neo4j_store._session() as session:
+        session.run("MATCH (n) WHERE n.id IN $ids DETACH DELETE n", ids=ids).consume()
 
 
 def _ordering_scenario() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
@@ -2338,109 +2480,85 @@ def _assert_neo4j_orders_by_seq() -> None:
             f"neo4j_store.{name} no longer orders by the stored seq (13 §10)"
 
 
-@check(31, "backend parity: the same write/read/replay scenario, plus a delete-"
-           "then-recreate that frees lower Neo4j internal ids, answers IDENTICALLY "
-           "on stub and on neo4j — counts, idea groupings, ideas_without_leaves, a "
-           "replay that says skipped on both, and every reader that promises "
-           "insertion order (get_ideas/get_leaves/list_theses/all_theses/"
-           "list_idea_ids/dirty_ideas/list_sources) in the same order on both, "
-           "pinned statically too (id(...) is not reliably reused live in this "
-           "environment); the `:_Seq` counter refuses a duplicate; the live half "
-           "SKIPS LOUDLY without a live, empty Neo4j")
+@check(31, "insertion order + replay: write/read/replay through phase 2, plus a "
+           "delete-then-recreate that frees lower Neo4j internal ids, still gives "
+           "back the right counts, idea groupings, ideas_without_leaves, a replay "
+           "that says skipped, and every reader that promises insertion order "
+           "(get_ideas/get_leaves/list_theses/all_theses/list_idea_ids/"
+           "dirty_ideas/list_sources) in insertion order — pinned statically too "
+           "(id(...) is not reliably reused live in this environment); the "
+           "`:_Seq` counter refuses a duplicate")
 def check_31(tmp: Path) -> str:
-    _assert_neo4j_orders_by_seq()   # offline, runs even without a container
-    _require_neo4j()
+    _assert_neo4j_orders_by_seq()   # offline, static — runs before anything live
 
-    def _run(root: Path) -> dict:
-        root.mkdir(parents=True, exist_ok=True)
-        _open(root)
-        report, ops, _ = _phase2(root, CORPUS, CORPUS_ANSWERS)
-        (root / "staging.cursor").write_text("0\n", encoding="utf-8")   # replay from the top
-        replay, replay_ops, _ = _phase2(root, CORPUS, [])
-        order_got, order_want = _ordering_scenario()
-        # `ideas_without_leaves()` is raw (`13` §5): it also names legal hypotheses
-        # (`_ordering_scenario`'s own `kept_idea_b`, origin="synthesized"), so
-        # "the same ideas_without_leaves" means the same ORIGINS on both backends
-        # here, not an empty list — and never `extracted`, which would be the
-        # broken-write case §5/6.30 exist to catch.
-        orphan_origins = sorted(idea["origin"] for idea in
-                                graph_client.get_ideas(graph_client.ideas_without_leaves()))
-        return {"report": report, "ops": ops, "orphan_origins": orphan_origins,
-                "counts": graph_client.counts(), "groups": _leaf_groups(),
-                "replay": replay, "replay_ops": replay_ops,
-                "order_got": order_got, "order_want": order_want}
+    from neo4j.exceptions import ConstraintError
 
-    stub_side = _run(tmp / "stub")
-
-    with _neo4j_backend() as neo:
-        from neo4j.exceptions import ConstraintError
-        # The `:_Seq` counter is the one identity node the whole ordering
-        # guarantee rests on (module docstring, neo4j_store.py) and had no
-        # uniqueness constraint until this review: a second one landed with only
-        # a UserWarning, not an error. Proven fixed here, before it matters to
-        # anything else this check writes.
-        with neo._session() as session:
+    # The `:_Seq` counter is the one identity node the whole ordering guarantee
+    # rests on (module docstring, neo4j_store.py) and had no uniqueness
+    # constraint until this review: a second one landed with only a
+    # UserWarning, not an error. Proven fixed here, before it matters to
+    # anything else this check writes — `_open` below wipes any leftover
+    # `:_Seq` first, so this creates the very first one on purpose.
+    _open(tmp)
+    with neo4j_store._session() as session:
+        session.run("CREATE (:_Seq {id: 'global'})").consume()
+    try:
+        with neo4j_store._session() as session:
             session.run("CREATE (:_Seq {id: 'global'})").consume()
-        try:
-            with neo._session() as session:
-                session.run("CREATE (:_Seq {id: 'global'})").consume()
-        except ConstraintError:
-            pass
-        else:
-            raise AssertionError("a second :_Seq counter node was accepted — nothing "
-                                 "left stands behind the ordering guarantee (13 §10)")
-        with neo._session() as session:
-            session.run("MATCH (n:_Seq) DETACH DELETE n").consume()
+    except ConstraintError:
+        pass
+    else:
+        raise AssertionError("a second :_Seq counter node was accepted — nothing "
+                             "left stands behind the ordering guarantee (13 §10)")
+    with neo4j_store._session() as session:
+        session.run("MATCH (n:_Seq) DETACH DELETE n").consume()
 
-        neo_side = _run(tmp / "neo")
+    report, ops, _ = _phase2(tmp, CORPUS, CORPUS_ANSWERS)
+    (tmp / "staging.cursor").write_text("0\n", encoding="utf-8")   # replay from the top
+    replay, replay_ops, _ = _phase2(tmp, CORPUS, [])
+    order_got, order_want = _ordering_scenario()
+    # `ideas_without_leaves()` is raw (`13` §5): it also names legal hypotheses
+    # (`_ordering_scenario`'s own `kept_idea_b`, origin="synthesized"), so the
+    # invariant is "never extracted" — that origin is the broken-write case
+    # §5/6.30 exist to catch, not "the list is always empty".
+    orphan_origins = sorted(idea["origin"] for idea in
+                            graph_client.get_ideas(graph_client.ideas_without_leaves()))
 
-    for name, side in (("stub", stub_side), ("neo4j", neo_side)):
-        assert side["report"]["theses"] == 5 and side["report"]["ideas"] == 4, (name, side["report"])
-        assert side["ops"] == ["link"] * 4 + ["trust"] * 4, (name, side["ops"])
-        assert "extracted" not in side["orphan_origins"], \
-            (name, "a broken write left an extracted idea without leaves", side["orphan_origins"])
-        assert side["replay"]["theses_written"] == 0, (name, side["replay"])
-        assert side["replay"]["theses_skipped"] == 5, (name, side["replay"])
-        assert side["replay_ops"] == [], (name, side["replay_ops"])
-        for reader, ids in side["order_got"].items():
-            assert ids == side["order_want"][reader], \
-                (name, reader, "insertion order lost", ids, side["order_want"][reader])
+    assert report["theses"] == 5 and report["ideas"] == 4, report
+    assert ops == ["link"] * 4 + ["trust"] * 4, ops
+    assert "extracted" not in orphan_origins, \
+        ("a broken write left an extracted idea without leaves", orphan_origins)
+    assert replay["theses_written"] == 0, replay
+    assert replay["theses_skipped"] == 5, replay
+    assert replay_ops == [], replay_ops
+    for reader, ids in order_got.items():
+        assert ids == order_want[reader], \
+            (reader, "insertion order lost", ids, order_want[reader])
 
-    assert stub_side["orphan_origins"] == neo_side["orphan_origins"], \
-        (stub_side["orphan_origins"], neo_side["orphan_origins"])
-    assert stub_side["groups"] == neo_side["groups"], (stub_side["groups"], neo_side["groups"])
-    assert stub_side["counts"] == neo_side["counts"], (stub_side["counts"], neo_side["counts"])
-
-    return ("5 theses / 4 ideas / ideas_without_leaves origins identical / replay=skipped / "
-            "7 order-sensitive readers "
-            "and the :_Seq constraint, identical on stub and neo4j")
+    return ("5 theses / 4 ideas / no extracted orphan / replay=skipped / 7 order-"
+            "sensitive readers hold insertion order / the :_Seq constraint refuses "
+            "a duplicate")
 
 
-@check("31a", "lake/neo4j_store.py's own ~30-assert `__main__` suite (single-transaction "
-              "rollback, leaf_key idempotency, the orphan-Thesis traversal parity behind "
-              "counts()/count_theses()/all_theses()/list_theses(), get_ideas/get_leaves/"
-              "set_trust parity, the wipe guard) is RUN here, as a subprocess, not merely "
-              "sitting next to this suite unreached (review, `13` §10): the thin parity "
-              "slice 31/33 re-derive next to it let a split-transaction create_idea_with_"
-              "theses, a silently MERGEd duplicate leaf_key, and counts() reading the raw "
-              "label instead of the served traversal all survive mutation. SKIPS LOUDLY "
-              "without a live, empty Neo4j, same gate as 31/33")
+@check("31a", "lake/neo4j_store.py's own `__main__` self-check suite (single-"
+              "transaction rollback, leaf_key idempotency, the orphan-Thesis "
+              "traversal behind counts()/count_theses()/all_theses()/"
+              "list_theses(), get_ideas/get_leaves/set_trust, the wipe guard) is "
+              "RUN here, as a subprocess, not merely sitting next to this suite "
+              "unreached (review, `13` §10): a thin slice re-derived next to it "
+              "let a split-transaction create_idea_with_theses, a silently "
+              "MERGEd duplicate leaf_key, and counts() reading the raw label "
+              "instead of the served traversal all survive mutation")
 def check_31a(tmp: Path) -> str:
-    _require_neo4j()   # loud skip before spawning anything — same gate 31/33 use
     import subprocess
-    # Cleanup is the CALLER's job here, not the subject's (review, `13` §10,
-    # point 2): `neo4j_store.py`'s own __main__ wipes its own fixtures in its own
-    # `finally` blocks, but that code runs INSIDE the subprocess this spawns, and
-    # a hard kill — this call's own `timeout=180`, or any crash the interpreter
-    # never gets to run a Python `finally` for — skips all of it, leaving rows
-    # behind for whichever check reaches this same live instance next (6.31,
-    # 6.33). `_neo4j_backend()` wipes in ITS OWN `finally`, from OUTSIDE the
-    # subprocess, so this check leaves the database clean for its neighbours
-    # even when the subprocess never reaches its own cleanup at all.
-    with _neo4j_backend():
-        result = subprocess.run(
-            [sys.executable, "-B", "-m", "lake.neo4j_store"],
-            cwd=REPO, capture_output=True, text=True, timeout=180)
+    # No gate and no env override needed here any more (D11: one shared live
+    # graph for the whole suite, the same NEO4J_URI this process already
+    # validated at the top of `main`) — the runner's own `_cleanup`, which runs
+    # after every check including this one, is what guarantees the graph is
+    # empty going in.
+    result = subprocess.run(
+        [sys.executable, "-B", "-m", "lake.neo4j_store"],
+        cwd=REPO, capture_output=True, text=True, timeout=180)
     # Pin the module's own final print, not only the exit code: a run killed or
     # crashed before ever reaching a live assertion (import error, hang, timeout)
     # must not read as green just because something downstream defaulted to 0.
@@ -2452,67 +2570,51 @@ def check_31a(tmp: Path) -> str:
         f"lake/neo4j_store.py's own self-check printed its ok line but still exited "
         f"{result.returncode}:\n{result.stdout}\n{result.stderr}")
     return ("lake/neo4j_store.py's own self-check ran to completion, as a subprocess, "
-            "against a live Neo4j — the rollback/idempotency/traversal-parity suite next "
-            "to the module is no longer merely present, it is reached")
+            "against the shared live Neo4j — the rollback/idempotency/traversal suite "
+            "next to the module is no longer merely present, it is reached")
 
 
 @check(32, "a killed Neo4j: every sampled graph route answers 503 (never a quiet "
            "200), /retrieve answers 503 too — not `ideas: []` — and writes no "
-           "success line to the retrieve log; both real refusal directions of "
-           "`13` §4.1 (LAKE_STORE=neo4j with no NEO4J_URI, and NEO4J_URI set "
-           "while LAKE_STORE is never mentioned at all) still refuse at startup")
+           "success line to the retrieve log; the D11 startup refusal (missing "
+           "or empty NEO4J_URI) still refuses, for both shapes of missing")
 def check_32(tmp: Path) -> str:
     from fastapi.testclient import TestClient
 
     from .api.app import create_app
 
-    # --- part 1: the two REAL startup refusals of `13` §4.1 -------------------
-    # Note on the spec's literal wording ("NEO4J_URI set with LAKE_STORE=stub"
-    # must refuse): the code (graph_client.py:44-88, BLOCKER 3) deliberately
-    # tells apart LAKE_STORE never mentioned at all from LAKE_STORE=stub written
-    # out BY HAND next to a NEO4J_URI that exists only for `neo4j_load`'s
-    # one-way push (`.env.local.example`, `docker-compose.yml`) — only the
-    # former refuses. Driving the literal "any NEO4J_URI + LAKE_STORE=stub
-    # refuses" would break that real, documented deployment, so this check
-    # drives the two directions the code actually implements (and reasons
-    # about at length in `_select_backend`'s own docstring), not the reading
-    # that cannot tell the two states apart.
-    old = {k: os.environ.get(k) for k in ("LAKE_STORE", "NEO4J_URI")}
+    # --- part 1: the D11 startup refusal — no fallback, ever (`13` §4.1) -------
+    # `stub_store` is gone and so is `LAKE_STORE`: Neo4j is the only backend, and
+    # `_select_backend` now refuses on a single condition, checked both ways it
+    # can go missing — the env key absent entirely, and present but empty (a
+    # blank `.env.local` line, say) — `not os.environ.get(...)` treats both the
+    # same, and this proves the check does too, not just the more common one.
+    old_uri = os.environ.get("NEO4J_URI")
     try:
-        os.environ["LAKE_STORE"] = "neo4j"
-        os.environ.pop("NEO4J_URI", None)
-        try:
-            graph_client._select_backend()
-        except RuntimeError as exc:
-            assert "NEO4J_URI" in str(exc), exc
-        else:
-            raise AssertionError("LAKE_STORE=neo4j with no NEO4J_URI must refuse")
-
-        os.environ.pop("LAKE_STORE", None)
-        os.environ["NEO4J_URI"] = "bolt://neo4j:7687"
-        try:
-            graph_client._select_backend()
-        except RuntimeError as exc:
-            assert "LAKE_STORE" in str(exc), exc
-        else:
-            raise AssertionError(
-                "NEO4J_URI set while LAKE_STORE is never mentioned must refuse (13 "
-                "§4.1, BLOCKER 3) — a forgotten flag next to a configured graph URI "
-                "must not silently write to SQLite")
-
-        # And the documented deployment this refusal must NOT break: the same
-        # NEO4J_URI, LAKE_STORE=stub written out BY HAND.
-        os.environ["LAKE_STORE"] = "stub"
-        backend, name = graph_client._select_backend()
-        assert name == "stub" and backend is stub_store, (name, backend)
-    finally:
-        for key, value in old.items():
-            if value is None:
-                os.environ.pop(key, None)
+        for missing_uri in (None, ""):
+            if missing_uri is None:
+                os.environ.pop("NEO4J_URI", None)
             else:
-                os.environ[key] = value
+                os.environ["NEO4J_URI"] = missing_uri
+            try:
+                graph_client._select_backend()
+            except RuntimeError as exc:
+                assert "NEO4J_URI" in str(exc), exc
+            else:
+                raise AssertionError(f"NEO4J_URI={missing_uri!r} must refuse (D11)")
+
+        os.environ["NEO4J_URI"] = "bolt://neo4j:7687"
+        assert graph_client._select_backend() is neo4j_store, \
+            "a non-empty NEO4J_URI must select neo4j_store, the only backend left"
+    finally:
+        if old_uri is None:
+            os.environ.pop("NEO4J_URI", None)
+        else:
+            os.environ["NEO4J_URI"] = old_uri
 
     # --- part 2: a killed Neo4j, through the real app -------------------------
+    # No backend to swap any more (D11: `graph_client._backend` is always
+    # `neo4j_store`) — only the URI needs to point somewhere nothing answers.
     neo4j_store.close()
     old_uri = os.environ.get("NEO4J_URI")
     os.environ["NEO4J_URI"] = "bolt://127.0.0.1:1"   # nothing listens on port 1: fails fast
@@ -2525,8 +2627,6 @@ def check_32(tmp: Path) -> str:
             os.environ["NEO4J_URI"] = old_uri
 
     with contextlib.ExitStack() as stack:
-        stack.enter_context(_swap(graph_client, "_backend", neo4j_store))
-        stack.enter_context(_swap(graph_client, "_BACKEND_NAME", "neo4j"))
         stack.callback(_restore)
 
         with TestClient(create_app(mock=False, warmup=False, api_key=False,
@@ -2561,98 +2661,29 @@ def check_32(tmp: Path) -> str:
             assert line["returned"] == [] and line["cut_off"] == [], line
             assert "ideas" not in line, \
                 "the retrieve log recorded a success shape for a broken store"
+            # Review finding 2026-07-31: 0 is ALSO the legal value of a request whose
+            # D14 quota never had to reject anyone — initializing the three quota
+            # fields to 0 made a 503 indistinguishable from a healthy, unviolated
+            # quota on all three. `None` is the only value that cannot be misread
+            # as "ranking ran and the quota held".
+            assert (line["trust_quota"], line["untrusted_returned"],
+                    line["untrusted_over_quota"]) == (None, None, None), line
 
-    return ("both real backend-selection refusals hold, and the documented explicit-"
-            "stub deployment does not break; every sampled graph route and /retrieve "
-            "answer 503 on a killed Neo4j, with no fake success in the retrieve log")
+    return ("the D11 startup refusal holds for a missing and an empty NEO4J_URI alike, "
+            "and a non-empty one selects neo4j_store; every sampled graph route and "
+            "/retrieve answer 503 on a killed Neo4j, with no fake success in the "
+            "retrieve log")
 
 
-@check(33, "migration: after lake.db -> Neo4j, counts() match before and after "
-           "and every idea/thesis carries a 384-float vector (07:78, the path "
-           "that silently dropped vectors before — asserted by LENGTH, not by "
-           "presence of the key); migrate(wipe=True) refuses a non-local "
-           "NEO4J_URI before ever touching it, not after; SKIPS LOUDLY without "
-           "a live, empty Neo4j")
-def check_33(tmp: Path) -> str:
-    _require_neo4j()
-
-    _open(tmp)
-    _phase2(tmp, CORPUS, CORPUS_ANSWERS)
-    before = graph_client.counts()
-    assert (before["sources"], before["ideas"], before["theses"]) == (2, 4, 5), before
-
-    # Gap (review, `13` §10): `migrate(wipe=True)` used to call `_get_driver()` —
-    # which connects AND writes schema constraints — BEFORE checking whether the
-    # target is local, so a non-local NEO4J_URI got constraints written into it
-    # before the wipe was ever refused. Proven fixed by poisoning `_get_driver`
-    # itself: if the guard really runs first, the poisoned version is never
-    # reached, and nothing this call could have written lands anywhere.
-    neo4j_store.close()
-    old_uri = os.environ.get("NEO4J_URI")
-    os.environ["NEO4J_URI"] = "neo4j+s://deadbeef00.databases.neo4j.io"
-    try:
-        def _poisoned():
-            raise AssertionError("_get_driver() was reached before the local-target guard")
-
-        with _swap(neo4j_store, "_get_driver", _poisoned):
-            try:
-                neo4j_store.migrate(wipe=True)
-            except RuntimeError as exc:
-                assert "deadbeef00" in str(exc), exc
-            else:
-                raise AssertionError("migrate(wipe=True) accepted a non-local NEO4J_URI")
-    finally:
-        if old_uri is None:
-            os.environ.pop("NEO4J_URI", None)
-        else:
-            os.environ["NEO4J_URI"] = old_uri
-
-    # The real migration, against the live local instance `_require_neo4j` already
-    # confirmed is reachable and empty.
-    neo4j_store.close()
-    old = {k: os.environ.get(k) for k in
-           ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD", "NEO4J_DATABASE")}
-    os.environ["NEO4J_URI"] = "bolt://localhost:7687"
-    os.environ.pop("NEO4J_USERNAME", None)
-    os.environ.pop("NEO4J_PASSWORD", None)
-    os.environ["NEO4J_DATABASE"] = "neo4j"
-    try:
-        migration = neo4j_store.migrate()
-        assert migration["read_from_sqlite"] == \
-            {"sources": before["sources"], "ideas": before["ideas"],
-             "theses": before["theses"]}, migration
-        after = migration["counted_in_neo4j"]
-        assert (after["sources"], after["ideas"], after["theses"]) == \
-               (before["sources"], before["ideas"], before["theses"]), (before, after)
-
-        # `list_theses` used to drop `vector` and `migrate()` used to build its
-        # `Thesis` objects off it, so 60 theses reached Neo4j with a hole (07:78).
-        # LENGTH, not presence of the key: an empty or wrong-dimension vector is
-        # still a hole and `"vector" in row` alone would not see it.
-        with neo4j_store._session() as session:
-            idea_lens = [r["n"] for r in
-                        session.run("MATCH (n:Idea) RETURN size(n.vector) AS n")]
-            thesis_lens = [r["n"] for r in
-                          session.run("MATCH (t:Thesis) RETURN size(t.vector) AS n")]
-        assert len(idea_lens) == before["ideas"], idea_lens
-        assert len(thesis_lens) == before["theses"], thesis_lens
-        assert all(n == EMBED_DIM for n in idea_lens), \
-            f"an idea landed without a {EMBED_DIM}-float vector: {idea_lens}"
-        assert all(n == EMBED_DIM for n in thesis_lens), \
-            f"a thesis landed without a {EMBED_DIM}-float vector: {thesis_lens}"
-    finally:
-        with neo4j_store._session() as session:
-            session.run("MATCH (n) DETACH DELETE n").consume()
-        neo4j_store.close()
-        for key, value in old.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    return (f"{before['sources']}/{before['ideas']}/{before['theses']} migrated, counts "
-            f"match before/after, every vector is {EMBED_DIM} floats; migrate(wipe=True) "
-            "refuses a remote URI before it is ever connected to")
+# check 33 ("migration: lake.db -> Neo4j") is retired with `neo4j_store.migrate()`
+# itself (D11: "миграция... делается операционно, старым образом... в коде путь
+# чтения из SQLite не сохраняем") — there is no `stub_store` left for it to read
+# from. The 384-float-vector regression (07:78) that check proved fixed was a
+# property of `migrate()`'s own Thesis-building, not of anything `neo4j_store`'s
+# normal write path does; that write path (`create_idea_with_theses`/
+# `write_theses`) is exercised by nearly every other check in this file with real
+# vectors from `_vec()`, so the regression class stays covered even with the
+# migration-specific proof gone.
 
 
 # ------------------------------------------------------------------- the runner
@@ -2666,7 +2697,10 @@ def _fingerprint_real_data() -> dict[str, str]:
     # check that reached the module default instead of its bound temp path would enqueue
     # fixture jobs into the operator's real queue, or take the lock the running API
     # holds — and neither shows up as a failure anywhere else.
-    for path in (DATA / "lake.db", DATA / "index.db", DATA / "staging.jsonl",
+    # `lake.db` (the old stub_store SQLite file) is gone with D11 — the graph this
+    # suite must not touch is the real Neo4j the process is pointed at, guarded
+    # separately by `_require_neo4j_up`'s empty-database refusal, not a file here.
+    for path in (DATA / "index.db", DATA / "staging.jsonl",
                  DATA / "staging.cursor", DATA / "pending_link.jsonl",
                  DATA / "jobs.db", DATA / "writer.lock",
                  DATA / "logs" / "retrieve.jsonl"):
@@ -2677,10 +2711,13 @@ def _fingerprint_real_data() -> dict[str, str]:
 
 @check(34, "the Idea-synthesis pair (`lake/idea_merger.py`, `lake/idea_edges.py`) has "
            "its own self-check RUN here, as a subprocess: hypothesis shape (`13` §6 "
-           "field by field), origin/trust, the write order through graph_client, the "
-           "indexed synthetic leaf, `persisted` in the audit log, and on the edge side "
-           "the `:RELATED` label both readers match plus the accumulate/MERGE/MATCH "
-           "semantics of the upsert. Offline, no store and no network")
+           "field by field), origin/trust, the write order through graph_client "
+           "including the two `derived_from` edges (D12), the indexed synthetic "
+           "leaf, `persisted` in the audit log, and `idea_edges.py`'s own "
+           "`parse_parents`. The `:RELATED` label / accumulate-MERGE-MATCH shape of "
+           "the upsert itself moved into `neo4j_store.py` with the edge-writing "
+           "code (D12) and is checked there, offline, by 6.31a's subprocess instead "
+           "— `idea_edges.py` no longer has a Cypher of its own to pin")
 def check_34(tmp: Path) -> str:
     """Both modules used to live entirely behind their own `--self-check`, reached by
     neither this suite nor CI (`.github/workflows/deploy.yml` runs `lake.ingest.run
@@ -2715,6 +2752,138 @@ def check_34(tmp: Path) -> str:
     return "; ".join(notes) + " — both ran to completion as subprocesses"
 
 
+# The four checks below close mutation-testing gaps found against D14's quota (`13`
+# review 2026-07-31): each one is written to FAIL on the specific mutation named in
+# its `@check` text, not just to exercise the code path the mutation sits in.
+
+@check(35, "graph_client.neighbors() on an unreachable Neo4j RAISES — it must never "
+           "swallow the error into an empty list (mutation M13: that turns a broken "
+           "graph into a falsely 'no related ideas' answer instead of a 503, exactly "
+           "the fail-open CLAUDE.md bans)")
+def check_35(tmp: Path) -> None:
+    neo4j_store.close()
+    old_uri = os.environ.get("NEO4J_URI")
+    os.environ["NEO4J_URI"] = "bolt://127.0.0.1:1"   # nothing listens on port 1: fails fast
+    try:
+        try:
+            graph_client.neighbors(["idea_doesnotexist0"])
+        except graph_client.STORE_ERRORS:
+            pass
+        else:
+            raise AssertionError(
+                "neighbors() returned instead of raising on an unreachable Neo4j — a "
+                "broken graph must surface as a 503 through rank.rank()'s edge step, "
+                "not a quiet empty page")
+    finally:
+        neo4j_store.close()
+        if old_uri is None:
+            os.environ.pop("NEO4J_URI", None)
+        else:
+            os.environ["NEO4J_URI"] = old_uri
+
+
+@check(36, "the D14 quota (`floor(0.2*k)` ideas with trust_score==0) is enforced on "
+           "the ACTUAL /retrieve answer, not just the log field (mutation M2: "
+           "`untrusted_used < quota` replaced by `True` removes the cap outright "
+           "while `trust_quota` in the log keeps printing floor(0.2*k) as if nothing "
+           "changed — only the served ideas would show the difference)")
+def check_36(tmp: Path) -> None:
+    _open(tmp)
+    src = _sid("s1")
+    graph_client.write_source(Source(id=src, url=SOURCES["s1"][0], title=SOURCES["s1"][1],
+                                     type=SOURCES["s1"][2], version="v1",
+                                     retrieved_at="2026-07-28T10:00:00Z"))
+    k = 10
+    quota = math.floor(0.2 * k)  # 2
+    # 6 untrusted ideas outscore all 10 trusted ones outright — without the cap every
+    # one of them fits inside k on score alone, nothing pushes them down.
+    untrusted_ids = [_seed_idea(src, f"untrusted match {i}", 0.0) for i in range(6)]
+    trusted_ids = [_seed_idea(src, f"trusted match {i}", 0.8) for i in range(10)]
+    hits = ([{"idea_id": i, "score": 0.9 - 0.001 * n} for n, i in enumerate(untrusted_ids)]
+           + [{"idea_id": i, "score": 0.5 - 0.001 * n} for n, i in enumerate(trusted_ids)])
+    with _swap(rank, "search", lambda q, qv, top_k=50, _h=hits: _h):
+        ideas, log = rank.rank("anything", k=k,
+                               query_vec=np.asarray(_vec("anything"), dtype=np.float32))
+    assert len(ideas) == k, ideas
+    n_untrusted = sum(1 for i in ideas if i["trust_score"] == 0)
+    # This is the line the mutation breaks: without the cap all 6 top-scored
+    # untrusted ideas would be selected, not `quota` (2) of them.
+    assert n_untrusted <= quota, (n_untrusted, quota, [i["idea_id"] for i in ideas])
+    assert log["trust_quota"] == quota, log
+
+
+@check(37, "the untrusted top-up beyond quota (`via='padding'`) is picked in the SAME "
+           "deterministic best-first order `scored` already put candidates in, not "
+           "reversed (mutation M4: `deferred_untrusted[:k-len(out)]` reversed hands "
+           "back the worst-matching untrusted ideas first)")
+def check_37(tmp: Path) -> None:
+    _open(tmp)
+    src = _sid("s1")
+    graph_client.write_source(Source(id=src, url=SOURCES["s1"][0], title=SOURCES["s1"][1],
+                                     type=SOURCES["s1"][2], version="v1",
+                                     retrieved_at="2026-07-28T10:00:00Z"))
+    trusted_id = _seed_idea(src, "trusted anchor", 0.8)
+    # quota = floor(0.2*5) = 1: the primary scan takes untrusted #0 into the cap and
+    # defers #1, #2, #3 in best-score-first order — exactly what padding must preserve.
+    untrusted_ids = [_seed_idea(src, f"untrusted padding candidate {i}", 0.0)
+                     for i in range(4)]
+    hits = ([{"idea_id": trusted_id, "score": 0.99}]
+           + [{"idea_id": i, "score": 0.9 - 0.1 * n} for n, i in enumerate(untrusted_ids)])
+    k = 5
+    with _swap(rank, "search", lambda q, qv, top_k=50, _h=hits: _h):
+        ideas, log = rank.rank("anything", k=k,
+                               query_vec=np.asarray(_vec("anything"), dtype=np.float32))
+    assert len(ideas) == k, ideas
+    padded = [i for i in ideas if i["via"] == "padding"]
+    # untrusted_ids[0] was consumed by the quota (via="thesis"); padding must take the
+    # rest in the SAME best-first order `scored` put them in: [1], [2], [3].
+    assert [i["idea_id"] for i in padded] == untrusted_ids[1:], (padded, untrusted_ids)
+    assert log["untrusted_returned"] == 4 and log["trust_quota"] == 1, log
+
+
+@check(38, "idea_merger's grammar canary (`main()`, before every real run) checks the "
+           "SAME model merge_classify itself runs on (D10: both moved to 9B) — a "
+           "canary pinned to a different model proves nothing about the step it "
+           "guards (mutation M15)")
+def check_38(tmp: Path) -> None:
+    class _Stop(Exception):
+        pass
+
+    step_models: list = []
+
+    def fake_step_complete(prompt, *, system, schema, op, max_tokens, timeout, model,
+                           temperature):
+        step_models.append(model)
+        return {"can_combine": False}
+
+    canary_models: list = []
+
+    def fake_canary(model):
+        canary_models.append(model)
+
+    with _swap(llm, "complete", fake_step_complete), \
+            _swap(llm, "assert_grammar_works", fake_canary):
+        # merge_classify itself, to learn what model it ACTUALLY runs on — not a
+        # constant copied from `idea_merger.py`, which would just check the literal
+        # against itself and stay green under the mutation.
+        idea_merger.ask_can_combine({"text": "a", "effect_claimed": "e"},
+                                    {"text": "b", "effect_claimed": "e"})
+        assert step_models, "ask_can_combine made no llm.complete call"
+        step_model = step_models[0]
+
+        # `main()`'s canary line runs unconditionally, before `run()` — stub `run()`
+        # to abort right after, so this needs neither a real graph nor `--persist`.
+        with _swap(idea_merger, "run", lambda *a, **k: (_ for _ in ()).throw(_Stop())):
+            try:
+                idea_merger.main([])
+            except _Stop:
+                pass
+    assert canary_models, "idea_merger.main() must run the grammar canary before run()"
+    assert canary_models[0] == step_model, (
+        f"canary checked model={canary_models[0]!r} but merge_classify actually runs "
+        f"on {step_model!r} — a passing canary said nothing about the real step")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m lake.selfcheck",
@@ -2722,9 +2891,15 @@ def main(argv=None) -> int:
                     "leaf-ceiling split, "
                     "one run, only assert.")
     parser.add_argument("--offline", action="store_true",
-                        help="skip 6.1, the only check that opens a socket; the other "
-                             "24 need neither the network nor a key")
+                        help="skip 6.1, the only check that opens a socket to the school's "
+                             "LLM servers; the other checks still need NO_PROXY, no key — "
+                             "but DO need a live, empty, LOCAL Neo4j (D11: it is the only "
+                             "backend now, not just what points 31/31a used to reach past "
+                             "a `stub` default for)")
     args = parser.parse_args(argv)
+
+    _require_neo4j_up()  # D11: the whole suite's precondition now, checked once, up front —
+                          # never silently green because the graph it needs is absent (13 §10)
 
     trace.set_run_id("selfcheck-" + uuid.uuid4().hex[:6])
     failed: list[int] = []
@@ -2757,11 +2932,6 @@ def main(argv=None) -> int:
                 try:
                     with contextlib.redirect_stdout(captured):
                         note = fn(tmp)
-                except _Skip as exc:
-                    # Loud and distinct from `ok`: a check whose subject (a live
-                    # Neo4j, points 31/33) is absent must never read as green.
-                    skipped.append(number)
-                    print(f"skip 6.{number}  {what}\n      {exc}")
                 except Exception:
                     failed.append(number)
                     print(f"FAIL 6.{number}  {what}")

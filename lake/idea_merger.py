@@ -3,16 +3,14 @@ and drafted by the school's LLMs (spec 10 §3.1 conventions), written the way `1
 says a hypothesis is written.
 
 **Goes through `graph_client`, not through a driver of its own.** The original version
-opened `neo4j.GraphDatabase` directly and justified it by "`graph_client` fronts
-`stub_store`, which never held the ideas this operates on". That stopped being true on
-2026-07-31: `graph_client` picks between `stub_store` and `neo4j_store` by `LAKE_STORE`
-(`graph_client.py:44-92`, `13` §4.1), and the Bolt backend is the same lake this reads.
-A second write path around it would miss everything the backend does on the way in — the
-`seq` ordering counter (`neo4j_store.py:131`, without which `list_idea_ids`/`get_leaves`
-come back in a shuffled order), the uniqueness constraints, `dirty` raised inside the
-same transaction as the leaves (`13` §3.2), and the trace block D reads. This module now
-runs on whichever backend `LAKE_STORE` names, stub or Bolt, and writes nothing the
-serving path cannot read.
+opened `neo4j.GraphDatabase` directly and justified it by "`graph_client` fronts a
+store that never held the ideas this operates on". That stopped being true on
+2026-07-31, and since D11 `graph_client` has exactly one backend, `neo4j_store`, the
+same lake this reads. A second write path around it would miss everything the backend
+does on the way in — the `seq` ordering counter (`neo4j_store.py:131`, without which
+`list_idea_ids`/`get_leaves` come back in a shuffled order), the uniqueness
+constraints, `dirty` raised inside the same transaction as the leaves (`13` §3.2), and
+the trace block D reads. This module writes nothing the serving path cannot read.
 
 A hypothesis is not a bare Idea node. `13` §5-§6:
 
@@ -33,7 +31,8 @@ Pipeline per pair:
 
   1. two random Idea nodes from the lake. Hypotheses are **not** eligible as parents —
      see `sample_idea_pairs`.
-  2. merge_classify (35B, schema-forced boolean): can these two combine into one
+  2. merge_classify (9B, schema-forced boolean; D10 moved it off 35B — cheap and fast per
+     the meeting, not the arbiter's job): can these two combine into one
      coherent idea? A schema-forced `can_combine` replaces free-text ДА/НЕТ entirely —
      there is no "chatty small model" failure mode to parse around, the grammar only
      ever returns a JSON boolean (`lake/llm.py` p.1, p.5-p.7).
@@ -48,18 +47,16 @@ Pipeline per pair:
   5. `write_source` → `create_idea_with_theses` → `index_theses`, the same three calls
      in the same order as the ingest loop (`run.py:246-280`).
 
-The `DERIVED_FROM` edge to the two parents is **not** written here. A writes no
-Idea—Idea edges at all (`13` §3.1) and `graph_client` has no method for one; the edge is
-block B's side and lives in `idea_edges.py --derived-from`, which reads the parentage
-back off the leaf's `locator`, so this module keeps one write path instead of two.
+The `derived_from` edge to the two parents (D12) is written HERE, right after the
+hypothesis and its synthetic leaf are committed — `graph_client.write_derived_from_edges`,
+weight fixed at 1.0, one edge per parent, child -> parent. `13` §3.1's "A never writes
+Idea—Idea edges" is stale as of D12; the parentage still ALSO lives in the leaf's
+`locator` (`13` §6) — that is what `idea_edges.py`'s backfill CLI reads for hypotheses
+synthesized before this edge write existed — but a fresh hypothesis no longer depends on
+a second pass ever running to become a real graph edge.
 
-Two deliberate gaps, both worth knowing before reading a run's output as complete:
+One deliberate gap, worth knowing before reading a run's output as complete:
 
-- **`--derived-from` speaks Cypher only.** Under `LAKE_STORE=stub` the hypothesis
-  lands in SQLite, and that pass — which never touches `stub_store`'s `edge` table —
-  finds nothing to convert. The parentage still exists, on the leaf's `locator`, but it
-  never becomes an edge and `stub_store.neighbors` never returns it. Edges on the stub
-  backend need Neo4j, or they need a stub writer nobody has asked for yet.
 - **No dedup.** `13` §6 п.2 has the synthetic leaf go through the arbiter
   (`link.py:46-109`) so a repeated synthesis attaches to the existing idea instead of
   creating a second node; that is deferred by decision, not overlooked. `create_idea_
@@ -173,7 +170,7 @@ def ask_can_combine(idea_a: dict, idea_b: dict) -> bool:
     prompt = f"IDEA A\n{_describe(idea_a)}\n\nIDEA B\n{_describe(idea_b)}\n"
     answer = llm.complete(prompt, system=llm.load_prompt("merge_classify"),
                           schema=CAN_COMBINE_SCHEMA, op="merge_classify", max_tokens=32,
-                          timeout=30, model=llm.QWEN_35B, temperature=0.0)
+                          timeout=30, model=llm.QWEN_9B, temperature=0.0)
     return bool(answer["can_combine"])
 
 
@@ -247,11 +244,29 @@ def synthesis_records(idea: Idea, parent_ids: list[str]) -> tuple[Source, Thesis
     return src, thesis
 
 
-def write_hypothesis(idea: Idea, parent_ids: list[str]) -> Thesis:
-    """Source, then idea+leaf in one transaction, then the index — the same three calls
-    in the same order as the ingest loop (`run.py:246-280`). Indexing after the commit,
-    never before: an indexed thesis no graph write backs is a search hit into a hole,
-    and `_reconcile_index` only ever repairs the other direction."""
+def write_hypothesis(idea: Idea, parent_ids: list[str]) -> tuple[Thesis, list[str]]:
+    """Source, then idea+leaf in one transaction, then the index, then the
+    `derived_from` edges (D12) — the same three-call order as the ingest loop
+    (`run.py:246-280`) plus one step neither branch of that loop needs. Indexing
+    after the commit, never before: an indexed thesis no graph write backs is a
+    search hit into a hole, and `_reconcile_index` only ever repairs the other
+    direction. Edges after the idea exists, for the same reason `write_source` runs
+    before `create_idea_with_theses` — an edge to a parent that is not yet
+    committed is not the failure mode here (both parents pre-exist), but an edge
+    FROM a hypothesis that does not exist yet would be.
+
+    Returns `(thesis, missing_parent_ids)`. A parent id that does not MATCH is not
+    this function's failure to hide: the hypothesis and its leaf are already
+    committed and findable either way (module docstring above), so raising here
+    would make a real write look like a crash. It is also not this function's
+    call to swallow silently: `idea_edges.py`'s own backfill CLI treats the same
+    "wrote, but a parent was missing" outcome as exit code 1 (`main`, lines
+    ~148-152), and until 2026-07-31 this function answered the SAME condition
+    with only a printed WARNING — a green `write_hypothesis` and a red
+    `idea_edges.py` for the identical shape of partial write (review). Returning
+    the missing ids, instead of only printing them, is what lets `run`/`main`
+    below apply that same exit code without re-deriving it from stdout.
+    """
     # ponytail: a failure between `write_source` and `create_idea_with_theses` leaves a
     # Source with no leaves, and unlike the ingest loop this one cannot self-heal — the
     # cursor there is not advanced and `source_id` is stable, so a retry MERGEs the same
@@ -264,7 +279,11 @@ def write_hypothesis(idea: Idea, parent_ids: list[str]) -> Thesis:
     graph_client.write_source(src)
     graph_client.create_idea_with_theses(idea, src.id, [thesis])
     index.index_theses([thesis])
-    return thesis
+    edge_outcomes = graph_client.write_derived_from_edges(idea.id, parent_ids)
+    missing = [o["idea_b_id"] for o in edge_outcomes if o["missing"]]
+    if missing:
+        print(f"WARNING: {idea.id}: derived_from edge(s) missing parent(s) {missing}")
+    return thesis, missing
 
 
 # ============================================================
@@ -293,13 +312,19 @@ def log_pair(idea_a: dict, idea_b: dict, result: Idea | None, *, persisted: bool
 # ============================================================
 
 def run(num_pairs: int, persist: bool, min_trust: float | None = None,
-        log_path=MERGE_LOG) -> list[Idea | None]:
+        log_path=MERGE_LOG) -> tuple[list[Idea | None], list[str]]:
+    """Returns `(results, missing_parent_ideas)` — the second list names every
+    persisted hypothesis whose `derived_from` write found a parent missing
+    (`write_hypothesis`'s own return, review 2026-07-31), so `main` can answer
+    the same "wrote, but incompletely" outcome `idea_edges.py`'s backfill CLI
+    already turns into exit code 1, instead of only a WARNING line."""
     pairs = sample_idea_pairs(num_pairs, min_trust=min_trust)
     if not pairs:
         print("no Idea pairs found in the graph")
-        return []
+        return [], []
 
     results: list[Idea | None] = []
+    missing_parent_ideas: list[str] = []
     for idea_a, idea_b in pairs:
         result = try_combine_ideas(idea_a, idea_b)
         written = False
@@ -312,8 +337,10 @@ def run(num_pairs: int, persist: bool, min_trust: float | None = None,
             if result is not None:
                 print(f"combined {idea_a['id']} + {idea_b['id']} -> {result.id}: {result.text}")
                 if persist:
-                    thesis = write_hypothesis(result, [idea_a["id"], idea_b["id"]])
+                    thesis, missing = write_hypothesis(result, [idea_a["id"], idea_b["id"]])
                     written = True
+                    if missing:
+                        missing_parent_ideas.append(result.id)
                     print(f"   written via {graph_client.backend_name()}, "
                           f"synthetic leaf {thesis.id} indexed")
             else:
@@ -321,7 +348,7 @@ def run(num_pairs: int, persist: bool, min_trust: float | None = None,
         finally:
             log_pair(idea_a, idea_b, result, persisted=written, log_path=log_path)
         results.append(result)
-    return results
+    return results, missing_parent_ideas
 
 
 # ============================================================
@@ -346,12 +373,19 @@ def main(argv: list[str] | None = None) -> int:
         demo()
         return 0
 
-    llm.assert_grammar_works(llm.QWEN_9B)     # canary per model used, every run
-    llm.assert_grammar_works(llm.QWEN_35B)
+    llm.assert_grammar_works(llm.QWEN_9B)     # canary per model used, every run (D10: both steps are 9B now)
 
-    results = run(args.num_pairs, args.persist, min_trust=args.min_trust)
+    results, missing_parent_ideas = run(args.num_pairs, args.persist, min_trust=args.min_trust)
     successful = [r for r in results if r is not None]
     print(f"{len(successful)}/{len(results)} pairs combined; log: {MERGE_LOG}")
+    # Same behavior as `idea_edges.py`'s backfill CLI for the identical condition
+    # (review 2026-07-31): a hypothesis whose `derived_from` write found a missing
+    # parent DID get written — `successful` above still counts it — but exit 0 here
+    # would say the run has nothing left to look at, when it does.
+    if missing_parent_ideas:
+        print(f"{len(missing_parent_ideas)} hypothesis(es) written with a missing "
+              f"derived_from parent edge: {missing_parent_ideas}")
+        return 1
     return 0
 
 
@@ -369,6 +403,7 @@ class _FakeGraph:
         self.writes: list[tuple] = []
         self.indexed: list[Thesis] = []
         self.order: list[str] = []
+        self.edges: list[tuple] = []
 
     def list_idea_ids(self, limit=50, offset=0):
         return [b["id"] for b in self.bodies][offset:offset + limit]
@@ -390,6 +425,12 @@ class _FakeGraph:
     def index_theses(self, theses):
         self.order.append("index_theses")
         self.indexed.extend(theses)
+
+    def write_derived_from_edges(self, child_id, parent_ids):
+        self.order.append("write_derived_from_edges")
+        self.edges.append((child_id, parent_ids))
+        return [{"idea_a_id": child_id, "idea_b_id": p, "weight": 1.0, "missing": False}
+                for p in parent_ids]
 
     def backend_name(self):
         return "fake"
@@ -423,7 +464,7 @@ def demo() -> None:
         assert "IDEA A" in prompt and "IDEA B" in prompt, prompt
         assert temperature == 0.0
         if op == "merge_classify":
-            assert schema is CAN_COMBINE_SCHEMA and model is llm.QWEN_35B
+            assert schema is CAN_COMBINE_SCHEMA and model is llm.QWEN_9B
             return {"can_combine": _ANSWERS.pop(0)}
         assert op == "merge_generate" and schema is GENERALIZE_SCHEMA and model is llm.QWEN_9B
         return {"text": "cache-aside reads paired with pooled connections to the backing "
@@ -501,18 +542,43 @@ def _demo_body(idea_a, idea_b, calls, _body) -> None:
 
     # (d) the write goes through graph_client, in the ingest order, and the leaf is
     # indexed — a hypothesis nobody indexed is one /retrieve cannot find (§6 п.1).
+    # D12: derived_from edges to BOTH parents are written last, after the hypothesis
+    # exists — an edge from a not-yet-committed node is the failure mode ordering
+    # rules out (module docstring).
     real_graph, real_index = graph_client, index
     fake = _FakeGraph()
     globals()["graph_client"], globals()["index"] = fake, fake
     try:
-        leaf = write_hypothesis(result, [idea_a["id"], idea_b["id"]])
+        leaf, missing = write_hypothesis(result, [idea_a["id"], idea_b["id"]])
     finally:
         globals()["graph_client"], globals()["index"] = real_graph, real_index
-    assert fake.order == ["write_source", "create_idea_with_theses", "index_theses"], fake.order
+    assert fake.order == ["write_source", "create_idea_with_theses", "index_theses",
+                          "write_derived_from_edges"], fake.order
     written_idea, written_sid, written_theses = fake.writes[0]
     assert written_idea is result and written_sid == fake.sources[0].id
     assert [t.id for t in written_theses] == [leaf.id] == [t.id for t in fake.indexed]
-    print("ok (d): write_source -> create_idea_with_theses -> index_theses, one leaf")
+    assert fake.edges == [(result.id, [idea_a["id"], idea_b["id"]])], fake.edges
+    assert missing == [], "both parents pre-exist in this fixture — nothing should be missing"
+    print("ok (d): write_source -> create_idea_with_theses -> index_theses -> "
+          "write_derived_from_edges(child, [parent_a, parent_b])")
+
+    # (d2) a missing parent is warned about, not raised — the hypothesis and its leaf
+    # are already committed and findable either way (module docstring) — but IS
+    # returned to the caller (review 2026-07-31: `main` needs it for exit code 1,
+    # the same behavior `idea_edges.py`'s backfill CLI already has for this outcome).
+    class _MissingParent(_FakeGraph):
+        def write_derived_from_edges(self, child_id, parent_ids):
+            return [{"idea_a_id": child_id, "idea_b_id": p, "weight": None, "missing": True}
+                   for p in parent_ids]
+
+    globals()["graph_client"], globals()["index"] = _MissingParent(), _FakeGraph()
+    try:
+        _leaf2, missing2 = write_hypothesis(result, [idea_a["id"], idea_b["id"]])  # must not raise
+    finally:
+        globals()["graph_client"], globals()["index"] = real_graph, real_index
+    assert missing2 == [idea_a["id"], idea_b["id"]], missing2
+    print("ok (d2): a missing derived_from parent is reported AND returned, not "
+          "raised — the hypothesis write already committed")
 
     # (e) sampling refuses hypotheses as parents: compounding unverified content leaves
     # nothing in the chain that ever grounds it (`sample_idea_pairs`).
@@ -581,6 +647,24 @@ def _demo_body(idea_a, idea_b, calls, _body) -> None:
         lines = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines()]
         assert len(lines) == 1 and lines[0]["persisted"] is False, lines
     print("ok (g): a write that raised still logs the pair, as persisted=false, then propagates")
+
+    # (h) `run()` surfaces `write_hypothesis`'s missing-parent ids all the way up —
+    # `main()` turns a non-empty list into exit code 1 (review 2026-07-31, item 8:
+    # this used to be a WARNING nobody's exit code reflected, unlike `idea_edges.py`'s
+    # identical condition).
+    _ANSWERS = [True]
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "idea_merger.jsonl"
+        globals()["graph_client"] = _MissingParent([idea_a, idea_b])
+        globals()["index"] = _FakeGraph()
+        try:
+            h_results, h_missing = run(1, persist=True, log_path=log_path)
+        finally:
+            globals()["graph_client"], globals()["index"] = real_graph, real_index
+        assert len(h_results) == 1 and h_results[0] is not None, h_results
+        assert h_missing == [h_results[0].id], h_missing
+    print("ok (h): run() returns the persisted-but-incomplete hypothesis id, not just a "
+          "printed WARNING")
 
     print("idea_merger self-check OK")
 

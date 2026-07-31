@@ -159,7 +159,15 @@ def retrieve(query: str, k: int = K_DEFAULT, *, budget: int | None = None,
     # the two must never disagree about what the request cost.
     cost = {"tokens_in": 0, "tokens_out": 0, "wall_ms": 0.0}
     record = {"log_id": log_id, "ts": _now(), "query_raw": query, "query_rewritten": query,
-              "rewrite_failed": False, "k": k, "returned": [], "cut_off": [], "cost": cost}
+              "rewrite_failed": False, "k": k, "returned": [], "cut_off": [], "cost": cost,
+              # D14: quota fields default to "nothing ranked yet" — `None`, not 0
+              # (review finding 2026-07-31): 0 is also the legal value of a healthy
+              # request whose quota never had to reject anyone, so a 503 that
+              # initialized these to 0 was indistinguishable from an honestly
+              # empty quota violation on all three fields. The 503 path below
+              # never overwrites them; only a call that actually reached
+              # `rank.rank()` has anything to report about trust.
+              "trust_quota": None, "untrusted_returned": None, "untrusted_over_quota": None}
     # Per-request ids and per-request token counter (trace.request). Diffing the
     # process-global totals made concurrent requests claim each other's tokens,
     # and the global run/log id cross-tagged trace rows even sequentially.
@@ -200,6 +208,12 @@ def retrieve(query: str, k: int = K_DEFAULT, *, budget: int | None = None,
                         "diverged (§6.19); refusing to answer as an empty lake")
                 ideas, payload = rank.rank(record["query_rewritten"], k=k)
                 record["returned"], record["cut_off"] = payload["returned"], payload["cut_off"]
+                # D14: how many trust_score==0 ideas the quota let through, and how
+                # many more than that recall-first still had to add — the exact
+                # fields a silent quota violation would otherwise hide.
+                record["trust_quota"] = payload["trust_quota"]
+                record["untrusted_returned"] = payload["untrusted_returned"]
+                record["untrusted_over_quota"] = payload["untrusted_over_quota"]
                 # The body is validated HERE, inside the guard, and not left to the
                 # HTTP layer. FastAPI validates a response AFTER this function has
                 # returned 200 and its `finally` has already written `returned: [...]`

@@ -147,8 +147,8 @@ lake/
   llm.py               # клиент llama.cpp: схема, канарейка, fail-closed
   embed.py             # arctic-embed-s на CPU
   trace.py             # C5: JSONL-декоратор
-  graph_client.py      # ЕДИНСТВЕННОЕ место, знающее формат B (C1 + C2)
-  stub_store.py        # SQLite-бэкенд того же интерфейса, пока B не готов — ВРЕМЕННЫЙ
+  graph_client.py      # ЕДИНСТВЕННОЕ место, знающее формат B (C1 + C2); Neo4j-only (D11, 2026-07-31)
+  neo4j_store.py       # Neo4j-бэкенд, рёбра A (D12, 2026-07-31)
   index.py             # индекс тезисов: FTS5 + вектора + RRF. Мой навсегда, на Neo4j не едет
   models.py            # Source / Thesis / Idea: dataclass + JSON-схемы для LLM
   selfcheck.py         # assert-проверки, один запуск
@@ -270,9 +270,10 @@ def parse_section(...): ...
 
 Счёт токенов — `usage.*` из ответа, он надёжен при `stream=False` (`09:293`).
 
-### 3.4 `graph_client.py` и `stub_store.py`
+### 3.4 `graph_client.py` и `neo4j_store.py`
 
-Единственное место, знающее формат B. Смена формата = правка одного файла (`08:60`).
+**[ревизия 2026-07-31: РЕАЛИЗОВАНО]** Единственное место, знающее формат B — теперь только Neo4j. 
+Смена формата = правка `neo4j_store.py`.
 
 ```python
 def write_source(src: Source) -> str
@@ -287,31 +288,13 @@ def neighbors(ids: list[str], hops: int = 1, min_weight: float | None = None) ->
 
 **`update_thesis` в интерфейсе нет и не будет.** Иммутабельность тезиса (§1.2) держится отсутствием метода, а не `frozen=True` на dataclass: писать в хранилище может только этот модуль, и если способа изменить `text` он не предоставляет, изменить его неоткуда. `selfcheck` проверяет именно это (§6.9).
 
-Со-встречаемость внутри источника отдельным полем не передаётся: батч приходит одним вызовом на один источник (`08:177`), все затронутые идеи в нём видны, инициализацию рёбер B выводит из батча (`06:217`, механизм 1).
+Со-встречаемость внутри источника отдельным полем не передаётся: батч приходит одним вызовом на один источник (`08:177`), все затронутые идеи в нём видны, инициализацию рёбер A выводит сама в пайплайне (`lake/graph_client.write_cocitation_edges`, `lake/graph_client.write_derived_from_edges`, D12).
 
 `get_ideas` отдаёт листья **уже склеенными** с `source.type`, `source.url`, `source.title`. Так разделение `effect_claimed`/`effect_observed` не зависит от того, вспомнил ли кто-то сделать join, а провенанс в ответе `/retrieve` берётся оттуда же.
 
-`stub_store.py` — тот же интерфейс на SQLite (`08:62`), **временный**: умирает в день переезда на Neo4j.
+**Запись листа и создание идеи — одна транзакция.** Иначе отказ между `create_idea` и `write_theses` оставляет идею с нулём листьев, что нарушает `IDEA ||--|{ THESIS` (`06:85`), а §4.5 объявляет падение одного тезиса из шести штатным случаем. В Neo4j это `session.execute_write(txn)` с обеими операциями внутри (`neo4j_store.py:847-855`).
 
-```sql
-CREATE TABLE source(id TEXT PRIMARY KEY, url, title, type, version,
-                    retrieved_at, run_success INT, run_meta TEXT);
-CREATE TABLE idea(id TEXT PRIMARY KEY, text, applicability_conditions, limitations,
-                  failure_modes TEXT, differentiation, effect_claimed, effect_observed,
-                  trust_score REAL, dirty INT, rederived_at_leaf_count INT DEFAULT 0,
-                  created_at, updated_at, vec BLOB);
-CREATE TABLE thesis(rowid INTEGER PRIMARY KEY, id TEXT UNIQUE, source_id, idea_id,
-                    text, context, effect, locator, text_hash, created_at, vec BLOB,
-                    UNIQUE(source_id, text_hash));
-CREATE TABLE edge(source_id, target_id, type, note, weight REAL, evidence TEXT,
-                  PRIMARY KEY(source_id, target_id, type));
-```
-
-**Запись листа и создание идеи — одна транзакция.** Иначе отказ между `create_idea` и `write_theses` оставляет идею с нулём листьев, что нарушает `IDEA ||--|{ THESIS` (`06:85`), а §4.5 объявляет падение одного тезиса из шести штатным случаем. В stub это `BEGIN`/`COMMIT`, у B — вопрос к её реализации, и он записан в §10.
-
-`edge` в MVP пустая: рёбра — зона B. Пока она пуста, `neighbors` возвращает `[]`, и ранжирование деградирует до плоского top-k — это пункт 3 в порядке урезания (`08:377`).
-
-`trust_score` в stub считается заглушкой — логарифм числа различающихся источников под идеей, кандидат первой версии из `06:192`. Значение B его заменяет; формула у меня нигде не размазана, читается только в ранжировании.
+**Рёбра теперь пишет A, не B** (D12): `write_cocitation_edges` и `write_derived_from_edges` запускаются в пайплайне фазы 2 и синтеза. `neighbors` отдаёт реальные рёбра; ранжирование использует их в `via="edge"` для дозаполнения (`lake/retrieve/rank.py:189-212`).
 
 ### 3.5 `index.py` — индекс тезисов, мой навсегда
 

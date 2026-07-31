@@ -1,117 +1,54 @@
-"""Write the Idea—Idea edges of the lake, against the Neo4j instance block B serves
-(`knowledge/07-roles-and-contracts.md:70-81`). Two passes, one CLI:
+"""Backfill CLI for the Idea—Idea edges of the lake (`(:Idea)-[:RELATED {type}]->(:Idea)`).
 
-- **co-citation** (default): two ideas that both leaf into the same Source
-  (`(:Source)-[:YIELDS]->(:Thesis)<-[:HAS_LEAF]-(:Idea)`) are co-cited by it; every
-  source with >= `min_theses` distinct co-cited ideas contributes one weight increment
-  per unordered idea pair.
-- **`--derived-from`**: a hypothesis (`Idea.origin="synthesized"`, `13` §5) to the two
-  ideas it was synthesized out of. `idea_merger.py` does not write this edge — it goes
-  through `graph_client`, which has no method for one, because A writes no Idea—Idea
-  edges at all (`13` §3.1). The parentage reaches the graph on the synthetic leaf's
-  `locator` (`synthesis/<id>+<id>`, `13` §6) and this pass turns it into an edge.
+**D12: A writes these edges itself, in the pipeline, not here.** Co-citation is
+written per source right after that source's ideas are committed
+(`ingest/run.py`, phase 2), `derived_from` is written at synthesis
+(`idea_merger.write_hypothesis`). This file is what is left over: a one-off
+recompute for data that reached the graph BEFORE D12 shipped and therefore never
+went through either of those two write points.
 
-**Both passes are Neo4j-only, and that is a real gap, not a formality.** This file
-speaks Cypher against a driver of its own; `idea_merger.py` writes through
-`graph_client`, which under the default `LAKE_STORE=stub` puts the hypothesis in
-SQLite. Run against a stub-backed lake there is nothing here to read and nothing
-written: `stub_store`'s `edge` table — the one `stub_store.neighbors` reads
-(`stub_store.py:41-42`) — stays empty, and a hypothesis keeps its parentage only on the
-leaf's `locator`. Edges on the stub backend would need a writer that does not exist.
+- **co-citation** (default): re-runs `graph_client.write_cocitation_edges` over
+  every Source currently in the lake. Idempotent by construction (the edge's
+  `evidence` records which source ids have already contributed, `neo4j_store`'s
+  docstring) — running this against a lake phase 2 already covered is a no-op,
+  not a doubled weight, which is what makes "just in case, backfill again" safe.
+- **`--derived-from`**: every `Idea.origin="synthesized"` node, parentage read off
+  its synthetic leaf's `locator` (`synthesis/<id>+<id>`, `13` §6) the same way
+  `idea_merger` reads it before the fresh write path existed, then
+  `graph_client.write_derived_from_edges`.
 
-Still not a `graph_client` backend, but the reason changed on 2026-07-31 and the old
-one is worth not repeating: it used to be "`graph_client` fronts `stub_store`, which
-never held these ideas" — no longer true, `LAKE_STORE=neo4j` puts the real Bolt store
-behind it (`graph_client.py:44-92`). The reason now is the contract: **A never writes
-edges** (`13` §3.1, `07:16`, `06` §6) and `graph_client` therefore exposes no method
-that could; `neighbors()` is read-only and that is the whole of A's side. This script
-is block B's, run by hand against B's instance, and it stays out of `graph_client.py`
-so it cannot be mistaken for part of the serving path.
-
-**The relationship type is `:RELATED` and is not configurable.** Both readers of the
-graph match exactly `(:Idea)-[:RELATED]->(:Idea)` — `neighbors()` (`neo4j_store.py:761`,
-which feeds `via="edge"` top-up in `retrieve/rank.py:149`) and `counts()`
-(`neo4j_store.py:545`, which is `/stats`'s `edges`). The first version of this file
-wrote `RELATED_VIA_SOURCE` with a `--rel-type` flag: those edges land in the database,
-`MATCH` finds them by hand, and every serving path reads straight past them — a full
-graph that reports `edges: 0` and ranks as if it were empty. The kind of edge lives in
-the `type` **property** instead, which is what both readers already return in their
-rows, and the flag is gone rather than defaulted: a knob whose every non-default value
-produces invisible writes is not a knob.
-
-**Both directions are written for co-citation.** The stored edge is directed in both
-backends (`stub_store.neighbors` filters `WHERE source_id IN (...)`,
-`neo4j_store.neighbors` matches `-[r]->`), so a single edge is only ever traversable
-from one end; co-citation is symmetric, and one row would make the traversal depend on
-which of the two idea ids sorts first. `--derived-from` writes one direction on
-purpose — child -> parent — because there the direction *is* the meaning.
-
-Repeated runs accumulate the co-citation weight rather than overwrite it, so a source
-seen again (a re-post through `upsert_source`, or a second load) keeps compounding it —
-deduplicating that is `--dry-run`'s job, not this script's: run it once per source per
-intended increment. `--derived-from` is idempotent: it sets the weight rather than
-adding to it, since the parentage of a hypothesis cannot happen twice.
-
-TODO (left as found, not this pass's job): `compute_weight_increment` is
-`min(count_a, count_b)`, chosen as a placeholder. It rewards two ideas for how many
-leaves EACH has under the source, not for how much the source specifically ties them
-together, so an idea with many unrelated leaves under one source inflates every pair it
-is in.
+**Goes through `graph_client`, not a driver of its own.** The original version of
+this file opened `neo4j.GraphDatabase` directly and justified it by "A never
+writes edges, so this cannot go through `graph_client`, which has no method for
+one" (`13` §3.1). D12 gave `graph_client` exactly that method, and it is the one
+the pipeline itself calls — a second Cypher implementation here would drift from
+whatever the pipeline's ends up doing.
 """
 import argparse
 import os
 
-DEFAULT_MIN_THESES = 2
-
-# The relationship label both readers match on. Not a parameter — see the docstring.
-REL_LABEL = "RELATED"
-CO_CITED = "related_via_source"     # goes into the edge's `type` property
-DERIVED_FROM = "derived_from"
-
-_FIND_PAIRS = """
-MATCH (s:Source)-[:YIELDS]->(t:Thesis)<-[:HAS_LEAF]-(i:Idea)
-WITH s, i, count(DISTINCT t) AS thesis_count
-WHERE thesis_count >= $min_theses
-WITH s, collect({idea_id: i.id, count: thesis_count}) AS ideas
-WHERE size(ideas) >= 2
-UNWIND ideas AS a
-UNWIND ideas AS b
-WITH s, a, b
-WHERE a.idea_id < b.idea_id
-RETURN s.id AS source_id,
-       a.idea_id AS idea_a_id, a.count AS count_a,
-       b.idea_id AS idea_b_id, b.count AS count_b
-"""
-
-# The parentage of every hypothesis, read off the synthetic leaf `13` §6 puts it on.
-# `origin` is checked as well as the locator prefix: either one alone would also match
-# a hand-made node, and the two together are what `idea_merger.write_hypothesis` writes.
-_FIND_DERIVED = """
-MATCH (i:Idea)-[:HAS_LEAF]->(t:Thesis)
-WHERE i.origin = 'synthesized' AND t.locator STARTS WITH 'synthesis/'
-RETURN i.id AS child_id, t.locator AS locator
-"""
-
-# One statement for both passes. `MERGE` on the typed edge, then `SET` — the type has
-# to be part of the MERGE pattern, or a second pass with a different `type` would match
-# the first pass's edge and overwrite its kind.
-_UPSERT = f"""
-MATCH (a:Idea {{id: $idea_a_id}})
-MATCH (b:Idea {{id: $idea_b_id}})
-MERGE (a)-[r:{REL_LABEL} {{type: $type}}]->(b)
-ON CREATE SET r.weight = 0
-SET r.weight = CASE WHEN $accumulate THEN coalesce(r.weight, 0) + $increment
-                    ELSE $increment END,
-    r.note = $note,
-    r.evidence = $evidence,
-    r.updated_at = datetime()
-RETURN r.weight AS new_weight
-"""
+DEFAULT_MIN_IDEAS = 2
 
 
-def compute_weight_increment(count_a: int, count_b: int) -> float:
-    """Weight added to one Idea-Idea edge for one shared Source. See the TODO above."""
-    return min(count_a, count_b)
+def backfill_cocitation(min_ideas: int = DEFAULT_MIN_IDEAS,
+                        dry_run: bool = False) -> list[dict]:
+    """One `graph_client.write_cocitation_edges` call per Source in the lake.
+    Returns every outcome, across every source, in source order."""
+    from . import graph_client
+
+    outcomes = []
+    offset = 0
+    page = 50
+    while True:
+        sources = graph_client.list_sources(limit=page, offset=offset)
+        if not sources:
+            break
+        for src in sources:
+            for outcome in graph_client.write_cocitation_edges(
+                    src["id"], min_ideas=min_ideas, dry_run=dry_run):
+                outcomes.append({"source_id": src["id"], **outcome})
+        offset += page
+    return outcomes
 
 
 def parse_parents(locator: str) -> list[str]:
@@ -122,154 +59,59 @@ def parse_parents(locator: str) -> list[str]:
 
     The prefix guard is load-bearing and easy to lose: without it `locator[10:]` still
     slices any string, so `pdf/page/12+34` would come back as the two "parents"
-    `['ge/12', '34']` and this pass would MATCH two ids that do not exist. The demo
-    pins that with a locator long enough for the slice to survive — a short one like
-    `pdf/page/3` truncates to `''` and passes with the guard removed (review).
+    `['ge/12', '34']` and this pass would try to write two edges to ids that do not
+    exist. The demo pins that with a locator long enough for the slice to survive — a
+    short one like `pdf/page/3` truncates to `''` and passes with the guard removed
+    (review).
     """
     if not locator.startswith("synthesis/"):
         return []
     return [part for part in locator[len("synthesis/"):].split("+") if part]
 
 
-def open_driver():
-    from neo4j import GraphDatabase
-
-    missing = [name for name in ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD")
-               if not os.environ.get(name)]
-    if missing:
-        raise SystemExit(f"not in the environment: {', '.join(missing)}")
-    return GraphDatabase.driver(os.environ["NEO4J_URI"],
-                                auth=(os.environ["NEO4J_USERNAME"],
-                                      os.environ["NEO4J_PASSWORD"]))
-
-
-def database_name() -> str:
-    return os.environ.get("NEO4J_DATABASE", "neo4j")
-
-
-def find_pairs(session, min_theses: int) -> list[dict]:
-    return [dict(r) for r in session.run(_FIND_PAIRS, min_theses=min_theses)]
-
-
-def find_derived(session) -> list[dict]:
-    return [dict(r) for r in session.run(_FIND_DERIVED)]
-
-
-def upsert_edge(tx, idea_a_id: str, idea_b_id: str, increment: float, *,
-                type_: str, note: str, evidence: str, accumulate: bool) -> float | None:
-    """One directed edge, inside a caller-supplied transaction. `None` means one of the
-    two MATCHes found nothing — the edge was NOT written. Every caller has to tell that
-    apart from a weight, because `None` is also what a dry run records."""
-    rec = tx.run(_UPSERT, idea_a_id=idea_a_id, idea_b_id=idea_b_id,
-                 increment=increment, type=type_, note=note, evidence=evidence,
-                 accumulate=accumulate).single()
-    return rec["new_weight"] if rec else None
-
-
-def upsert_both(session, idea_a_id: str, idea_b_id: str, increment: float, *,
-                type_: str, note: str, evidence: str) -> tuple[float | None, float | None]:
-    """Both directions of one symmetric edge, in ONE managed transaction.
-
-    Two autocommit `session.run` calls would not do: if the second raises, the first is
-    already committed and the graph keeps a one-sided edge — and since `neighbors()`
-    traverses `-[r]->` directionally, the traversal then depends on which end you enter
-    from, which is exactly what writing both directions exists to prevent. Worse, the
-    obvious repair (re-run) adds the increment to the surviving direction a second time
-    and the two weights diverge for good. `execute_write` makes the pair atomic and
-    gives it the driver's retry (review, finding 8).
-    """
-    def txn(tx):
-        forward = upsert_edge(tx, idea_a_id, idea_b_id, increment, type_=type_,
-                              note=note, evidence=evidence, accumulate=True)
-        reverse = upsert_edge(tx, idea_b_id, idea_a_id, increment, type_=type_,
-                              note=note, evidence=evidence, accumulate=True)
-        return forward, reverse
-
-    return session.execute_write(txn)
-
-
-def process(session, min_theses: int = DEFAULT_MIN_THESES, dry_run: bool = False) -> list[dict]:
-    """Co-citation pass over the whole graph. Returns what happened to each pair, so a
-    caller (or the self-check) can assert on it instead of only reading stdout."""
-    pairs = find_pairs(session, min_theses)
-    print(f"found {len(pairs)} pair(s)" + (" [dry-run]" if dry_run else ""))
+def backfill_derived_from(dry_run: bool = False) -> list[dict]:
+    """Every `origin="synthesized"` idea currently in the lake, parentage read off
+    its synthetic leaf's `locator`. Skips (and reports) an idea whose parentage
+    cannot be parsed, same as `idea_merger.write_hypothesis` does for a fresh one."""
+    from . import graph_client
 
     outcomes = []
-    for rec in pairs:
-        increment = compute_weight_increment(rec["count_a"], rec["count_b"])
-        if dry_run:
-            print(f"[source={rec['source_id']}] {rec['idea_a_id']} (n={rec['count_a']}) <-> "
-                  f"{rec['idea_b_id']} (n={rec['count_b']}): would add +{increment}")
-            outcomes.append({**rec, "increment": increment, "new_weight": None})
-            continue
-
-        # Both directions, one transaction: the stored edge is directed and co-citation
-        # is not (module docstring, `upsert_both`).
-        forward, reverse = upsert_both(session, rec["idea_a_id"], rec["idea_b_id"],
-                                       increment, type_=CO_CITED,
-                                       note=f"co-cited by {rec['source_id']}",
-                                       evidence=rec["source_id"])
-        # `None` from either direction means a MATCH found no node — nothing was
-        # written. Printing it raw would read as `weight = None` and land in the
-        # outcome as the SAME value a dry-run row carries, so "wrote nothing" and
-        # "was asked not to write" would be one state (review, finding 7).
-        missing = forward is None or reverse is None
-        if missing:
-            print(f"[source={rec['source_id']}] {rec['idea_a_id']} <-> {rec['idea_b_id']}: "
-                  f"MISSING (idea not in the graph: "
-                  f"{'a' if forward is None else ''}{'b' if reverse is None else ''})")
-        else:
-            print(f"[source={rec['source_id']}] {rec['idea_a_id']} <-> {rec['idea_b_id']}: "
-                  f"+{increment} -> weight = {forward}")
-        outcomes.append({**rec, "increment": increment, "new_weight": forward,
-                         "reverse_weight": reverse, "missing": missing})
-    return outcomes
-
-
-def process_derived(session, dry_run: bool = False) -> list[dict]:
-    """`--derived-from` pass: hypothesis -> each parent it was synthesized out of.
-
-    One direction only (child -> parent): there the direction is the meaning. Weight is
-    set, not accumulated — a hypothesis is derived from its parents exactly once, and a
-    second run of this pass over the same graph must not inflate it.
-    """
-    rows = find_derived(session)
-    outcomes = []
-    for rec in rows:
-        parents = parse_parents(rec["locator"])
-        if not parents:
-            # Not silently skipped: a hypothesis whose parentage cannot be read is the
-            # one thing this pass exists to record, and dropping it quietly would leave
-            # a synthesized idea with no edge and no complaint.
-            print(f"[skip] {rec['child_id']}: unparseable locator {rec['locator']!r}")
-            outcomes.append({**rec, "parents": [], "new_weight": None, "missing": True})
-            continue
-        if len(parents) != 2:
-            # `13` §6 puts exactly two parents on the locator. One is not "a smaller
-            # merge", it is a parentage that lost a half somewhere — the edges below
-            # are still true, so they are written, but a truncated provenance that
-            # printed like a whole one would be indistinguishable from a correct run.
-            print(f"[partial] {rec['child_id']}: {len(parents)} parent(s) in "
-                  f"{rec['locator']!r}, expected 2")
-        for parent_id in parents:
-            if dry_run:
-                print(f"{rec['child_id']} -> {parent_id}: would set derived_from [dry-run]")
-                outcomes.append({**rec, "parent_id": parent_id, "new_weight": None,
-                                 "missing": False})
+    offset = 0
+    page = 50
+    while True:
+        ids = graph_client.list_idea_ids(limit=page, offset=offset)
+        if not ids:
+            break
+        for idea in graph_client.get_ideas(ids):
+            if idea["origin"] != "synthesized":
                 continue
-            weight = session.execute_write(
-                lambda tx, p=parent_id: upsert_edge(tx, rec["child_id"], p, 1.0,
-                                                    type_=DERIVED_FROM, note="синтез",
-                                                    evidence=rec["locator"],
-                                                    accumulate=False))
-            # None means one of the two MATCHes found nothing — a parent that has since
-            # been deleted or split away. Named, not swallowed.
-            print(f"{rec['child_id']} -> {parent_id}: " +
-                  (f"derived_from, weight = {weight}" if weight is not None
-                   else "MISSING (idea not in the graph)"))
-            outcomes.append({**rec, "parent_id": parent_id, "new_weight": weight,
-                             "missing": weight is None})
-    print(f"{len(rows)} hypothesis/-es scanned" + (" [dry-run]" if dry_run else ""))
+            # The SYNTHETIC leaf explicitly, not `theses[0]` (`13` review 2026-07-31):
+            # `theses[0]` is "whichever leaf landed first, by `seq`" — true for every
+            # hypothesis `write_hypothesis` has ever produced (exactly one leaf), but
+            # not a guarantee this loop can lean on. The deleted pre-D12 Cypher picked
+            # the leaf explicitly (`origin='synthesized'` on the idea, already checked
+            # above, AND `locator STARTS WITH 'synthesis/'` on the leaf) — restored
+            # here so a hypothesis that ever gained an out-of-order leaf still finds
+            # its real parentage instead of silently reading someone else's locator.
+            synthetic = next((t for t in idea["theses"]
+                             if t["locator"].startswith("synthesis/")), None)
+            locator = synthetic["locator"] if synthetic else ""
+            parents = parse_parents(locator)
+            if not parents:
+                print(f"[skip] {idea['id']}: unparseable locator {locator!r}")
+                outcomes.append({"idea_id": idea["id"], "parents": [], "missing": True})
+                continue
+            if len(parents) != 2:
+                print(f"[partial] {idea['id']}: {len(parents)} parent(s) in "
+                      f"{locator!r}, expected 2")
+            for edge in graph_client.write_derived_from_edges(idea["id"], parents,
+                                                               dry_run=dry_run):
+                print(f"{idea['id']} -> {edge['idea_b_id']}: " +
+                      (f"derived_from, weight = {edge['weight']}" +
+                       (" [dry-run]" if dry_run else "")
+                       if not edge["missing"] else "MISSING (idea not in the graph)"))
+                outcomes.append({"idea_id": idea["id"], **edge})
+        offset += page
     return outcomes
 
 
@@ -280,40 +122,41 @@ def process_derived(session, dry_run: bool = False) -> list[dict]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m lake.idea_edges",
-        description="Write (:Idea)-[:RELATED]->(:Idea) edges: co-citation by shared "
-                    "source, or the parentage of synthesized hypotheses.")
-    parser.add_argument("--min-theses", type=int, default=DEFAULT_MIN_THESES,
-                        help=f"minimum co-cited theses per idea under one source "
-                             f"(default {DEFAULT_MIN_THESES})")
+        description="Backfill (:Idea)-[:RELATED]->(:Idea) edges for data that reached the "
+                    "graph before D12 (the pipeline writes these itself now).")
+    parser.add_argument("--min-ideas", type=int, default=DEFAULT_MIN_IDEAS,
+                        help=f"minimum distinct ideas a source must touch before any "
+                             f"co-citation pair is formed (default {DEFAULT_MIN_IDEAS}; "
+                             f"NOT a per-idea thesis count, BLOCKER 2 review 2026-07-31)")
     parser.add_argument("--derived-from", action="store_true",
                         help="instead of co-citation: hypothesis -> its parents, read "
                              "off the synthetic leaf's locator (13 §6)")
     parser.add_argument("--dry-run", action="store_true",
                         help="find and print, write nothing")
     parser.add_argument("--self-check", action="store_true",
-                        help="offline check of the formulas and query shapes, no Neo4j")
+                        help="check against a live, empty, local Neo4j (paging logic "
+                             "included, review 2026-07-31) plus the offline parse_parents "
+                             "formula; 1 on SKIPPED/REFUSED, matching every other module")
     args = parser.parse_args(argv)
 
     if args.self_check:
-        demo()
-        return 0
+        return demo()
 
-    driver = open_driver()
-    try:
-        with driver.session(database=database_name()) as session:
-            if args.derived_from:
-                outcomes = process_derived(session, dry_run=args.dry_run)
-            else:
-                outcomes = process(session, min_theses=args.min_theses, dry_run=args.dry_run)
-    finally:
-        driver.close()
+    if not os.environ.get("NEO4J_URI"):
+        raise SystemExit("NEO4J_URI is required (D11) — import lake.graph_client to check")
+
+    if args.derived_from:
+        outcomes = backfill_derived_from(dry_run=args.dry_run)
+    else:
+        outcomes = backfill_cocitation(min_ideas=args.min_ideas, dry_run=args.dry_run)
+        print(f"found {len(outcomes)} co-citation pair(s)" + (" [dry-run]" if args.dry_run else ""))
+        for o in outcomes:
+            tag = "MISSING" if o["missing"] else f"weight = {o['weight']}"
+            print(f"[source={o['source_id']}] {o['idea_a_id']} <-> {o['idea_b_id']}: {tag}")
 
     # A run where every write found no node used to exit 0 exactly like a clean one:
-    # the wrong `NEO4J_DATABASE` (`database_name()` defaults to "neo4j" and verifies
-    # nothing) reads as an empty graph, and an operator wiring this into a script gets
-    # green from a database that was never touched (review, finding 9). "Found
-    # nothing" stays 0 — an empty co-citation result is a legitimate answer about a
-    # small lake — but "tried to write and the node was absent" does not.
+    # "found nothing" stays 0 — an empty result is a legitimate answer about a small
+    # lake — but "tried to write and the node was absent" does not.
     missing = [o for o in outcomes if o.get("missing")]
     if missing:
         print(f"{len(missing)} write(s) matched no idea — nothing was written for them")
@@ -322,168 +165,138 @@ def main(argv: list[str] | None = None) -> int:
 
 
 # ============================================================
-# Self-check — the pure formula and the query shapes, no Neo4j
+# Self-check — parse_parents offline, backfill_cocitation/backfill_derived_from
+# against a live local scratch Neo4j
 # ============================================================
 
-class _FakeRecord(dict):
-    def single(self):
-        return self
+def demo() -> int:
+    """`parse_parents` needs no server and runs first, unconditionally. Then, against
+    a live local scratch Neo4j: `backfill_cocitation`/`backfill_derived_from`
+    THEMSELVES, not just the `graph_client.write_*_edges` calls underneath them.
 
+    Review, 2026-07-31: the print this replaced claimed the paging in this file
+    ("exercised live by `ingest.run.selfcheck` (D12 assertions) and `idea_merger.demo`
+    (`write_derived_from_edges`)") was covered elsewhere. False — neither of those two
+    ever calls `backfill_cocitation`/`backfill_derived_from`; they exercise
+    `graph_client.write_*_edges` directly. `lake/selfcheck.py`'s check 34 only asserts
+    this module reached its own final line, so a claim printed here that nothing
+    actually verifies was the green light producing itself (CLAUDE.md: a check that
+    does not fail on broken code is worse than no check). Made true here instead of
+    deleted, since the paging loop (offset stepping, page boundary) is exactly the
+    kind of non-trivial logic CLAUDE.md wants a check for.
 
-class _NoRecord:
-    """What the driver returns when a MATCH found nothing: a result whose `.single()`
-    is None. Without this the missing-node branch of `upsert_edge` — and every
-    `MISSING` print built on it — never runs in the self-check at all (review)."""
-
-    def single(self):
-        return None
-
-
-class _FakeSession:
-    """Scripted read results, recorded calls for `upsert_edge`.
-
-    Dispatch is on the QUERY OBJECT, not on a substring of it: keying on text made the
-    fake's routing depend on the very strings the checks were supposed to pin, so a
-    mutation to `_FIND_DERIVED` broke the routing and looked "caught" for the wrong
-    reason (review). Identity dispatch cannot do that.
+    Returns 1 on SKIPPED/REFUSED, 0 once every assertion below actually ran — the
+    same contract as every other module self-check since D12 (`lake/vault.py:demo`
+    is the reference shape this mirrors: local-only target, confirmed-empty graph,
+    fixture wiped in a `finally`).
     """
-
-    def __init__(self, pairs: list[dict] | None = None, derived: list[dict] | None = None,
-                 missing: bool = False):
-        self._pairs = pairs or []
-        self._derived = derived or []
-        self._missing = missing
-        self.upserts: list[dict] = []
-        self.queries: list[str] = []
-        self.transactions = 0
-
-    def execute_write(self, fn):
-        self.transactions += 1
-        return fn(self)
-
-    def run(self, query, **params):
-        self.queries.append(query)
-        if query is _FIND_PAIRS:
-            return [dict(p) for p in self._pairs]
-        if query is _FIND_DERIVED:
-            return [dict(d) for d in self._derived]
-        assert query is _UPSERT, f"unexpected query: {query!r}"
-        self.upserts.append(dict(params))
-        return _NoRecord() if self._missing else _FakeRecord({"new_weight": params["increment"]})
-
-
-def demo() -> None:
-    # (a) the formula itself: min() of the two leaf counts under the shared source.
-    assert compute_weight_increment(3, 5) == 3
-    assert compute_weight_increment(2, 2) == 2
-    assert compute_weight_increment(0, 4) == 0
-    print("ok (a): compute_weight_increment(a, b) == min(a, b)")
-
-    # (b) the label both readers match on is in the write statement, and the kind of
-    # edge is a property rather than a second label. This is the check that would have
-    # caught `RELATED_VIA_SOURCE`: edges nobody reads (`neo4j_store.py:545,761`).
-    #
-    # The literal `RELATED` is spelled out on purpose. The first version asserted
-    # `f"-[r:{REL_LABEL} ..." in _UPSERT`, and since `_UPSERT` is itself built from
-    # `REL_LABEL`, both sides moved together: setting `REL_LABEL = "LINKSTO"` left the
-    # self-check green while every serving read went blind (review, verified by
-    # mutation). A guard interpolated from the thing it guards is not a guard.
-    assert REL_LABEL == "RELATED", REL_LABEL
-    assert "-[r:RELATED {type: $type}]->" in _UPSERT, _UPSERT
-    assert "RELATED_VIA_SOURCE" not in _UPSERT
-    # The parts of the statement no fake can execute, pinned as text — the fake returns
-    # canned rows, so `MERGE`->`CREATE` (a duplicate edge every run), `MATCH`->`MERGE`
-    # (inventing the missing idea instead of reporting it) and the loss of `coalesce`
-    # (accumulation silently becoming assignment) were all invisible before (review).
-    assert "MERGE (a)-[r:RELATED" in _UPSERT, "MERGE, not CREATE: re-runs must not duplicate"
-    assert _UPSERT.count("MATCH (") == 2, "both endpoints MATCH; MERGE would invent them"
-    assert "coalesce(r.weight, 0) + $increment" in _UPSERT, "accumulation must accumulate"
-    print("ok (b): writes (:Idea)-[:RELATED {type: ...}]->(:Idea), the shape neighbors() reads")
-
-    pairs = [{"source_id": "s1", "idea_a_id": "idea_a", "count_a": 3,
-              "idea_b_id": "idea_b", "count_b": 2}]
-
-    # (c) dry-run finds pairs and writes nothing.
-    session = _FakeSession(pairs)
-    outcomes = process(session, dry_run=True)
-    assert len(outcomes) == 1 and outcomes[0]["new_weight"] is None
-    assert session.upserts == [], "dry-run must not touch the graph"
-    print("ok (c): --dry-run finds pairs, upserts nothing")
-
-    # (d) a real pass computes the increment and writes BOTH directions, accumulating,
-    # inside ONE transaction — a second commit for the reverse direction would leave a
-    # one-sided edge that no re-run can repair without double-counting the survivor.
-    session = _FakeSession(pairs)
-    outcomes = process(session, dry_run=False)
-    assert outcomes[0]["increment"] == 2, outcomes
-    assert len(session.upserts) == 2, session.upserts
-    assert session.transactions == 1, "both directions must share one transaction"
-    forward, back = session.upserts
-    assert (forward["idea_a_id"], forward["idea_b_id"]) == ("idea_a", "idea_b")
-    assert (back["idea_a_id"], back["idea_b_id"]) == ("idea_b", "idea_a")
-    for call in session.upserts:
-        assert call["type"] == CO_CITED and call["increment"] == 2
-        assert call["accumulate"] is True, "co-citation weight accumulates across runs"
-        assert call["evidence"] == "s1"
-    assert outcomes[0]["missing"] is False, outcomes
-    print("ok (d): both directions, one transaction, type=related_via_source, accumulating")
-
-    # (d2) a MATCH that finds nothing is NOT a weight: `None` must not read as success
-    # and must not be the same recorded value a dry run leaves behind.
-    session = _FakeSession(pairs, missing=True)
-    outcomes = process(session, dry_run=False)
-    assert outcomes[0]["missing"] is True, outcomes
-    assert outcomes[0]["new_weight"] is None and outcomes[0]["reverse_weight"] is None
-    print("ok (d2): a missing idea is reported as MISSING, not as a written weight")
-
-    # (e) locator parsing, including every way it can be unusable. The non-synthesis
-    # case uses a locator LONG enough that dropping the prefix guard changes the
-    # answer: `pdf/page/3` slices to `''` either way and pins nothing (review).
     assert parse_parents("synthesis/idea_x+idea_y") == ["idea_x", "idea_y"]
     assert parse_parents("synthesis/idea_x") == ["idea_x"]
     assert parse_parents("pdf/page/12+34") == [], "a non-synthesis locator has no parents"
     assert parse_parents("synthesis/") == [], "an empty parent list is not a parent"
-    print("ok (e): parse_parents reads synthesis/<id>+<id>, refuses anything else")
+    print("ok: parse_parents reads synthesis/<id>+<id>, refuses anything else")
 
-    # (f) the derived-from pass: one edge per parent, child -> parent, weight SET.
-    derived = [{"child_id": "idea_new", "locator": "synthesis/idea_a+idea_b"}]
-    session = _FakeSession(derived=derived)
-    outcomes = process_derived(session)
-    assert len(session.upserts) == 2, session.upserts
-    assert [(c["idea_a_id"], c["idea_b_id"]) for c in session.upserts] == \
-        [("idea_new", "idea_a"), ("idea_new", "idea_b")], session.upserts
-    for call in session.upserts:
-        assert call["type"] == DERIVED_FROM
-        assert call["accumulate"] is False, "parentage is set once, never accumulated"
-        assert call["evidence"] == "synthesis/idea_a+idea_b"
-    print("ok (f): --derived-from writes child -> parent per parent, weight set not added")
+    from . import graph_client, neo4j_store
+    from .models import Idea, Source, Thesis, new_idea_id, new_thesis_id
+    from .models import source_id as make_source_id, text_hash
 
-    # (g) an unreadable locator is reported and written nowhere, not guessed at.
-    session = _FakeSession(derived=[{"child_id": "idea_bad", "locator": "synthesis/"}])
-    outcomes = process_derived(session)
-    assert session.upserts == [], session.upserts
-    assert outcomes[0]["parents"] == [] and outcomes[0]["new_weight"] is None, outcomes
-    assert outcomes[0]["missing"] is True, "an unwritten parentage is not a success"
-    print("ok (g): unparseable locator -> reported, no edge invented")
+    # BLOCKER (review 2026-07-31): checked `os.environ.get("NEO4J_URI")` here and
+    # unconditionally `DETACH DELETE`d below — one variable checked, a different
+    # one (whatever the driver connected with, possibly set before an env change)
+    # wiped. `_get_driver()` first, then the URI it actually snapshotted
+    # (`neo4j_store._uri`), same as `lake.selfcheck._wipe_graph`.
+    try:
+        neo4j_store._get_driver()  # so `_uri` below reflects what the driver really used
+        neo4j_store._require_local_target(neo4j_store._uri)
+        with neo4j_store._session() as session:
+            existing = session.execute_read(
+                lambda tx: tx.run("MATCH (n) RETURN count(n) AS c").single()["c"])
+    except graph_client.STORE_ERRORS as exc:
+        print(f"SKIPPED: no Neo4j reachable at {os.environ.get('NEO4J_URI')} "
+              f"({type(exc).__name__}: {exc}). Bring one up with "
+              "`docker compose up -d neo4j` and rerun.")
+        return 1
+    if existing:
+        print(f"REFUSED: the graph is not empty ({existing} node(s) total) — this "
+              "self-check only ever runs against an empty scratch instance, never one "
+              "that might hold data it did not create. Point NEO4J_URI at an empty "
+              "instance and rerun.")
+        return 1
 
-    # (h) a parentage that lost a half is still written — the edge it names is true —
-    # but it is not allowed to print like a whole one (`13` §6 puts two parents there).
-    session = _FakeSession(derived=[{"child_id": "idea_half", "locator": "synthesis/idea_a"}])
-    outcomes = process_derived(session)
-    assert len(session.upserts) == 1, session.upserts
-    assert all(o["missing"] is False for o in outcomes), outcomes
-    print("ok (h): a one-parent locator is written and flagged [partial], not passed off as whole")
+    try:
+        sid = make_source_id("https://arxiv.org/abs/idea-edges-demo", "v1")
+        graph_client.write_source(Source(id=sid, url="https://arxiv.org/abs/idea-edges-demo",
+                                         title="idea_edges demo", type="paper", version="v1",
+                                         retrieved_at="2026-07-31T00:00:00Z"))
+        idea_a = Idea(id=new_idea_id(), text="idea_edges demo a", applicability_conditions="ac",
+                     limitations="lim", failure_modes=[], effect_claimed="",
+                     effect_observed="", vector=[0.1] * 384)
+        idea_b = Idea(id=new_idea_id(), text="idea_edges demo b", applicability_conditions="ac",
+                     limitations="lim", failure_modes=[], effect_claimed="",
+                     effect_observed="", vector=[0.2] * 384)
 
-    # (i) a derived-from write against an absent parent is MISSING, and `main` turns
-    # that into a non-zero exit instead of the green an empty database used to give.
-    session = _FakeSession(derived=[{"child_id": "idea_x", "locator": "synthesis/idea_a+idea_b"}],
-                           missing=True)
-    outcomes = process_derived(session)
-    assert all(o["missing"] for o in outcomes), outcomes
-    assert [o for o in outcomes if o.get("missing")], "main keys its exit code on this"
-    print("ok (i): absent parent -> MISSING on every row, which is what main exits 1 on")
+        def leaf(text: str, idea_id: str) -> Thesis:
+            return Thesis(id=new_thesis_id(), source_id=sid, idea_id=idea_id, text=text,
+                         context="c", effect="e", locator="l", text_hash=text_hash(text),
+                         vector=[0.1] * 384, created_at="2026-07-31T00:00:00Z")
 
-    print("idea_edges self-check OK")
+        leaf_a, leaf_b = leaf("demo leaf a", idea_a.id), leaf("demo leaf b", idea_b.id)
+        graph_client.create_idea_with_theses(idea_a, sid, [leaf_a])
+        graph_client.create_idea_with_theses(idea_b, sid, [leaf_b])
+
+        # One source, ONE leaf per idea — exactly the shape BLOCKER 2 fixed: the old
+        # per-idea threshold found nothing here; the fixed gate (source touches >= 2
+        # distinct ideas) finds the pair.
+        outcomes = backfill_cocitation()
+        assert len(outcomes) == 1 and outcomes[0]["missing"] is False, outcomes
+        assert graph_client.counts()["edges"] == 2, graph_client.counts()
+        print("ok: backfill_cocitation pages over list_sources and finds the pair "
+              "(1 leaf per idea, BLOCKER 2 semantics)")
+
+        # Item 6 (review 2026-07-31): the synthetic leaf must be found by its
+        # LOCATOR PREFIX, not by leaf position. A hypothesis whose synthesis leaf
+        # landed SECOND (an out-of-order append `write_theses` allows and
+        # `create_idea_with_theses` does not prevent) used to read `theses[0]` —
+        # the decoy leaf below — and report the parentage unparseable. Two real
+        # parent ideas, so `backfill_derived_from`'s edges can actually MATCH.
+        parent_a = Idea(id=new_idea_id(), text="parent a", applicability_conditions="ac",
+                       limitations="lim", failure_modes=[], effect_claimed="",
+                       effect_observed="", vector=[0.3] * 384)
+        parent_b = Idea(id=new_idea_id(), text="parent b", applicability_conditions="ac",
+                       limitations="lim", failure_modes=[], effect_claimed="",
+                       effect_observed="", vector=[0.4] * 384)
+        graph_client.create_idea(parent_a)
+        graph_client.create_idea(parent_b)
+        hypo = Idea(id=new_idea_id(), text="a hypothesis", applicability_conditions="ac",
+                   limitations="lim", failure_modes=[], effect_claimed="", effect_observed="",
+                   vector=[0.5] * 384, origin="synthesized", trust_score=0.0)
+        decoy = leaf("decoy: an ordinary leaf, not the synthesis one", hypo.id)
+        decoy.locator = "not-synthesis/decoy"        # deliberately NOT the synthesis prefix
+        real = leaf("real: the synthesis leaf", hypo.id)
+        real.locator = f"synthesis/{parent_a.id}+{parent_b.id}"
+        graph_client.create_idea_with_theses(hypo, sid, [decoy])   # decoy lands FIRST (lower seq)
+        graph_client.write_theses(sid, [real])                     # synthesis leaf appended SECOND
+
+        derived_outcomes = backfill_derived_from()
+        assert len(derived_outcomes) == 2, derived_outcomes
+        assert {o["idea_b_id"] for o in derived_outcomes} == {parent_a.id, parent_b.id}, \
+            derived_outcomes
+        assert all(o["missing"] is False for o in derived_outcomes), derived_outcomes
+        print("ok: backfill_derived_from pages over list_idea_ids and finds the SYNTHESIS "
+              "leaf by its locator prefix even when it is not theses[0] (item 6)")
+    finally:
+        # Unconditional full wipe, not id-scoped (`lake/vault.py:demo`'s own choice,
+        # same reasoning): the emptiness gate above already confirmed nothing but this
+        # fixture is in the graph, so `MATCH (n) DETACH DELETE n` cannot touch data it
+        # did not write — and it is what also clears `_Seq` (`neo4j_store.py:132`'s
+        # global ordering counter, bumped as a side effect of every `create_idea_with_
+        # theses` call here), which an id-scoped delete would leave behind as a single
+        # node the NEXT empty-graph gate would then see and REFUSE against.
+        with neo4j_store._session() as session:
+            session.execute_write(lambda tx: tx.run("MATCH (n) DETACH DELETE n").consume())
+
+    print("idea_edges self-check OK — paging logic exercised live, not just claimed")
+    return 0
 
 
 if __name__ == "__main__":

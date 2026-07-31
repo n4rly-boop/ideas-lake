@@ -20,10 +20,10 @@ for a store that contradicts itself or a file count that does not add up.
 Three known limits, left as they are on purpose:
 
 * `escape`/`_line` coerce `None` to `""`. Unreachable: the store refuses NULL in
-  these columns (`stub_store._NULLABLE_IDEA_FIELDS`).
+  these columns (`neo4j_store._NULLABLE_IDEA_FIELDS`).
 * `ID_RE` admits neither a dot nor a separator, so even when the slug is empty and
   the file name is the bare id, there is no `..`, no `/` and no dotfile to reach.
-* an empty `data/lake.db` is created by whoever opens the store first; that is
+* an empty lake (no nodes yet) is a legal state on first connect; that is
   `graph_client`'s behaviour, shared by every module, and not vault's to fix.
   What vault does about it is refuse to report a successful export of zero nodes.
 """
@@ -846,20 +846,27 @@ def _demo_refusals(tmp: Path, vault: Path, first, orphan) -> None:
     print("ok: чужой каталог и небезопасные id — отказ, без удаления")
 
 
-def demo() -> None:
-    """ponytail: single-run self-check (§11.6), fixture in a temp dir, no network.
+def demo() -> int:
+    """ponytail: single-run self-check (§11.6), fixture against the live Neo4j.
 
-    The store and the trace log are pointed at that directory, and the real
-    `data/` is fingerprinted before and after — same guard, same reason as
-    `lake/api/selfcheck.py`: a check that edits the lake it is checking has
-    happened in this repo once already.
+    Returns 1 on SKIPPED/REFUSED, 0 once every assertion below actually ran — a
+    caller that only checks "did it raise" must not read a skipped demo as a
+    pass (`lake/api/selfcheck.py:main` docstring has the full story).
 
-    Pointing the store there means writing `stub_store._db_path` and `._conn`
-    directly, around `graph_client`. Both neighbouring self-checks do the same;
-    the module's "reads through graph_client only" is about the working path, not
-    about the check that has to put a lake somewhere disposable.
+    D11 removed the stub backend, and with it the trick this check used to isolate
+    itself: pointing a fresh SQLite file at the store. Neo4j has no equivalent
+    disposable target, so this writes into whatever `NEO4J_URI` names for real —
+    guarded by the same two checks `neo4j_store`'s own self-check uses: the target
+    host must be local/scratch (`neo4j_store._require_local_target`), and the graph
+    must be confirmed empty (`MATCH (n)`, not just the labels this module reads)
+    before a single fixture node goes in. Everything written is wiped again in the
+    `finally`, which is safe exactly because the emptiness was already confirmed.
+
+    The trace log still gets its own temp dir and `data/` is still fingerprinted
+    before and after — same guard, same reason as `lake/api/selfcheck.py`: a check
+    that edits the lake it is checking has happened in this repo once already.
     """
-    from . import stub_store, trace
+    from . import neo4j_store, trace
 
     def fingerprint() -> dict:
         if not DATA.exists():
@@ -871,22 +878,37 @@ def demo() -> None:
     assert _diff({"a": "1"}, {}) == ["a"] and _diff({}, {"a": "1"}) == ["a"]
     assert _diff({"a": "1"}, {"a": "1"}) == []
 
+    # BLOCKER (review 2026-07-31): checked `os.environ.get("NEO4J_URI")` here and
+    # unconditionally `DETACH DELETE`d below — one variable checked, a different
+    # one (whatever the driver connected with, possibly set before an env change)
+    # wiped. `_get_driver()` first, then the URI it actually snapshotted
+    # (`neo4j_store._uri`), same as `lake.selfcheck._wipe_graph`.
+    try:
+        neo4j_store._get_driver()  # so `_uri` below reflects what the driver really used
+        neo4j_store._require_local_target(neo4j_store._uri)
+        with neo4j_store._session() as session:
+            existing = session.execute_read(
+                lambda tx: tx.run("MATCH (n) RETURN count(n) AS c").single()["c"])
+    except graph_client.STORE_ERRORS as exc:
+        print(f"SKIPPED: no Neo4j reachable at {os.environ.get('NEO4J_URI')} "
+              f"({type(exc).__name__}: {exc}). Bring one up with "
+              "`docker compose up -d neo4j` and rerun.")
+        return 1
+    if existing:
+        print(f"REFUSED: the graph is not empty ({existing} node(s) total) — this "
+              "self-check only ever runs against an empty scratch instance, never one "
+              "that might hold data it did not create. Point NEO4J_URI at an empty "
+              "instance and rerun.")
+        return 1
+
     before = fingerprint()
     tmp = Path(tempfile.mkdtemp(prefix="lake-vault-selfcheck-"))
-    if stub_store._conn is not None:      # a live handle on the real lake, closed first
-        stub_store._conn.close()
-    real_db, stub_store._db_path, stub_store._conn = stub_store._db_path, tmp / "lake.db", None
     # Every graph call is @trace'd and trace appends to TRACES_DIR/<run_id>.jsonl,
     # which is inside the real data/ this check promises not to touch.
     real_traces, trace.TRACES_DIR = trace.TRACES_DIR, tmp / "traces"
 
     leaked: list[str] = []
     try:
-        # The guards of the guard, and BEFORE the fixture: a store still pointed at
-        # the real lake, or a fingerprint that fingerprints nothing, would make
-        # `not leaked` true for the wrong reason — and noticing that afterwards
-        # means noticing it with the fixture already written into data/lake.db.
-        assert stub_store._db_path.is_relative_to(tmp), stub_store._db_path
         # "There are files under data/ and the fingerprint saw none" — that is a
         # fingerprint pointed at the wrong path. An EMPTY data/ measuring `{}` is not
         # the same thing and must pass: the image declares `VOLUME /app/lake/data`, so
@@ -895,10 +917,11 @@ def demo() -> None:
         assert not any(DATA.rglob("*")) or before, "the leak guard measured nothing"
         _demo_body(tmp)
     finally:
-        if stub_store._conn is not None:
-            stub_store._conn.close()
-        stub_store._db_path, stub_store._conn = real_db, None
         trace.TRACES_DIR = real_traces
+        # The graph was confirmed empty above, so wiping it outright on the way out
+        # cannot touch anything this run did not itself write.
+        with neo4j_store._session() as session:
+            session.execute_write(lambda tx: tx.run("MATCH (n) DETACH DELETE n").consume())
         # Compared inside the `finally`: after a failed assertion the comparison
         # would never run, and the leaking run and the debugged run are the same one.
         leaked = _diff(before, fingerprint())
@@ -907,7 +930,8 @@ def demo() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
     assert not leaked, f"the self-check wrote to real data/: {leaked}"
-    print("vault self-check OK — real data/ untouched")
+    print("vault self-check OK — real data/ untouched, graph wiped back to empty")
+    return 0
 
 
 if __name__ == "__main__":
@@ -923,7 +947,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.self_check:
-        demo()
+        raise SystemExit(demo())
     else:
         done = export(args.dest)
         print(f"vault: {done['ideas']} идей + {done['theses']} тезисов + "

@@ -5,11 +5,10 @@ Why a file and not the dict in `api/jobs.py`: that dict dies with the process, a
 lake's files. The cursor already made the *work* restart-safe (§4.7); this makes
 the *record* of it restart-safe too, which is what a caller polling a job id needs.
 
-Why its own database file and not a table in `lake.db`: `stub_store` is documented
-as the throwaway half of format B ("this file dies the day the graph moves to
-Neo4j", `stub_store.py:1-4`) and only `graph_client` may open it (§3.4). A queue of
-jobs is neither format B nor throwaway. `index.py` set the precedent: own file, own
-module, own lock (`index.py:1-6`).
+Why its own database file and not a Neo4j node: format B is `graph_client`'s alone
+to write (§3.4), and a queue of jobs is not format B — it is this module's own
+state, restart-safe the same way the graph is, but through a different store.
+`index.py` set the precedent: own file, own module, own lock (`index.py:1-6`).
 
 The queue does not decide anything about the ingest. It holds rows and hands the
 oldest one out exactly once — `claim` is a single UPDATE, so two workers asking at
@@ -69,9 +68,9 @@ CREATE INDEX IF NOT EXISTS job_dedup ON job(dedup_key, status);
 """
 
 # One lock over one connection per database file — the same ponytail compromise as
-# `stub_store.py:41` and `index.py:30`, and for the same reason: every caller is in
-# this process. `claim` is still a single UPDATE, so the invariant does not depend
-# on the lock; the lock only keeps the connection to itself.
+# `index.py:30`, and for the same reason: every caller is in this process. `claim`
+# is still a single UPDATE, so the invariant does not depend on the lock; the lock
+# only keeps the connection to itself.
 _LOCK = threading.RLock()
 _CONNS: dict[str, sqlite3.Connection] = {}
 

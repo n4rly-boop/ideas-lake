@@ -100,7 +100,7 @@ def split_idea(idea_id: str, max_leaves: int = MAX_LEAVES) -> dict:
     # No "fewer than 2 parts" guard: `_clusters` recurses whenever it is over the
     # ceiling and `_cut` never returns an empty side, so 2 is the floor by construction.
     # A guard no input can reach is not a guard — it is a line that reads as one, and
-    # `stub_store.split_idea` refuses an empty child list anyway.
+    # `neo4j_store.split_idea` refuses an empty child list anyway.
     #
     # Largest first; ties by first leaf, so the same store always splits the same way.
     parts.sort(key=lambda part: (-len(part), int(part[0])))
@@ -208,9 +208,13 @@ def _centroid(rows: np.ndarray) -> np.ndarray:
 
 # -------------------------------------------------------------------- self-check
 
-def demo() -> None:
+def demo() -> int:
     """ponytail: single-run self-check, not a test suite. Offline: the encoder is a
     seeded fake and the re-derivation is scripted off the leaves in the prompt.
+
+    Returns 1 on SKIPPED/REFUSED, 0 once every assertion below actually ran — a
+    caller that only checks "did it raise" must not read a skipped demo as a
+    pass (`lake/api/selfcheck.py:main` docstring has the full story).
 
     The fixture is deliberately asymmetric and holds TWO ideas. A symmetric one-idea
     fixture passed while "the parent keeps the largest part" was inverted, while the
@@ -220,12 +224,13 @@ def demo() -> None:
     so the recursive path is on the only road through.
     """
     import functools
+    import os
     import sys
     import tempfile
     import types
     from pathlib import Path
 
-    from .. import llm, stub_store, trace as trace_mod
+    from .. import llm, neo4j_store, trace as trace_mod
     from ..models import (EMBED_DIM, REDERIVE_SCHEMA, Source, Thesis, new_thesis_id,
                           source_id as make_source_id, text_hash)
 
@@ -279,15 +284,39 @@ def demo() -> None:
                 "failure_modes": ["fm"], "effect_claimed": "+1 pp", "effect_observed": ""}
 
     old_complete, old_run_id = llm.complete, trace_mod.current_run_id()
-    old_traces, old_db = trace_mod.TRACES_DIR, stub_store._db_path
+    old_traces = trace_mod.TRACES_DIR
     old_reconcile, old_all_theses = index.reconcile, graph_client.all_theses
     llm.complete = fake_complete
+    # D11 removed the isolated store this check used to swap in (a fresh SQLite
+    # file). Neo4j has no equivalent disposable target, so the fixture below is
+    # written into whatever `NEO4J_URI` names for real — guarded the same way
+    # `vault.demo`/`lake.api.selfcheck` are: the host must be local/scratch
+    # (`neo4j_store._require_local_target`) and the graph confirmed empty first.
+    # BLOCKER (review 2026-07-31): checked `os.environ.get("NEO4J_URI")` here and
+    # unconditionally `DETACH DELETE`d below — one variable checked, a different
+    # one (whatever the driver connected with, possibly set before an env change)
+    # wiped. `_get_driver()` first, then the URI it actually snapshotted
+    # (`neo4j_store._uri`), same as `lake.selfcheck._wipe_graph`.
+    try:
+        neo4j_store._get_driver()  # so `_uri` below reflects what the driver really used
+        neo4j_store._require_local_target(neo4j_store._uri)
+        with neo4j_store._session() as _s:
+            _existing = _s.execute_read(
+                lambda tx: tx.run("MATCH (n) RETURN count(n) AS c").single()["c"])
+    except graph_client.STORE_ERRORS as exc:
+        print(f"SKIPPED: no Neo4j reachable at {os.environ.get('NEO4J_URI')} "
+              f"({type(exc).__name__}: {exc}). Bring one up with "
+              "`docker compose up -d neo4j` and rerun.")
+        llm.complete = old_complete
+        return 1
+    if _existing:
+        print(f"REFUSED: the graph is not empty ({_existing} node(s) total) — this "
+              "self-check only ever runs against an empty scratch instance. Point "
+              "NEO4J_URI at an empty instance and rerun.")
+        llm.complete = old_complete
+        return 1
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            if stub_store._conn is not None:        # a live handle on the real lake
-                stub_store._conn.close()
-            stub_store._conn = None
-            stub_store._db_path = Path(tmp) / "lake.db"
             db = Path(tmp) / "index.db"
             # Every graph call is @trace'd into TRACES_DIR/<run_id>.jsonl, inside the real
             # data/ this check must not touch (the same move `vault.demo` makes).
@@ -510,12 +539,13 @@ def demo() -> None:
             del package.embed
         else:
             package.embed = had_embed
-        if stub_store._conn is not None:
-            stub_store._conn.close()
-        stub_store._db_path, stub_store._conn = old_db, None
         for key in list(index._CONNS):          # the temp index.db handle, closed not leaked
             index._CONNS.pop(key).close()
         index._MATS.clear()
+        # The graph was confirmed empty above, so wiping it outright on the way out
+        # cannot touch anything this run did not itself write.
+        with neo4j_store._session() as _s:
+            _s.execute_write(lambda tx: tx.run("MATCH (n) DETACH DELETE n").consume())
 
     # The cleanup above is itself checked: check 22 is registered LAST, so a leaked
     # global has no later check to fail and would sit here unnoticed forever.
@@ -523,9 +553,9 @@ def demo() -> None:
     assert graph_client.all_theses is old_all_theses
     assert trace_mod.TRACES_DIR == old_traces and trace_mod.current_run_id() == old_run_id
     assert "lake.embed" not in sys.modules and getattr(package, "embed", None) is had_embed
-    assert stub_store._db_path == old_db and stub_store._conn is None
     print("split self-check OK")
+    return 0
 
 
 if __name__ == "__main__":
-    demo()
+    raise SystemExit(demo())

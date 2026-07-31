@@ -217,6 +217,8 @@ def _phase2(staging_path, limit: int | None) -> dict:
     rederive_failed: list[dict] = []
     splits: list[dict] = []
     split_failed: list[dict] = []
+    cocitation_pairs = 0
+    cocitation_missing: list[dict] = []
 
     def split_sweep() -> None:
         """Split every idea over the leaf ceiling (issue #2).
@@ -279,6 +281,20 @@ def _phase2(staging_path, limit: int | None) -> dict:
             index.index_theses(theses)
             written += len(theses)
 
+        # D12: co-citation edges for THIS source's own ideas, right after all of
+        # them are committed and before `split_sweep()` — a child idea a split
+        # creates below has no leaves of its own under `src.id` yet, so writing
+        # edges before the split covers the same ideas co-citation is defined
+        # over (two ideas sharing a source), not idea shells split has not
+        # populated. `write_cocitation_edges` is idempotent per source (repeat
+        # ingest of the same source recomputes the same pairs, its own id is
+        # already recorded, weight does not move — `neo4j_store` docstring).
+        for outcome in graph_client.write_cocitation_edges(src.id):
+            if outcome["missing"]:
+                cocitation_missing.append({"source_id": src.id, **outcome})
+            else:
+                cocitation_pairs += 1
+
         _reconcile_index()
 
         split_sweep()
@@ -324,7 +340,19 @@ def _phase2(staging_path, limit: int | None) -> dict:
     report.update({"sources_processed": len(groups[:limit]), "theses_written": written,
                    "theses_skipped": skipped, "theses_refused": refused,
                    "rederived": rederived, "rederive_failed": rederive_failed,
-                   "splits": splits, "split_failed": split_failed, **trust_report,
+                   "splits": splits, "split_failed": split_failed,
+                   # `cocitation_pairs`, not `cocitation_edges` (review, 2026-07-31): this
+                   # counts idea PAIRS `write_cocitation_edges` reported as written — one
+                   # per source pass over the loop below. `/stats.edges` (`counts()["edges"]`)
+                   # counts `(:Idea)-[:RELATED]->(:Idea)` ROWS, both directions, so it reads
+                   # TWICE this number for the same co-citation work (`neo4j_store` module
+                   # docstring: "both directions... the stored edge is directed"). A field
+                   # literally named `..._edges` holding half of what `/stats.edges` calls
+                   # edges was the kind of number that does not agree with what the page
+                   # shows without actually being wrong — renamed rather than doubled, since
+                   # "pairs found" is what the loop below actually counts.
+                   "cocitation_pairs": cocitation_pairs,
+                   "cocitation_missing": cocitation_missing, **trust_report,
                    # Read off the STORE, not off `split_failed`. The failure list counts
                    # attempts — one idea failing under ten sources is ten entries, and an
                    # idea nobody attempted is zero — so it answers "did a call raise",
@@ -523,6 +551,10 @@ def _print_report(report: dict) -> None:
         from .split import MAX_LEAVES
         print(f"  STILL OVER THE CEILING: {report['ideas_over_ceiling']} idea(s) above "
               f"{MAX_LEAVES} leaves, max is {report['max_leaves_per_idea']} (issue #2)")
+    if report.get("cocitation_missing"):
+        print(f"  co-citation edges that matched no idea: {len(report['cocitation_missing'])}")
+        for miss in report["cocitation_missing"]:
+            print(f"    {miss['source_id']}: {miss['idea_a_id']} <-> {miss['idea_b_id']}")
 
 
 def _draft_of(row: dict) -> DraftThesis:
@@ -647,7 +679,7 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
 
     if args.phase == "selfcheck":
-        selfcheck()
+        raise SystemExit(selfcheck())
     elif args.phase == "phase1":
         import yaml                             # only the CLI reads sources.yaml
         entries = yaml.safe_load(Path(args.sources).read_text(encoding="utf-8"))
@@ -658,13 +690,17 @@ def main(argv=None) -> None:
 
 # ------------------------------------------------------------------- self-check
 
-def selfcheck() -> None:
+def selfcheck() -> int:
     """Offline end-to-end over two fixture sources: no network, no model load.
 
     fetch/parse/generalize/link, `lake.embed` and `llm.complete` are fakes; the store
     and the index go to a temporary directory. ponytail: one runnable check, not a
     suite — it fails if the staging format, the cursor, idempotency or the re-derive
     trigger break.
+
+    Returns 1 on SKIPPED/REFUSED, 0 once every assertion below actually ran — a
+    demo that never touched the graph must not read like a passed check
+    (`lake/api/selfcheck.py:main` docstring has the full story).
     """
     import functools
     import sys
@@ -674,7 +710,7 @@ def selfcheck() -> None:
 
     import numpy as np
 
-    from .. import stub_store
+    from .. import neo4j_store
     from ..models import (EMBED_DIM, Idea, Section, Thesis, new_idea_id,
                           new_thesis_id, source_id as make_source_id)
 
@@ -768,10 +804,11 @@ def selfcheck() -> None:
         out = []
         for row in rows:
             th = row["thesis"]
-            with stub_store._lock:
-                seen = stub_store._c().execute(
-                    "SELECT 1 FROM thesis WHERE source_id=? AND text_hash=?",
-                    (source_id, th["text_hash"])).fetchone()
+            leaf_key = f"{source_id}|{th['text_hash']}"
+            with neo4j_store._session() as _s:
+                seen = _s.execute_read(lambda tx, leaf_key=leaf_key: tx.run(
+                    "MATCH (t:Thesis {leaf_key: $leaf_key}) RETURN 1 AS c",
+                    leaf_key=leaf_key).single())
             if seen:
                 out.append({"thesis": None, "idea": None, "skipped": True,
                             "reason": "text_hash already under this source"})
@@ -816,12 +853,38 @@ def selfcheck() -> None:
 
     from . import rederive
 
+    # D11 removed the isolated store this check used to swap in (a fresh SQLite
+    # file). Neo4j has no equivalent disposable target, so the fixture below is
+    # written into whatever `NEO4J_URI` names for real — guarded the same way
+    # `vault.demo`/`lake.api.selfcheck` are: the host must be local/scratch
+    # (`neo4j_store._require_local_target`) and the graph confirmed empty first.
+    # BLOCKER (review 2026-07-31): checked `os.environ.get("NEO4J_URI")` here and
+    # unconditionally `DETACH DELETE`d below — one variable checked, a different
+    # one (whatever the driver connected with, possibly set before an env change)
+    # wiped. `_get_driver()` first, then the URI it actually snapshotted
+    # (`neo4j_store._uri`), same as `lake.selfcheck._wipe_graph`.
+    try:
+        neo4j_store._get_driver()  # so `_uri` below reflects what the driver really used
+        neo4j_store._require_local_target(neo4j_store._uri)
+        with neo4j_store._session() as _s:
+            _existing = _s.execute_read(
+                lambda tx: tx.run("MATCH (n) RETURN count(n) AS c").single()["c"])
+    except graph_client.STORE_ERRORS as exc:
+        print(f"SKIPPED: no Neo4j reachable at {os.environ.get('NEO4J_URI')} "
+              f"({type(exc).__name__}: {exc}). Bring one up with "
+              "`docker compose up -d neo4j` and rerun.")
+        return 1
+    if _existing:
+        print(f"REFUSED: the graph is not empty ({_existing} node(s) total) — this "
+              "self-check only ever runs against an empty scratch instance. Point "
+              "NEO4J_URI at an empty instance and rerun.")
+        return 1
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             STAGING = Path(tmp) / "staging.jsonl"
             cursor_path = _cursor_path(STAGING)
             idx = Path(tmp) / "index.db"
-            stub_store._db_path = Path(tmp) / "lake.db"
             # Every graph call is @trace'd into TRACES_DIR/<run_id>.jsonl. Deleting the
             # file afterwards was not enough: `_write` mkdirs the directory, and a data/
             # that exists while holding no file is what makes `vault.demo`'s leak guard
@@ -890,6 +953,24 @@ def selfcheck() -> None:
             assert index.count(db=idx) == 4, index.count(db=idx)
             print("ok: phase 2 on 1 source — 4 leaves, 2 ideas, cursor 4, no re-derive yet")
 
+            # --- co-citation edges (D12): source s1 gives BOTH "lever 0" and "lever 1"
+            # 2 leaves each (one per section) — 2 DISTINCT ideas under one source is
+            # what the gate is on (BLOCKER 2, review 2026-07-31: not a per-idea leaf
+            # count — `lake/neo4j_store.py`'s own live self-check covers the 1-leaf-
+            # per-idea shape this fixture does not), so phase 2 must write one
+            # co-citation edge, both directions, weight min(2, 2) = 2.
+            hot0, cold0 = ideas_by_text["lever 0"], ideas_by_text["lever 1"]
+            assert first["cocitation_pairs"] == 1 and first["cocitation_missing"] == [], first
+            assert graph_client.counts()["edges"] == 2, graph_client.counts()  # 1 pair, 2 rows
+            hop = graph_client.neighbors([hot0])
+            assert len(hop) == 1 and hop[0]["target_id"] == cold0 and hop[0]["weight"] == 2.0, hop
+            assert hop[0]["type"] == "related_via_source", hop
+            back = graph_client.neighbors([cold0])
+            assert len(back) == 1 and back[0]["target_id"] == hot0 and back[0]["weight"] == 2.0, \
+                back
+            print("ok: phase 2 writes co-citation edges for the source's own ideas, "
+                  "both directions, weight min(count_a, count_b) (D12)")
+
             # --- restart: continues from the cursor -------------------------
             second = phase2(STAGING)
             assert second["sources_processed"] == 1, "restart re-processed source 1"
@@ -903,6 +984,12 @@ def selfcheck() -> None:
             assert second["leakage_share"] == 0.0 and second["pending_link"] == 0, second
             #  ^ source 2 is all lever 0; the whole staging replayed below is 2/6
             assert second["wall_ms"] > 0, second
+            # source s2 (`run`) links both its leaves onto the SAME idea ("lever 0"
+            # twice, `link_batch`'s fake overlay) — one idea under s2, no pair to
+            # co-cite, and the s1 edge above must be untouched by a different source.
+            assert second["cocitation_pairs"] == 0 and second["cocitation_missing"] == [], second
+            assert graph_client.neighbors([hot0])[0]["weight"] == 2.0, \
+                "an unrelated source's phase 2 must not touch another source's edge"
             print("ok: restart from the cursor — source 2 only, 6 leaves, index == graph")
 
             # --- the re-derive itself ---------------------------------------
@@ -934,7 +1021,16 @@ def selfcheck() -> None:
             assert again["theses_written"] == 0, "a replay wrote new theses"
             assert again["leakage_share"] == 0.333, again
             assert index.count(db=idx) == 6
-            print("ok: replay of the whole staging — 6 skipped, 0 new theses, 0 new ideas")
+            # D12 idempotency requirement: replaying source s1 recomputes the same
+            # co-citation pair (still not "missing"), but its own source id is
+            # already in the edge's `evidence`, so the weight must NOT have doubled
+            # to 4.0 — a re-ingest of the same source must not inflate the weight.
+            assert again["cocitation_pairs"] == 1, again
+            assert graph_client.counts()["edges"] == 2, graph_client.counts()
+            assert graph_client.neighbors([hot0])[0]["weight"] == 2.0, \
+                "replaying the same source doubled the co-citation weight"
+            print("ok: replay of the whole staging — 6 skipped, 0 new theses, 0 new ideas, "
+                  "co-citation weight unchanged (D12 idempotency)")
 
             # --- /fetch: one source, own staging, corpus untouched -----------
             corpus_before = STAGING.read_text(encoding="utf-8")
@@ -1067,14 +1163,18 @@ def selfcheck() -> None:
                   "row, and only a run row")
 
             index._CONNS.pop(str(idx)).close()
-            stub_store._conn.close()
-            stub_store._conn = None
     finally:
         STAGING = real_staging
         index.index_theses, llm.complete = real_index_theses, real_complete
         index.has, index.index_rows = real_has, real_index_rows
         index.stale_links, index.reconcile = real_stale_links, real_reconcile
         llm.assert_grammar_works = real_canary
+        # The graph was confirmed empty above, so wiping it outright on the way out
+        # cannot touch anything this run did not itself write. Unconditional, in the
+        # `finally`: an assertion failure above must not leave fixtures behind to
+        # poison the emptiness gate of the next invocation.
+        with neo4j_store._session() as _s:
+            _s.execute_write(lambda tx: tx.run("MATCH (n) DETACH DELETE n").consume())
         for full_name, prev_mod, prev_attr in reversed(installed):
             parent, _, leaf = full_name.rpartition(".")   # a fake left behind is a trap
             if prev_mod is None:
@@ -1089,6 +1189,7 @@ def selfcheck() -> None:
         writer_lock.LOCK_PATH = real_lock_path
 
     print("run self-check OK")
+    return 0
 
 
 if __name__ == "__main__":

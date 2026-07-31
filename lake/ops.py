@@ -126,7 +126,7 @@ def patch_idea(idea_id: str, fields: dict) -> dict:
     that sets both loses its own vector, deliberately: the text is the source.
 
     Raises `NotFound`. What may be patched at all is the HTTP layer's business
-    (`schemas.IdeaPatch`); what the columns accept is the store's (`stub_store`).
+    (`schemas.IdeaPatch`); what the columns accept is the store's (`neo4j_store`).
     """
     fields = dict(fields)
     if "text" in fields:

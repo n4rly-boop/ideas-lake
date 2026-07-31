@@ -4,6 +4,23 @@
     python3 -m lake.neo4j_load               # write
     python3 -m lake.neo4j_load --wipe        # delete every node first, then write
 
+Reads through `NEO4J_URI`/`NEO4J_USERNAME`/`NEO4J_PASSWORD`/`NEO4J_DATABASE` — same
+four `graph_client` already used to import (the local lake, D11). Writes through a
+SEPARATE set, `NEO4J_TARGET_URI`/`NEO4J_TARGET_USERNAME`/`NEO4J_TARGET_PASSWORD`/
+`NEO4J_TARGET_DATABASE`, required and distinct from the read side, and refused if
+the two URIs are equal.
+
+BLOCKER (third round, `13` §4.4 p1): before D11 the read side was `stub_store`
+(SQLite) and the write side was whatever `NEO4J_URI` named — two different systems,
+so overriding `NEO4J_URI` to push into Aura was safe by construction. D11 made
+`graph_client` read Neo4j through the SAME `NEO4J_URI` as everything else, so the
+one documented way to push into Aura (`.env.local.example`, "Облачный граф вместо
+локального": override `NEO4J_URI` on a one-off `docker compose run`) now points the
+READ side at Aura too — `build()` would read Aura's own (likely near-empty) graph
+back at itself instead of the local lake, and call that "the lake". Two distinct
+variables make that class of bug impossible to reach by accident: there is no
+single name that redirects both sides at once.
+
 Not a `graph_client` backend. The integration form — HTTP service or client
 library — is B's open decision (`07:72`), and this does not pretend to make it:
 it reads through `graph_client` like every other consumer and speaks Cypher only
@@ -68,7 +85,7 @@ def _row(model, node: dict) -> dict:
     value the lake genuinely does not have (`run_success` on a paper), and the
     model spells those `| None = None`. A required field missing means the
     reader did not carry it — `list_theses` is a serving projection and has no
-    `vector` (`stub_store:277-283`) — and the node lands with a hole, silently,
+    `vector` (`neo4j_store.py:507`) — and the node lands with a hole, silently,
     because Neo4j has no schema to object. That is how 60 theses reached the
     database without vectors on 2026-07-29.
     """
@@ -100,7 +117,7 @@ def build() -> dict:
     theses = _all(lambda limit, offset: graph_client.list_theses(None, None, limit, offset))
     # `list_theses` is what `/theses` serves and it carries no vector — 384 floats
     # per leaf on every page would be a listing nobody wants. `all_theses` is the
-    # reader that holds them (`stub_store:319-332`), the same one the index
+    # reader that holds them (`neo4j_store.py:550`), the same one the index
     # reconciles against. A leaf missing from it stays `None` and `_row` refuses.
     vectors = {leaf["id"]: leaf["vector"] for leaf in graph_client.all_theses()}
     for leaf in theses:
@@ -135,34 +152,90 @@ def _chunks(rows: list, size: int = BATCH):
         yield rows[start:start + size]
 
 
+_LOOPBACK = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _target_key(uri: str, database: str) -> tuple:
+    """(host, port, database), normalized — the same fields `_require_local_target`
+    already parses with `urlparse`, not a raw string (BLOCKER, review 2026-07-31):
+    `neo4j://HOST:7687` and `neo4j://host` name the same address — default port
+    implicit either way, host case-insensitive — and a bare `==` in `push()` let
+    that second spelling through a guard whose entire job is catching 'this is the
+    same database', letting `--wipe` erase the very graph `build()` was about to read.
+
+    The scheme is deliberately NOT part of the key, and the loopback aliases collapse
+    to one token: `bolt://localhost:7687` and `neo4j://127.0.0.1:7687` are the same
+    database, and a guard that answers 'different' to either spelling is a guard that
+    does not hold (measured third round: `127.0.0.1` walked straight through the
+    version that kept scheme and host verbatim). Erring toward MORE refusals is the
+    right direction here — a false refusal costs one env var, a false pass costs the lake.
+
+    ponytail: textual normalization only, no DNS resolution — two different names for
+    the same remote host still read as different. Resolve with `socket.getaddrinfo` if
+    a deployment ever addresses one graph by several names.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(uri)
+    host = (parsed.hostname or "").lower()
+    return ("localhost" if host in _LOOPBACK else host, parsed.port or 7687, database)
+
+
 def push(payload: dict, wipe: bool = False) -> dict:
     from neo4j import GraphDatabase
 
-    from .neo4j_store import _require_local_target
+    from .neo4j_store import _require_local_target, _require_wipe_confirmed
 
-    missing = [name for name in ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD")
+    # Target — NOT `NEO4J_URI`. `build()` (the caller, above) already read the lake
+    # through `graph_client`, which resolved `NEO4J_URI` at import time (D11); reusing
+    # that same variable here as the WRITE target would mean the one documented way to
+    # push into Aura — overriding `NEO4J_URI` on a one-off `docker compose run`
+    # (`.env.local.example`) — redirects the READ side too, and `build()` reads
+    # Aura's own graph back at itself instead of the local lake (module docstring,
+    # BLOCKER third round). `NEO4J_TARGET_DATABASE` has no default on purpose: Aura's
+    # database name is the instance id, never `neo4j` (`.env.local.example`), and a
+    # silent default here would connect to the wrong graph without a word.
+    missing = [name for name in ("NEO4J_TARGET_URI", "NEO4J_TARGET_USERNAME",
+                                  "NEO4J_TARGET_PASSWORD", "NEO4J_TARGET_DATABASE")
                if not os.environ.get(name)]
     if missing:
-        raise SystemExit(f"not in the environment: {', '.join(missing)}")
+        raise SystemExit(f"not in the environment: {', '.join(missing)} — the push "
+                         "target is separate from NEO4J_URI (the read source, see "
+                         "the module docstring), on purpose")
 
     # Captured once and reused for both the guard and the driver below, so the two
     # can never diverge the way a re-read of `os.environ` could (`13` MAJOR 4).
-    uri = os.environ["NEO4J_URI"]
+    uri = os.environ["NEO4J_TARGET_URI"]
+    source_uri = os.environ.get("NEO4J_URI")
+    target_database = os.environ["NEO4J_TARGET_DATABASE"]
+    source_database = os.environ.get("NEO4J_DATABASE", "neo4j")
+    if source_uri and _target_key(uri, target_database) == _target_key(source_uri, source_database):
+        raise SystemExit(
+            f"NEO4J_TARGET_URI equals NEO4J_URI once normalized (scheme/host/port/"
+            f"database): {uri!r} vs {source_uri!r} — that pushes a database into "
+            "itself, not the local lake into block B's (BLOCKER third round). Point "
+            "NEO4J_TARGET_URI at the real target — NEO4J_URI cannot be left empty to "
+            "work around this: `graph_client` refuses to import without it at all "
+            "(D11), online or offline, so this script (which imports it, module "
+            "docstring) never starts without a real NEO4J_URI either way.")
     if wipe:
-        # BLOCKER (second round): this was the one reachable place `--wipe` ran
-        # with NO target guard at all — `neo4j_store.migrate(wipe=True)` has zero
-        # callers, this script is what an operator actually runs, and
-        # `.env.local.example` points `NEO4J_*` straight at Aura, block B's
-        # database. Reusing `neo4j_store`'s guard (not a second copy of it) means
-        # `--wipe` here can now only ever hit the lake's own local instance —
-        # never Aura, never "whatever the environment happens to name" (07:79).
+        # BLOCKER (second round, then third): this was the one reachable place
+        # `--wipe` ran with NO target guard at all — `neo4j_store.migrate(wipe=True)`
+        # has zero callers, this script is what an operator actually runs. Two gates,
+        # not one: `_require_local_target` (hostname) still refuses Aura/anything
+        # remote unconditionally, and `_require_wipe_confirmed` (LAKE_CONFIRM_WIPE,
+        # an exact URI match typed by hand) is the second, hostname-independent
+        # signal `neo4j_store.py`'s own comment on `_WIPE_ALLOWED_HOSTS` explains —
+        # needed because prod's own `NEO4J_URI` is `bolt://neo4j:7687`, the same
+        # compose service name a scratch instance also uses.
         _require_local_target(uri)
+        _require_wipe_confirmed(uri)
 
-    driver = GraphDatabase.driver(uri, auth=(os.environ["NEO4J_USERNAME"],
-                                             os.environ["NEO4J_PASSWORD"]))
+    driver = GraphDatabase.driver(uri, auth=(os.environ["NEO4J_TARGET_USERNAME"],
+                                             os.environ["NEO4J_TARGET_PASSWORD"]))
     written = {}
     try:
-        with driver.session(database=os.environ.get("NEO4J_DATABASE", "neo4j")) as session:
+        with driver.session(database=os.environ["NEO4J_TARGET_DATABASE"]) as session:
             if wipe:
                 gone = session.run("MATCH (n) DETACH DELETE n RETURN count(n) AS c")
                 written["wiped"] = gone.single()["c"]
@@ -224,28 +297,82 @@ def demo() -> None:
     refuses(Idea, {**full_idea, "vector": None}, "vector")
     print("ok: nested -> JSON, None dropped, False kept, every required field demanded")
 
-    # BLOCKER (second round): push(wipe=True) used to have no target guard at
-    # all — the reachable destructive path, since neo4j_store.migrate(wipe=True)
-    # has zero callers. Verified without a live connection: the guard runs
-    # before the driver is even built, so a fake Aura-shaped URI must refuse
-    # before any network call is attempted (no seeded database at risk here).
-    saved = {k: os.environ.get(k) for k in ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD")}
-    os.environ["NEO4J_URI"] = "neo4j+s://deadbeef00.databases.neo4j.io"
-    os.environ["NEO4J_USERNAME"] = "x"
-    os.environ["NEO4J_PASSWORD"] = "x"
+    # BLOCKER (second round, then third): push(wipe=True) used to have no target
+    # guard at all — the reachable destructive path, since
+    # neo4j_store.migrate(wipe=True) has zero callers. Verified without a live
+    # connection: every guard below runs before the driver is even built, so a bad
+    # environment must refuse before any network call is attempted (no seeded
+    # database at risk here).
+    ENV_KEYS = ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD", "NEO4J_TARGET_URI",
+               "NEO4J_TARGET_USERNAME", "NEO4J_TARGET_PASSWORD", "NEO4J_TARGET_DATABASE",
+               "LAKE_CONFIRM_WIPE")
+    saved = {k: os.environ.get(k) for k in ENV_KEYS}
     try:
-        push({"Source": [], "Thesis": [], "Idea": [], "edges": []}, wipe=True)
-    except RuntimeError as exc:
-        assert "deadbeef00" in str(exc), exc
-    else:
-        raise AssertionError("push(wipe=True) against a non-local URI must refuse, not wipe")
+        for k in ENV_KEYS:
+            os.environ.pop(k, None)
+
+        # (a) target vars entirely absent -> SystemExit, not a silent write to
+        # wherever NEO4J_URI (the read side) happened to name.
+        try:
+            push({"Source": [], "Thesis": [], "Idea": [], "edges": []}, wipe=False)
+        except SystemExit as exc:
+            assert "NEO4J_TARGET_URI" in str(exc), exc
+        else:
+            raise AssertionError("push() without NEO4J_TARGET_* must refuse")
+
+        # (b) target == source (BLOCKER third round): the one bug two separate
+        # variables exist to make unreachable — copying a database into itself.
+        os.environ["NEO4J_URI"] = "bolt://neo4j:7687"
+        os.environ["NEO4J_TARGET_URI"] = "bolt://neo4j:7687"
+        os.environ["NEO4J_TARGET_USERNAME"] = "x"
+        os.environ["NEO4J_TARGET_PASSWORD"] = "x"
+        os.environ["NEO4J_TARGET_DATABASE"] = "neo4j"
+        try:
+            push({"Source": [], "Thesis": [], "Idea": [], "edges": []}, wipe=False)
+        except SystemExit as exc:
+            assert "equals NEO4J_URI" in str(exc), exc
+        else:
+            raise AssertionError("push() with NEO4J_TARGET_URI == NEO4J_URI must refuse")
+
+        # (c) target is a genuinely different, non-local (Aura-shaped) host and
+        # wipe=True: `_require_local_target` refuses before `_require_wipe_confirmed`
+        # is even consulted.
+        os.environ["NEO4J_URI"] = "bolt://neo4j:7687"
+        os.environ["NEO4J_TARGET_URI"] = "neo4j+s://deadbeef00.databases.neo4j.io"
+        try:
+            push({"Source": [], "Thesis": [], "Idea": [], "edges": []}, wipe=True)
+        except RuntimeError as exc:
+            assert "deadbeef00" in str(exc), exc
+        else:
+            raise AssertionError("push(wipe=True) against a non-local target must "
+                                 "refuse, not wipe")
+
+        # (d) target is local/scratch-shaped (passes _require_local_target — this is
+        # prod's own hostname now) but LAKE_CONFIRM_WIPE is unset: the SECOND gate
+        # must still refuse. This is the exact scenario the third-round BLOCKER is
+        # about — hostname alone is not enough any more. Source deliberately
+        # different from target here (`localhost` vs the `neo4j` service name), or
+        # the target==source refusal above would fire first and this gate would
+        # never be reached.
+        os.environ["NEO4J_URI"] = "bolt://localhost:7687"
+        os.environ["NEO4J_TARGET_URI"] = "bolt://neo4j:7687"
+        os.environ.pop("LAKE_CONFIRM_WIPE", None)
+        try:
+            push({"Source": [], "Thesis": [], "Idea": [], "edges": []}, wipe=True)
+        except RuntimeError as exc:
+            assert "LAKE_CONFIRM_WIPE" in str(exc), exc
+        else:
+            raise AssertionError("push(wipe=True) against a local-shaped target "
+                                 "without LAKE_CONFIRM_WIPE must refuse (BLOCKER "
+                                 "third round)")
     finally:
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    print("ok: push(wipe=True) refuses a non-local NEO4J_URI before connecting (BLOCKER)")
+    print("ok: push() refuses missing target vars, target==source, a non-local "
+          "target, and an unconfirmed wipe — all before connecting (BLOCKER)")
     print("neo4j_load self-check OK — nothing connected, nothing written")
 
 
@@ -254,7 +381,9 @@ if __name__ == "__main__":
                                      description="Залить озеро в Neo4j блока B (`07:72`).")
     parser.add_argument("--dry-run", action="store_true", help="собрать и проверить, не подключаясь")
     parser.add_argument("--wipe", action="store_true",
-                        help="снести все узлы перед записью (тестовая БД)")
+                        help="снести все узлы NEO4J_TARGET_URI перед записью — требует "
+                             "LAKE_CONFIRM_WIPE=<точный NEO4J_TARGET_URI>, задать вручную "
+                             "в этом вызове, не в .env.local")
     parser.add_argument("--self-check", action="store_true", help="офлайн-проверка формовки")
     args = parser.parse_args()
 

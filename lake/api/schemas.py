@@ -49,7 +49,7 @@ class SourceOut(BaseModel):
 
 
 class SourceIn(BaseModel):
-    """Upsert of a Source. This is how block C reports a run back (§1.1, `stub_store`
+    """Upsert of a Source. This is how block C reports a run back (§1.1, `neo4j_store`
     comment on `write_source`): the same (url, version) yields the same id, so the
     row is replaced and never duplicated."""
     model_config = ConfigDict(extra="forbid")
@@ -172,14 +172,20 @@ class IdeaPatch(BaseModel):
 
 
 class EdgeOut(BaseModel):
-    """`edge` is block B's and empty in the MVP, so these listings answer [] —
-    planned degradation, not an error (§3.4, `08:377`)."""
+    """**[D12, 2026-07-31]** `edge` is now block A's: `write_cocitation_edges` and
+    `write_derived_from_edges` write to Neo4j in the ingest/synthesis pipeline itself.
+    These listings answer the real edges, not [] (§3.4, `07:C1`)."""
     source_id: str
     target_id: str
     type: str
     note: str | None = None
     weight: float | None = None
-    evidence: str | None = None
+    # list[str], not str: co-citation writes the LIST of contributing source ids
+    # (`neo4j_store._COCITE_UPSERT`), derived_from now writes a one-element list for
+    # the same reason (`neo4j_store.write_derived_from_edges`) — one key, one shape,
+    # or `GET /ideas/{id}/neighbors` 500s on FastAPI response validation the moment a
+    # real co-citation edge is in the answer (review, 2026-07-31).
+    evidence: list[str] | None = None
     hop: int
 
 

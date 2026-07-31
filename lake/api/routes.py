@@ -168,7 +168,7 @@ def idea_theses(idea_id: str):
 
 @graph.get("/ideas/{idea_id}/neighbors", response_model=list[EdgeOut],
            responses={**_GRAPH_ERRORS, **_NOT_FOUND},
-           summary="Рёбра из идеи (пусто в MVP: рёбра — блок B)")
+           summary="Рёбра из идеи (co-citation и derived_from, D12 2026-07-31)")
 def idea_neighbors(idea_id: str, hops: int = Query(1, ge=1, le=3),
                    min_weight: float | None = None):
     if not graph_client.get_ideas([idea_id]):
