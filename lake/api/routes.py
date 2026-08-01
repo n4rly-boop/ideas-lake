@@ -242,7 +242,8 @@ research = APIRouter(tags=["research"])
 
 
 @research.post("/research", response_model=ResearchResponse,
-               responses=_RESEARCH_ERRORS, summary="RAG + web → language research report")
+               responses=_RESEARCH_ERRORS,
+               summary="Lake priors + optional web → language research report")
 def research_endpoint(body: ResearchRequest, request: Request):
     """Run one bounded research round owned by Ideas Lake.
 
