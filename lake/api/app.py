@@ -85,6 +85,9 @@ DESCRIPTION = """\
 
 * **retrieve** — запрос → идеи с провенансом. Recall-first: отказа по низкому
   скору нет, выдача дозаполняется до `k`, но каждый элемент говорит `via`.
+* **research** — bounded natural-language mission → Lake priors plus independently
+  fetched web evidence → language report. It never creates local ideas or fitness
+  evidence.
 * **graph** — чтение хранилища постранично; из записей только upsert источника
   (сюда блок C пишет исход прогона) и правка полей идеи.
 * **ingest** — write path фоновыми заданиями, по одному за раз.
@@ -153,6 +156,8 @@ def create_app(mock: bool = False, warmup: bool = True, api_key=None,
     app.state.mock = mock
     app.state.warmup = warmup
     app.state.workers = workers
+    # Lazy construction keeps imports and mock/self-checks free of network calls.
+    app.state.research_agent = None
     # Read here, not per request: a key that changes under a running server would make
     # "it works on my machine" depend on when the request landed.
     app.state.api_key = os.environ.get("LAKE_API_KEY", "") if api_key is None else api_key

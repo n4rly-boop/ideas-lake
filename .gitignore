@@ -23,3 +23,6 @@ venv/
 
 # macOS
 .DS_Store
+
+# Промежуточные кадры manim (готовые ролики — tools/anim/out/)
+tools/anim/media/

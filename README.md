@@ -19,7 +19,8 @@ AIRI Summer 2026, проект 28 «Озеро идей».
 | `lake/models.py` | `Source` / `Thesis` / `Idea` — pydantic; отдельно литеральные JSON-схемы для LLM |
 | `lake/ingest/` | write path: fetch → parse → generalize → link → запись батчем |
 | `lake/retrieve/` | read path: rewrite → гибридный поиск → подъём к идеям → ранжирование |
-| `lake/api/` | HTTP-слой на всё: граф, поиск, ингест заданиями, retrieve, починка индекса |
+| `lake/research/` | reusable deep-research agent: Lake priors + independent web evidence → language report |
+| `lake/api/` | HTTP-слой на всё: граф, поиск, ингест заданиями, retrieve, research и починка индекса |
 | `lake/index.py` | индекс тезисов: SQLite FTS5 + вектора + RRF |
 | `lake/graph_client.py` | единственное место, знающее формат графового хранилища |
 | `lake/llm.py` | клиент llama.cpp: принуждение схемой, канарейка, fail-closed |
@@ -40,18 +41,33 @@ POST /retrieve
   { query, k=5, run_id?, budget?, rewrite=true, allow_web=false }
 ->
   { ideas: [ { idea_id, text, applicability_conditions, limitations, failure_modes,
-               effect_claimed, effect_observed, trust_score, score, via,
+               effect_claimed, effect_observed, trust_score, score, cosine_similarity, via,
                theses: [ { text, url, title, effect, locator } ] } ],
     log_id, cost: { tokens_in, tokens_out, wall_ms } }
 ```
 
 `via` — как идея попала в выдачу: `thesis` | `edge` | `padding`.
 
+Отдельная ручка `POST /research` принимает естественно-языковой запрос и bounded
+контекст, сначала получает приоры из `/retrieve`, затем независимо ищет и читает
+источники через SearXNG, Crawl4AI и Docling. Она возвращает language report с URL
+и выдержками, а не готовые локальные карточки. Карточки Lake используются только
+для gap/duplicate analysis и не копируются в task-local memory. Состояние RAG и
+предупреждения явно возвращаются; если одновременно нет рабочего RAG и
+independent web evidence, ответ — `503`, а не выдуманный пустой успех.
+
+Эволюционный `EvolutionResearchAgent` пока остаётся копией в
+`gigaevo-core-runtime/` для совместимости текущих прогонов. Будущие прогоны Core
+могут вызывать `/research` из фонового research worker; Core сам решает, какие
+гипотезы передать в task-local memory. Ручка не вызывается из `select_cards`,
+`pre_step_hook` или `post_step_hook`.
+
 Это контракт C3, но не весь сервер. Тем же приложением ходят чтение графа
 (`/sources`, `/ideas`, `/theses` — постранично, с фильтрами), сырой гибридный поиск
 по тезисам (`/search`), ингест фоновыми заданиями (`/ingest/phase1|phase2`, слот один,
-второй запуск → `409`), очередь отказов арбитра (`/ingest/pending-link`), починка
-индекса (`/admin/reindex`) и выгрузка озера в Obsidian-vault (`/vault/export`).
+второй запуск → `409`), приём батчей эволюции (`/run`), очередь отказов арбитра
+(`/ingest/pending-link`), судья доверия (`/admin/trust`), починка индекса
+(`/admin/reindex`) и выгрузка озера в Obsidian-vault (`/vault/export`).
 Скриптов, которые надо звать руками на машине с данными, не осталось.
 Полный список — `GET /docs`, разбор — в [`lake/README.md`](lake/README.md#5-слой-api).
 
@@ -102,7 +118,7 @@ read path (`GET /search`, BM25 + косинус, слитые RRF), корнем
 ## Запуск
 
 Python 3.12. Зависимости: `fastapi`, `uvicorn`, `pydantic`, `numpy`,
-`sentence-transformers`, `PyYAML`, остальное — stdlib. Платных API нет: LLM — серверы
+`sentence-transformers`, `PyYAML`, `neo4j`, остальное — stdlib. Платных API нет: LLM — серверы
 школы (llama.cpp), эмбеддинги считаются локально на CPU.
 
 Секреты — только из окружения, в репозиторий не попадают:
@@ -110,6 +126,10 @@ Python 3.12. Зависимости: `fastapi`, `uvicorn`, `pydantic`, `numpy`,
 ```
 LAKE_KEY_9B      ключ к Qwen3.5-9B
 LAKE_KEY_35B     ключ к Qwen3.6-35B-A3B
+LAKE_SEARXNG_URL  адрес локального SearXNG (по умолчанию http://127.0.0.1:8080)
+LAKE_CRAWL4AI_URL адрес локального Crawl4AI (по умолчанию http://127.0.0.1:11235)
+LAKE_DOCLING_URL  адрес локального Docling (по умолчанию http://127.0.0.1:5001)
+LAKE_RESEARCH_TIMEOUT_S таймаут одной операции research (по умолчанию 30)
 NEO4J_URI        neo4j+s://…
 NEO4J_USERNAME
 NEO4J_PASSWORD
@@ -119,7 +139,11 @@ NEO4J_DATABASE
 ```bash
 python -m lake.selfcheck                      # инварианты; --offline снимает единственный сетевой пункт
 python -m lake.api.selfcheck                  # офлайн-проверка HTTP-слоя, реальный data/ не трогает
+python -m lake.research.selfcheck             # офлайн-проверка планирования, RAG/web boundary и отказа
 python -m lake.api.app --port 8077            # сервер; --mock отдаёт форму /retrieve без графа и LLM
+curl -H "Authorization: Bearer $LAKE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"query":"alternative mechanisms for maintaining diversity in evolutionary search"}' \
+  http://127.0.0.1:8077/research
 python -m lake.ingest.run phase1 --limit 3    # то же, что POST /ingest/phase1, из терминала
 python -m lake.ingest.run phase2              # staging → граф + индекс, последовательно, с курсором
 python -m lake.vault                          # озеро → data/vault, открыть папку как vault в Obsidian
@@ -144,12 +168,16 @@ docker compose down -v                                       # снести вм
 нельзя, не назвав файл.
 
 Neo4j поднимается с `NEO4J_AUTH: none` и публикуется на `127.0.0.1` — одноразовая база на
-петлевом интерфейсе, логин и пароль из `.env.local` она игнорирует. Порт API тоже привязан
-к `127.0.0.1`: аутентификации у него нет вовсе.
+петлевом интерфейсе, логин и пароль из `.env.local` она игнорирует. Сервис `lake` ждёт
+здоровый Neo4j через `depends_on` и использует его как единственное графовое хранилище;
+SQLite остаётся только для локального FTS-индекса и долговечной очереди заданий. Порт API
+тоже привязан к `127.0.0.1`, но API защищён `LAKE_API_KEY`; `--no-auth` допустим только
+для явно локального диагностического запуска.
 
 Облачный граф — те же четыре `NEO4J_*` в `.env.local`, указывающие на Aura; менять код не
-нужно, контейнер Neo4j просто стоит без дела. `depends_on` между сервисами нет и по существу:
-API держит озеро в SQLite, а в Neo4j ходит только `lake.neo4j_load`.
+нужно, контейнер локального Neo4j в этом режиме можно не запускать. Для разовой загрузки
+в отдельный граф используются `NEO4J_TARGET_*` через `lake.neo4j_load`, чтобы сервис чтения
+не мог случайно залить данные сам в себя.
 
 `lake/data` подключается bind-монтированием — результаты прогонов остаются на хосте. Модель
 эмбеддингов запечена в образ: `create_app` греет энкодер до открытия порта, и качать её на
@@ -176,22 +204,15 @@ python3 demo/shoot.py        # PNG всей страницы и по секци�
 страница не считает ничего сама. Снять новый слепок — прогнать те же ручки и заменить
 файлы; ключ при этом не должен покидать сервер.
 
-## Состояние
+## Проверка и состояние
 
-Write path и read path проходят end-to-end на живых серверах школы. Последний прогон:
-из 3 поданных источников 2 дошли до графа (третий — Nature без arXiv-версии, недостижим
-ни одним из трёх путей фетча, отказ назван), 60 тезисов → 26 идей, очередь отказов
-арбитра пуста, идей без листьев 0, `/retrieve` укладывается в 1.1–1.3 с при бюджете 5 с.
-`selfcheck` — 23/23.
+Исследовательский boundary проверяется без сети и ключей:
+`python -m lake.research.selfcheck`. Для полного HTTP- и графового self-check
+используйте собранный Docker-образ и пустой локальный Neo4j; CI запускает
+`lake.ingest.run selfcheck`, `lake.api.selfcheck` и `lake.selfcheck --offline` именно
+в таком окружении. Это важно: локальный Python без зависимостей FastAPI/Neo4j не является
+валидной проверкой приложения, а self-check намеренно отказывается писать в непустой граф.
 
-Озеро выгружается в Obsidian-vault (88 заметок, 240 ссылок) и залито в тестовый Neo4j
-блока B: 2 источника, 60 тезисов, 26 идей, рёбра `HAS_LEAF` и `YIELDS`, констрейнты на
-`id` созданы. Это односторонняя заливка, а не переезд.
-
-`MATCH (n) RETURN count(n)` в той базе отдаёт 92, а не 88: рядом лежат 4 тестовых узла
-блока B, их загрузчик не пишет и не удаляет. И база называется `37b54210`, а не `neo4j`,
-— подключение без `NEO4J_DATABASE` показывает пустой граф.
-
-Ещё не сделано: ингест всего корпуса (84 источника), набор из 30 оценочных запросов и
-метрики (`lake/eval/`), переезд с временного SQLite-стаба на Neo4j блока B.
-Известные ограничения названы поимённо в [`lake/README.md`](lake/README.md#8-известные-ограничения).
+Текущие ограничения и точные контракты перечислены в
+[`lake/README.md`](lake/README.md#8-известные-ограничения) и в `knowledge/`; live-run
+evidence хранится рядом с артефактами соответствующего прогона, а не в этом README.

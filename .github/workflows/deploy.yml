@@ -101,7 +101,11 @@ jobs:
           NEO4J_URI: bolt://localhost:7687
         run: |
           img="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
-          for check in "lake.ingest.run selfcheck" "lake.api.selfcheck" "lake.selfcheck --offline"; do
+          # `lake.research.selfcheck` is fully offline (fakes for web, RAG and the
+          # queue), but it was green-by-never-running until it was listed here: the
+          # research agent's guards — graph-only mode, the ingest refusal branches, the
+          # no-evidence 503 — are exactly the paths no other check reaches.
+          for check in "lake.ingest.run selfcheck" "lake.api.selfcheck" "lake.selfcheck --offline" "lake.research.selfcheck"; do
             echo "::group::$check"
             docker run --rm --network host -e NEO4J_URI="$NEO4J_URI" "$img" python -m $check
             echo "::endgroup::"
