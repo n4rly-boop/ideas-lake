@@ -85,9 +85,9 @@ DESCRIPTION = """\
 
 * **retrieve** — запрос → идеи с провенансом. Recall-first: отказа по низкому
   скору нет, выдача дозаполняется до `k`, но каждый элемент говорит `via`.
-* **research** — bounded natural-language mission → Lake priors plus independently
-  fetched web evidence → language report. It never creates local ideas or fitness
-  evidence.
+* **research** — bounded natural-language mission → Lake priors plus optional
+  independently fetched web evidence → language report. It never creates local
+  ideas or fitness evidence.
 * **graph** — чтение хранилища постранично; из записей только upsert источника
   (сюда блок C пишет исход прогона) и правка полей идеи.
 * **ingest** — write path фоновыми заданиями, по одному за раз.

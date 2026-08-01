@@ -49,18 +49,32 @@ POST /retrieve
 `via` — как идея попала в выдачу: `thesis` | `edge` | `padding`.
 
 Отдельная ручка `POST /research` принимает естественно-языковой запрос и bounded
-контекст, сначала получает приоры из `/retrieve`, затем независимо ищет и читает
-источники через SearXNG, Crawl4AI и Docling. Она возвращает language report с URL
-и выдержками, а не готовые локальные карточки. Карточки Lake используются только
-для gap/duplicate analysis и не копируются в task-local memory. Состояние RAG и
-предупреждения явно возвращаются; если одновременно нет рабочего RAG и
-independent web evidence, ответ — `503`, а не выдуманный пустой успех.
+контекст, сначала получает приоры из `/retrieve`, а при включённом web независимо
+ищет и читает источники через SearXNG, Crawl4AI и Docling. Она возвращает language
+report с доступными URL и выдержками, а не готовые локальные карточки. Карточки
+Lake используются только для gap/duplicate analysis и не копируются в task-local
+memory. Состояние RAG и предупреждения явно возвращаются; если одновременно нет
+рабочего RAG и independent web evidence, ответ — `503`, а не выдуманный пустой
+успех.
+
+Планирование и synthesis в `POST /research` используют Qwen3.6-35B-A3B.
+Механические parse/generalize/retrieve-rewrite шаги остаются на Qwen3.5-9B,
+а существующие link/trust judgement уже используют 35B.
 
 Эволюционный `EvolutionResearchAgent` пока остаётся копией в
-`gigaevo-core-runtime/` для совместимости текущих прогонов. Будущие прогоны Core
-могут вызывать `/research` из фонового research worker; Core сам решает, какие
+`gigaevo-core-runtime/` для совместимости текущих прогонов. Активная
+интеграционная ветка Core вызывает `/research` из фонового research worker;
+Core сам решает, какие
 гипотезы передать в task-local memory. Ручка не вызывается из `select_cards`,
 `pre_step_hook` или `post_step_hook`.
+
+В RAG-only режиме (`LAKE_RESEARCH_WEB=0`) источник и grounded claim не являются
+обязательными: отчёт использует bounded Lake priors, сохраняет доступные thesis
+URL как untrusted provenance и оставляет independently fetched `sources=[]`.
+Если structured synthesis 35B временно не прошёл контракт, найденные priors не
+теряются: они возвращаются в отдельной явно untrusted секции отчёта. Любая
+сформированная Core гипотеза всё равно остаётся `unverified` до эволюционной
+проверки.
 
 Это контракт C3, но не весь сервер. Тем же приложением ходят чтение графа
 (`/sources`, `/ideas`, `/theses` — постранично, с фильтрами), сырой гибридный поиск
@@ -129,7 +143,8 @@ LAKE_KEY_35B     ключ к Qwen3.6-35B-A3B
 LAKE_SEARXNG_URL  адрес локального SearXNG (по умолчанию http://127.0.0.1:8080)
 LAKE_CRAWL4AI_URL адрес локального Crawl4AI (по умолчанию http://127.0.0.1:11235)
 LAKE_DOCLING_URL  адрес локального Docling (по умолчанию http://127.0.0.1:5001)
-LAKE_RESEARCH_TIMEOUT_S таймаут одной операции research (по умолчанию 30)
+LAKE_RESEARCH_TIMEOUT_S таймаут web/PDF-операции research (по умолчанию 30)
+LAKE_RESEARCH_LLM_TIMEOUT_S таймаут одного 35B planning/synthesis-вызова (по умолчанию 90)
 NEO4J_URI        neo4j+s://…
 NEO4J_USERNAME
 NEO4J_PASSWORD

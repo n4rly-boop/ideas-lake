@@ -356,7 +356,8 @@ C пишет ветку, которая никогда не сработает.
 нужно исследовать. Агент:
 
 1. получает небольшой список карточек через локальный `/retrieve` только для
-   gap/duplicate analysis;
+   gap/duplicate analysis; сохраняет bounded thesis URL/текст как untrusted
+   provenance, а не независимо проверенный web source;
 2. планирует до пяти разных запросов (при сбое модели использует deterministic
    coverage fallback);
 3. параллельно ищет в SearXNG и читает страницы через Crawl4AI, а PDF/arXiv —
@@ -364,14 +365,30 @@ C пишет ветку, которая никогда не сработает.
 4. возвращает language report, `queries`, independently fetched `sources` и
    per-round token/latency cost.
 
+При `LAKE_RESEARCH_WEB=0` шаги 2–3 не выполняются. RAG-only synthesis оставляет
+`sources=[]`, потому что источник не был независимо прочитан в этом раунде, но
+сохраняет доступные thesis URL в untrusted prior context. Источник и grounded
+claim предпочтительны, но не обязательны для task-local гипотезы: Core оставляет
+её `unverified` и проверяет только через нормальную эволюцию. При ошибке
+structured synthesis bounded RAG context остаётся в report, поэтому успешный
+retrieval не теряется.
+
+Планирование запросов и synthesis в `lake/research/agent.py` работают на
+`Qwen3.6-35B-A3B` (`llm.QWEN_35B`) с таймаутом одного вызова
+`LAKE_RESEARCH_LLM_TIMEOUT_S=90` по умолчанию. Механические parse/generalize/
+retrieve-rewrite шаги остаются на 9B; существующие link/trust judgement уже
+используют 35B. Это отдельная модельная роль, а не изменение ранжирования или
+схемы API.
+
 RAG-приоры не копируются в task-local memory и не считаются доказательством.
 Отсутствие RAG явно помечается `rag_status=empty|degraded`; отсутствие web
 evidence при сломанном RAG даёт `503`. Модель не выносит verdict о feasibility,
 fitness, usefulness или promotion — это ответственность Core и evaluator.
 
-Для текущих запусков копия агента остаётся в `gigaevo-core-runtime/`.
-Интеграция Core с `/research` будет отдельной веткой: вызов должен оставаться
-в фоне, а EvolutionResearchAgent — выбирать task-local hypotheses из отчёта.
+Совместимая копия агента остаётся в `gigaevo-core-runtime/` для старых запусков.
+Активная интеграционная ветка Core вызывает `/research` в фоне; его
+`EvolutionResearchAgent` формирует и выбирает task-local hypotheses из отчёта,
+а не инжектирует карточки Lake напрямую.
 
 ```
 POST /retrieve
