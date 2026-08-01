@@ -203,6 +203,43 @@ class SearchHit(BaseModel):
     vec_rank: int | None = None
 
 
+class DialPoint(BaseModel):
+    """One indexed thesis around the hypothesis. `cosine` is the real similarity —
+    the radius on the dial. `angle` is projected and carries no distance."""
+    thesis_id: str
+    idea_id: str
+    cosine: float
+    angle: float = Field(..., description="Радианы, из PCA остатка. Декорация, не расстояние.")
+
+
+class DialHit(SearchHit):
+    """A hit with what the index already holds: the leaf text and its cosine. Both come
+    from `idx_thesis`, so the list under the dial reads without touching the graph."""
+    text: str
+    cosine: float
+
+
+class DialCosine(BaseModel):
+    """Percentiles of the same cosine over the whole index — the rings. Measured per
+    call because "far" is a property of this corpus, not a constant."""
+    median: float
+    p90: float
+    p99: float
+    max: float
+
+
+class DialResponse(BaseModel):
+    """§5.2 with no ranking and no LLM: an arbitrary phrase against every leaf."""
+    query: str
+    total: int = Field(..., description="Точек = строк в индексе; расхождение с /healthz видно сразу.")
+    points: list[DialPoint]
+    hits: list[DialHit] = Field(..., description="То же, что вернул бы GET /search, плюс текст листа: правда, с которой картинка обязана сходиться.")
+    cosine: DialCosine
+    angle_variance: float = Field(
+        ..., description="Доля дисперсии остатка в плоскости угла. На этом озере ~0.1: "
+                         "угол почти ничего не несёт, и страница обязана это сказать.")
+
+
 class ReindexResult(BaseModel):
     """§6.19 reconciliation: `index.reset()` + `index_rows(all_theses())`."""
     indexed_before: int

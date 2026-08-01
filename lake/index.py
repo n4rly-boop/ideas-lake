@@ -236,6 +236,81 @@ def search_theses(query: str, k: int, query_vec=None, db=INDEX_DB) -> list[dict]
         return out
 
 
+def _pin_signs(comps: np.ndarray) -> np.ndarray:
+    """Each row flipped so its largest-magnitude coordinate is positive.
+
+    LAPACK is free to return either sign of a singular vector, and a flipped one mirrors
+    the whole dial between two runs of the same query — which reads as the lake having
+    moved. Testable on its own: `_pin_signs(-c)` must equal `_pin_signs(c)`.
+    """
+    out = np.array(comps, dtype=np.float32, copy=True)
+    for row in out:
+        if row[np.argmax(np.abs(row))] < 0:
+            row *= -1
+    return out
+
+
+def dial(query: str, k: int, query_vec=None, db=INDEX_DB) -> dict:
+    """Every indexed thesis placed around the query: radius is the real cosine, the
+    angle is decoration (§5.2 numbers, no ranking, no LLM, no log line).
+
+    A 2-D projection of 384-d embeddings is not honest about distance: PCA on this
+    corpus explains 8.8 % of the variance, and only 0-1 of the true top-10 land among
+    the 10 nearest on such a plot. So distance from the centre here is NOT a
+    projection — it is `cosine` itself, the same number `/retrieve` reports; only the
+    direction is projected, from the residual `v - (v·q)q`, and the caller is told how
+    much of the residual that plane actually carries (`angle_variance`).
+
+    `cosine` percentiles travel with the points because the ring they draw is the
+    only honest reference: "0.5 is far" is a property of THIS corpus and this query,
+    not a constant worth hardcoding into a page.
+    """
+    if query_vec is None:
+        from .embed import embed_query
+        query_vec = embed_query(query)
+    qv = np.asarray(query_vec, dtype=np.float32)
+    with _LOCK:
+        con = _con(db)
+        _assert_fts_consistent(con)
+        rowids, mat = _matrix(db, con)
+        if len(mat) == 0:
+            # An empty index is a broken index, not "nothing is close": a dial with no
+            # points reads as a lake with no ideas near the hypothesis (§0.1.11).
+            raise sqlite3.DatabaseError(
+                "index is empty: nothing to place around the query; POST /admin/reindex")
+        cos = mat @ qv
+        residual = mat - np.outer(cos, qv)
+        residual -= residual.mean(axis=0)
+        _, sing, comps = np.linalg.svd(residual, full_matrices=False)
+        plane = residual @ _pin_signs(comps[:2]).T
+        angle = np.arctan2(plane[:, 1], plane[:, 0])
+        energy = float((sing ** 2).sum())
+        named = {rid: (thesis_id, idea_id) for rid, thesis_id, idea_id in con.execute(
+            "SELECT rowid, thesis_id, idea_id FROM idx_thesis")}
+        points = [{"thesis_id": named[rid][0], "idea_id": named[rid][1],
+                   "cosine": round(float(cos[i]), 4), "angle": round(float(angle[i]), 4)}
+                  for i, rid in enumerate(rowids)]
+        hits = search_theses(query, k, query_vec=qv, db=db)
+        # Leaf text travels with the hit: it is already in this table, and without it the
+        # view would need the graph to say a single word about what it found — a dial that
+        # goes blank whenever Neo4j is down, for data it is holding in its hand.
+        texts = dict(con.execute("SELECT thesis_id, text FROM idx_thesis").fetchall())
+        by_id = {p["thesis_id"]: p for p in points}
+        for hit in hits:
+            hit["text"] = texts.get(hit["thesis_id"], "")
+            hit["cosine"] = by_id[hit["thesis_id"]]["cosine"]
+    return {
+        "points": points,
+        "hits": hits,
+        "cosine": {"median": round(float(np.median(cos)), 4),
+                   "p90": round(float(np.quantile(cos, 0.90)), 4),
+                   "p99": round(float(np.quantile(cos, 0.99)), 4),
+                   "max": round(float(cos.max()), 4)},
+        "angle_variance": round(float((sing[:2] ** 2).sum() / energy), 4) if energy else 0.0,
+        "total": len(points),
+    }
+
+
 def stale_links(rows: list[dict], db=INDEX_DB) -> list[str]:
     """Thesis ids this index maps to a different idea than `rows` does.
 
@@ -412,6 +487,13 @@ def demo() -> None:
 
         assert search_theses("anything", 5, query_vec=query_vec, db=db) == [], \
             "empty index must return [], not raise"
+        # `dial` is the opposite case on purpose: `[]` from search is "no match", but a
+        # dial with no points would read as "the lake holds nothing near this idea".
+        try:
+            dial("anything", 5, query_vec=query_vec, db=db)
+            raise AssertionError("empty index must raise from dial, not draw an empty lake")
+        except sqlite3.DatabaseError:
+            pass
 
         index_theses(theses, db=db)
         index_theses(theses, db=db)  # §4.8: replaying the same batch is a no-op
@@ -438,6 +520,35 @@ def demo() -> None:
         punct = search_theses("::: --- ???", 5, query_vec=query_vec, db=db)
         assert punct and all(h["bm25_rank"] is None for h in punct), \
             "punctuation-only: cosine answers alone, no BM25 ranks"
+
+        # --- dial: the demo view. Radius is the cosine itself, so the only way it can
+        # lie is by losing points, disagreeing with `search_theses`, or turning between
+        # two identical calls. All three are asserted here.
+        placed = dial("quick brown", 3, query_vec=query_vec, db=db)
+        assert placed["total"] == len(placed["points"]) == 5, placed["total"]
+        expected = {t.id: float(np.dot(np.asarray(t.vector, dtype=np.float32), query_vec))
+                    for t in theses}
+        for point in placed["points"]:
+            assert abs(point["cosine"] - expected[point["thesis_id"]]) < 1e-3, point
+            assert point["idea_id"] == by_id[point["thesis_id"]], point
+        assert placed["cosine"]["max"] == max(p["cosine"] for p in placed["points"])
+        assert placed["cosine"]["median"] <= placed["cosine"]["p90"] <= placed["cosine"]["p99"]
+        # The list under the dial IS `GET /search`; a view that ranked differently from
+        # the read path would be a second retrieval nobody measures.
+        assert [h["thesis_id"] for h in placed["hits"]] == \
+            [h["thesis_id"] for h in search_theses("quick brown", 3, query_vec=query_vec, db=db)]
+        placed_by_id = {p["thesis_id"]: p for p in placed["points"]}
+        for hit in placed["hits"]:
+            assert hit["text"] == texts[[t.id for t in theses].index(hit["thesis_id"])], hit
+            assert hit["cosine"] == placed_by_id[hit["thesis_id"]]["cosine"], hit
+        # Same query twice must draw the same picture, and the sign convention is what
+        # makes that true across machines — LAPACK may hand back either sign.
+        again = dial("quick brown", 3, query_vec=query_vec, db=db)
+        assert [p["angle"] for p in again["points"]] == [p["angle"] for p in placed["points"]]
+        comps = rng.standard_normal((2, EMBED_DIM)).astype(np.float32)
+        assert np.array_equal(_pin_signs(comps), _pin_signs(-comps)), \
+            "a flipped singular vector must not mirror the dial"
+        assert 0.0 <= placed["angle_variance"] <= 1.0 + 1e-9, placed["angle_variance"]
 
         # rebuild_from: staging replay, §4.7 line shape.
         staging = Path(tmp) / "staging.jsonl"

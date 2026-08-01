@@ -111,8 +111,12 @@ def main() -> int:
         saved[(module, name)] = getattr(module, name)
         setattr(module, name, value)
 
-    for name in ("count", "fts_count", "search_theses", "index_theses", "index_rows", "has",
-                 "reset", "reconcile"):
+    # `dial` belongs on this list for the same reason as the rest: unbound, `GET /dial`
+    # in this check answered out of the REAL `data/index.db` — 3 040 live leaves under a
+    # fixture query — and the only reason it showed up was an assert that compared the
+    # two counts.
+    for name in ("count", "fts_count", "search_theses", "dial", "index_theses", "index_rows",
+                 "has", "reset", "reconcile"):
         bind(index, name, functools.partial(getattr(index, name), db=idx))
     # `search.search` takes db=INDEX_DB as a DEFAULT ARGUMENT, bound at def time, and
     # `rank` imported the function by name. So patching `index` alone leaves the read
@@ -526,6 +530,23 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
             "k is a ceiling, not a suggestion"
         assert client.get("/search", params={"q": "encoder", "k": 0}).status_code == 400
         assert client.get("/search", params={"q": ""}).status_code == 400
+        # --- /dial: the same numbers as /search, and nothing written ------
+        # The claim this route is sold on — a visitor's phrase costs nothing and pollutes
+        # nothing — is exactly the kind that is true until someone adds a log line.
+        log_before = (retrieve_api.RETRIEVE_LOG.read_text(encoding="utf-8")
+                      if retrieve_api.RETRIEVE_LOG.exists() else "")
+        placed = client.get("/dial", params={"q": "freeze the encoder", "k": 3})
+        assert placed.status_code == 200, placed.text
+        body = placed.json()
+        assert body["total"] == len(body["points"]) == index.count(), body["total"]
+        assert [h["thesis_id"] for h in body["hits"]] == [h["thesis_id"] for h in hits], body
+        assert all(h["text"] for h in body["hits"]), "a hit with no text needs the graph to read"
+        assert client.get("/dial", params={"q": ""}).status_code == 400
+        assert client.get("/dial", params={"q": "x", "k": 0}).status_code == 400
+        assert (retrieve_api.RETRIEVE_LOG.read_text(encoding="utf-8")
+                if retrieve_api.RETRIEVE_LOG.exists() else "") == log_before, \
+            "/dial wrote into the A/B measurement log"
+
         answer = client.post("/retrieve", json={"query": "freeze the encoder", "k": 2,
                                                 "rewrite": False})
         assert answer.status_code == 200, answer.text

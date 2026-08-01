@@ -158,6 +158,12 @@ svg.graph .edge{stroke:var(--ink-2)}
 svg.graph .node{stroke:var(--surface);stroke-width:1;cursor:pointer}
 svg.graph .node.sel{stroke:var(--s2);stroke-width:2.5}
 svg.graph text.nl{fill:var(--ink);font-size:10.5px;pointer-events:none}
+/* Halo, not just colour: these captions sit on top of three thousand dots, and stroke
+   under fill is the only thing that keeps them readable there. */
+svg.graph text.ringlab,svg.graph text.hitlab{pointer-events:none;paint-order:stroke;
+  stroke:var(--surface-2);stroke-width:3.5px;stroke-linejoin:round}
+svg.graph text.ringlab{fill:var(--ink-2);font-size:10px;font-variant-numeric:tabular-nums}
+svg.graph text.hitlab{fill:var(--ink);font-size:11.5px}
 .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--ink-2);
   align-items:center}
 .sw{width:11px;height:11px;border-radius:3px;background:var(--muted);display:inline-block}
@@ -556,6 +562,227 @@ view("retrieve", "Retrieve", (host) => {
         el("button", { class: "ghost", onclick: () => fire(true) }, "Оба плеча рядом")),
       statusHost),
     out);
+  q.focus();
+});
+
+/* --------------------------------------------------------------- 1b. циферблат */
+
+/* Blue sequential ramp, dark end = closer. Same steps as the trust ramp above, used
+   for a different job: here it doubles the radius, so a point that looks close is
+   also coloured close and the two encodings cannot disagree. */
+const DIAL_RAMP = ["#cde2fb", "#b7d3f6", "#86b6ef", "#6da7ec", "#5598e7",
+                   "#3987e5", "#2a78d6", "#256abf", "#1c5cab"];
+
+view("dial", "Гипотеза", (host) => {
+  const statusHost = el("div"), wrap = el("div", { class: "graphwrap" });
+  const legendHost = el("div"), listHost = el("div"), ideasHost = el("div");
+  const q = el("textarea", { class: "grow", rows: 2, placeholder:
+    "гипотеза словами: «шедулить мутации по тому, как часто потомок бьёт родителя»",
+    style: "width:100%;background:var(--surface-2);border:1px solid var(--hair);"
+         + "border-radius:8px;padding:10px;color:var(--ink);font:inherit;resize:vertical" });
+  const k = el("input", { type: "number", min: 1, max: 50, value: 12 });
+  let generation = 0;
+
+  async function fire() {
+    const text = q.value.trim();
+    if (!text) { setStatus(statusHost, "warn", null, "пустой q → 400"); return; }
+    const mine = ++generation;
+    const stale = () => mine !== generation;
+    const data = await run(statusHost, "считаю косинус до каждого листа…", () =>
+      api(`/dial?q=${encodeURIComponent(text)}&k=${Number(k.value) || 12}`));
+    if (stale() || !data) return;
+
+    // `total` is the server's count of index rows, not points.length: the two differing
+    // would mean the payload lost rows on the way, and that must not read as a thinner lake.
+    const lost = data.total !== data.points.length;
+    setStatus(statusHost, lost ? "warn" : "ok", 200,
+      lost ? `сервер насчитал ${fmt(data.total)} листьев, доехало ${fmt(data.points.length)} — `
+             + "картинка неполная, числам ниже верить нельзя"
+           : `${fmt(data.total)} листьев расставлены: ближайший ${data.cosine.max.toFixed(3)}, `
+             + `медиана озера ${data.cosine.median.toFixed(3)}`);
+
+    try {
+      drawDial(data);
+    } catch (err) {
+      // A throw here used to mean an empty box under a green 200 — same lie as an empty
+      // list for a broken store.
+      wrap.replaceChildren();
+      setStatus(statusHost, "err", null, "отрисовка упала: " + err.message);
+      return;
+    }
+    renderHits(data);
+    loadIdeas(data, stale);
+  }
+
+  function drawDial(data) {
+    const w = wrap.clientWidth || 1100, h = Math.min(680, Math.round(window.innerHeight * 0.72));
+    const cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 42, R0 = R * 0.13;
+    const cos = data.points.map((p) => p.cosine);
+    const hi = Math.max(...cos), lo = Math.min(...cos);
+    const span = Math.max(hi - lo, 1e-6);
+    // Radius IS the cosine, linearly — the axis is only zoomed to [lo, hi] and says so.
+    // Nothing here is a projection of distance: 2 components of these embeddings carry
+    // ~10 % of the variance, which is why the angle is labelled decoration.
+    const radius = (c) => R0 + (hi - c) / span * (R - R0);
+    const shade = (c) => DIAL_RAMP[Math.max(0, Math.min(8,
+      Math.round((c - lo) / span * 8)))];
+
+    const mk = (tag, attrs = {}) => {
+      const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+      for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+      return node;
+    };
+    const tip = (parent, txt) => { const t = mk("title"); t.textContent = txt; parent.append(t); };
+    const svg = mk("svg", { class: "graph", viewBox: `0 0 ${w} ${h}` });
+    const gRings = mk("g"), gPts = mk("g"), gHits = mk("g"), gLab = mk("g");
+
+    const share = (c) => data.points.filter((p) => p.cosine >= c).length;
+    // On the ring goes the number and nothing else — the sentence explaining it lands in
+    // the HTML legend below, where it cannot collide with a hit label or with the cloud.
+    const rings = [[data.cosine.median, "медиана"], [data.cosine.p90, "p90"],
+                   [data.cosine.p99, "p99"]];
+    const ringLabel = (r, text) => {
+      const tag = mk("text", { x: cx + 7, y: cy + r - 5, class: "ringlab" });
+      tag.textContent = text;
+      gRings.append(tag);
+    };
+    for (const [value] of rings) {
+      const r = radius(value);
+      gRings.append(mk("circle", { cx, cy, r, fill: "none", stroke: "var(--grid)",
+                                   "stroke-dasharray": "3 5" }));
+      ringLabel(r, value.toFixed(3));
+    }
+    gRings.append(mk("circle", { cx, cy, r: R, fill: "none", stroke: "var(--axis)" }));
+    ringLabel(R, lo.toFixed(3));
+    legendHost.replaceChildren(el("div", { class: "legend wrap" },
+      el("span", { class: "dim" }, "кольца:"),
+      ...rings.reverse().map(([value, label]) => el("span", {},
+        `${label} ${value.toFixed(3)} — ближе ${fmt(share(value))} из ${fmt(data.total)}`)),
+      el("span", {}, `дальний край ${lo.toFixed(3)}`),
+      el("span", { class: "dim" }, "· радиус = косинус, цвет = он же, угол ничего не значит")));
+
+    const placed = [];      // y positions already taken by a hit label
+    const hitIds = new Set(data.hits.map((hit) => hit.thesis_id));
+    for (const p of data.points) {
+      if (hitIds.has(p.thesis_id)) continue;
+      const r = radius(p.cosine);
+      const dot = mk("circle", { cx: cx + Math.cos(p.angle) * r, cy: cy + Math.sin(p.angle) * r,
+                                 r: 1.9, fill: shade(p.cosine), "fill-opacity": .72 });
+      tip(dot, `${p.thesis_id}\ncos ${p.cosine.toFixed(3)}`);
+      gPts.append(dot);
+    }
+    // The hits are drawn last and joined to the centre: on a plot where the angle means
+    // nothing, the line is what carries "this one is actually near", not the position.
+    data.hits.forEach((hit, i) => {
+      const p = data.points.find((pt) => pt.thesis_id === hit.thesis_id);
+      if (!p) return;
+      const r = radius(p.cosine), x = cx + Math.cos(p.angle) * r, y = cy + Math.sin(p.angle) * r;
+      gHits.append(mk("line", { x1: cx, y1: cy, x2: x, y2: y, stroke: "var(--s2)",
+                                "stroke-width": 1, "stroke-opacity": .45 }));
+      const dot = mk("circle", { cx: x, cy: y, r: 4.5, fill: "var(--s2)",
+                                 stroke: "var(--surface)", "stroke-width": 2 });
+      tip(dot, `#${i + 1} ${hit.thesis_id}\ncos ${hit.cosine.toFixed(3)}\n${hit.text}`);
+      gHits.append(dot);
+      if (i < 5) {
+        // Right of the dot unless the text would run off the frame; then left. Width is
+        // estimated, not measured — an SVG text node has no box until it is in the DOM,
+        // and one reflow per label to place five of them is not worth it.
+        const text = `${i + 1}. ${cut(hit.text, 46)}`;
+        const width = text.length * 5.9;
+        const toRight = Math.cos(p.angle) >= 0 ? x + 10 + width < w - 8 : x - 10 - width < 8;
+        // Labels that land on the same row overwrite each other; push each one clear of
+        // the rows already taken instead of stacking five lines into one.
+        let ly = y + 4;
+        while (placed.some((taken) => Math.abs(taken - ly) < 14)) ly += 14;
+        placed.push(ly);
+        const label = mk("text", { x: x + (toRight ? 10 : -10), y: ly,
+          class: "hitlab", "text-anchor": toRight ? "start" : "end" });
+        label.textContent = text;
+        gLab.append(label);
+        if (Math.abs(ly - y - 4) > 2) {
+          gLab.append(mk("line", { x1: x, y1: y, x2: x + (toRight ? 8 : -8), y2: ly - 4,
+                                   stroke: "var(--s2)", "stroke-opacity": .35 }));
+        }
+      }
+    });
+
+    // The centre is the hypothesis at cosine 1.0, and the axis does NOT run there: the
+    // nearest leaf is 0.6-something. The gap is drawn as a break, not as empty space,
+    // because a filled disc would read as "nothing in the lake got close" — which is a
+    // different claim from "the scale starts here".
+    gLab.append(mk("circle", { cx, cy, r: R0, fill: "none", stroke: "var(--hair)",
+                               "stroke-dasharray": "2 4" }));
+    const centre = mk("circle", { cx, cy, r: 5, fill: "var(--s2)" });
+    tip(centre, "гипотеза, cos = 1.000 к самой себе");
+    gLab.append(centre);
+    const note = mk("text", { x: cx, y: cy - R0 - 10, class: "hitlab", "text-anchor": "middle" });
+    note.textContent = `гипотеза · разрыв шкалы: 1.000 → ${hi.toFixed(3)}`;
+    gLab.append(note);
+
+    svg.append(gRings, gPts, gHits, gLab);
+    wrap.replaceChildren(svg);
+  }
+
+  function renderHits(data) {
+    listHost.replaceChildren(
+      el("p", { class: "help" }, `Угол — первые две компоненты PCA остатка, и они несут `
+        + `${(data.angle_variance * 100).toFixed(1)} % его дисперсии: это украшение, `
+        + `расстояния в нём нет. Правда — радиус и таблица: косинус, тот же, что печатает `
+        + `/retrieve. Список — то же, что вернул бы GET /search.`),
+      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["#", "cos", "тезис", "идея", "RRF", "BM25", "vector"]
+          .map((head) => el("th", {}, head)))),
+        el("tbody", {}, ...data.hits.map((hit, i) => el("tr", {},
+          el("td", { class: "num" }, i + 1),
+          el("td", { class: "num mono " + cosClass(hit.cosine) }, hit.cosine.toFixed(3)),
+          el("td", {}, cut(hit.text, 110)),
+          el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
+            e.preventDefault(); openIdea(hit.idea_id); } }, hit.idea_id)),
+          el("td", { class: "num mono" }, hit.score.toFixed(5)),
+          el("td", { class: "num mono" }, hit.bm25_rank ?? "—"),
+          el("td", { class: "num mono" }, hit.vec_rank ?? "—")))))));
+  }
+
+  /* The dial itself never touches the graph. The idea cards do — so a dead graph costs
+     the cards and says so, instead of taking the whole answer down with it. */
+  async function loadIdeas(data, stale) {
+    const ids = [];
+    for (const hit of data.hits) if (!ids.includes(hit.idea_id)) ids.push(hit.idea_id);
+    ideasHost.replaceChildren(el("p", { class: "help" }, `Идеи-родители найденных листьев: `
+      + `${ids.length} на ${data.hits.length} попаданий. Поиск идёт по тезисам, поэтому это `
+      + `идея ближайшего листа, а не ближайшая по своему тексту идея.`));
+    let failure = null;
+    const bodies = await pool(ids, (id) => api(`/ideas/${encodeURIComponent(id)}`)
+      .catch((err) => { failure = failure || err; return null; }));
+    if (stale()) return;
+    const found = new Map(bodies.filter(([, body]) => body));
+    if (failure) {
+      ideasHost.append(el("div", { class: "status " + (failure.status === 503 ? "err" : "warn") },
+        el("span", { class: "code" }, failure.status || "—"),
+        `${explain(failure)} — карточки идей не прочитаны (${found.size} из ${ids.length}). `
+        + "Циферблат выше считается из индекса и от графа не зависит."));
+    }
+    for (const id of ids) {
+      const body = found.get(id);
+      // No `via`, no `score`: this view did not rank anything, and printing a rank it
+      // never computed would be a number with nothing behind it.
+      if (body) ideasHost.append(ideaCard({ ...body, idea_id: body.id,
+        theses: body.theses || [] }, ids.indexOf(id) + 1));
+    }
+  }
+
+  host.replaceChildren(
+    el("div", { class: "panel" },
+      el("h2", {}, "GET /dial — гипотеза против всего озера"),
+      el("p", { class: "help" }, "Фраза с трибуны сравнивается с каждым листом индекса. Ни rewrite, "
+        + "ни 9B, ни записи: в графе от этого ничего не появляется и в retrieve.jsonl "
+        + "(лог замера A/B) строки не остаётся."),
+      el("div", { class: "row" }, el("label", { class: "f grow" }, "гипотеза", q),
+        el("label", { class: "f" }, "k", k),
+        el("button", { class: "act", onclick: fire }, "Разложить")),
+      statusHost),
+    el("div", { class: "panel" }, wrap, legendHost, listHost),
+    el("div", { class: "panel" }, el("h2", {}, "Идеи рядом"), ideasHost));
   q.focus();
 });
 

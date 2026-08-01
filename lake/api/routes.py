@@ -36,7 +36,8 @@ from ..retrieve import api as retrieve_api
 from ..research import ResearchError, build_default_agent
 from . import jobs
 from ..models import FETCH_DIR
-from .schemas import (MAX_K, MAX_PAGE, EdgeOut, ErrorResponse, FetchRequest, Health, IdeaOut,
+from .schemas import (MAX_K, MAX_PAGE, MAX_QUERY_CHARS, DialResponse, EdgeOut, ErrorResponse,
+                      FetchRequest, Health, IdeaOut,
                       IdeaPatch, JobOut, Page, PendingLinkOut, Phase1Request, Phase2Request,
                       ReindexResult, ResearchRequest, ResearchResponse, RetrieveRequest,
                       RetrieveResponse, RunRequest, SearchHit, SourceIn,
@@ -212,6 +213,21 @@ def search_index(q: str = Query(..., min_length=1), k: int = Query(10, gt=0, le=
     the hybrid is running on cosine alone, which is the failure this view exists to
     make visible."""
     return index.search_theses(q, k)
+
+
+@search.get("/dial", response_model=DialResponse, responses=_GRAPH_ERRORS,
+            summary="Гипотеза против всего индекса: косинус радиусом, угол — проекция")
+def dial(q: str = Query(..., min_length=1, max_length=MAX_QUERY_CHARS),
+         k: int = Query(10, gt=0, le=MAX_K)):
+    """The demo view of §5.2: an arbitrary phrase placed against every leaf at once.
+
+    Reads the index and nothing else — no graph, no LLM, no `retrieve.jsonl` line.
+    Deliberately not `/retrieve`: that spends a 9B call and writes into the log the
+    A/B measurement is computed from, and a visitor typing a hypothesis is not a
+    measurement.
+    """
+    out = index.dial(q, k)
+    return {"query": q, **out}
 
 
 # ------------------------------------------------------------------------ retrieve
