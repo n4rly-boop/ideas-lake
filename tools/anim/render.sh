@@ -1,5 +1,8 @@
 #!/bin/sh
-# Рендер трёх сцен в out/: mp4 1080p60 для слайдов + gif 1000px 15fps.
+# Рендер сцен в out/: mp4 1080p60 для слайдов + gif 1000px 20fps.
+#
+# Без аргументов гонит все шесть. Можно назвать нужные:
+#   ./render.sh system_map:SystemMap
 #
 # Окружение (один раз, .venv под игнором):
 #   uv venv tools/anim/.venv --python 3.12
@@ -13,7 +16,11 @@ set -e
 cd "$(dirname "$0")"
 mkdir -p out
 
-for pair in write_path:WritePath read_path:ReadPath feedback_path:FeedbackPath; do
+all="write_path:WritePath read_path:ReadPath feedback_path:FeedbackPath
+     idea_synthesis:IdeaSynthesis agent_lake:AgentLake system_map:SystemMap"
+[ $# -gt 0 ] && all="$*"
+
+for pair in $all; do
     file=${pair%%:*}
     scene=${pair##*:}
     .venv/bin/manim -qh --disable_caching "$file.py" "$scene"

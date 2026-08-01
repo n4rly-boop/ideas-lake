@@ -56,11 +56,13 @@ def label(text, size=20, color=INK, weight=NORMAL):
 
 
 def thesis(size=0.78, color=THESIS):
+    # Скругление от размера: фиксированные 0.07 на стороне 0.17 съедают
+    # угол целиком, и тезис в идее читается кружком, а не квадратом.
     return (
         Square(side_length=size)
         .set_fill(BG, opacity=1)
         .set_stroke(color, width=STROKE)
-        .round_corners(0.07)
+        .round_corners(min(0.07, size * 0.09))
     )
 
 
@@ -72,6 +74,108 @@ def runlog(size=0.62, color=LOG):
     t = Triangle().set_fill(BG, opacity=1).set_stroke(color, width=STROKE)
     t.set_height(size)
     return t
+
+
+def box(width=2.6, height=1.5, color=INK):
+    """Внешняя система или шаг-«чёрный ящик»."""
+    return (
+        RoundedRectangle(width=width, height=height, corner_radius=0.1)
+        .set_fill(BG, opacity=1)
+        .set_stroke(color, width=1.6)
+    )
+
+
+def rotor(radius=0.66, color=IDEA, spokes=6):
+    """Колесо со спицами: крутится — значит, идёт прогон."""
+    return VGroup(
+        Circle(radius=radius).set_fill(opacity=0).set_stroke(color, width=2.2),
+        *[
+            Line(ORIGIN, RIGHT * radius)
+            .rotate(i * TAU / spokes, about_point=ORIGIN)
+            .set_stroke(color, width=2)
+            for i in range(spokes)
+        ],
+    )
+
+
+def globe(radius=0.55, color=INK):
+    """Веб: круг с меридианом и параллелями."""
+    return VGroup(
+        Circle(radius=radius).set_fill(BG, opacity=1).set_stroke(color, width=1.8),
+        Ellipse(width=radius, height=radius * 2)
+        .set_fill(opacity=0)
+        .set_stroke(color, width=1.4),
+        *[
+            Line(LEFT * w, RIGHT * w).shift(UP * dy).set_stroke(color, width=1.4)
+            for w, dy in (
+                (radius, 0.0),
+                (radius * 0.76, radius * 0.55),
+                (radius * 0.76, -radius * 0.55),
+            )
+        ],
+    ).move_to(ORIGIN)
+
+
+def robot(size=1.4, color=INK):
+    """Агент.
+
+    Робота в наборе иконок AIRI нет (шаблон, стр. 47–48), поэтому он собран
+    из тех же примитивов, что и человечки оттуда: один вес контура,
+    скруглённые углы, точки-акценты, без заливки внутри.
+    """
+    head = RoundedRectangle(width=0.62, height=0.5, corner_radius=0.12)
+    body = RoundedRectangle(width=0.8, height=0.62, corner_radius=0.12).next_to(
+        head, DOWN, buff=0.12
+    )
+    frame = VGroup(
+        head,
+        body,
+        Line(head.get_bottom(), body.get_top()),  # шея
+        Line(head.get_top(), head.get_top() + UP * 0.18),  # антенна
+        Line(body.get_left(), body.get_left() + LEFT * 0.24),
+        Line(body.get_right(), body.get_right() + RIGHT * 0.24),
+        *[
+            Line(
+                body.get_bottom() + RIGHT * s * 0.19,
+                body.get_bottom() + RIGHT * s * 0.19 + DOWN * 0.24,
+            )
+            for s in (1, -1)
+        ],
+    )
+    head.set_fill(BG, opacity=1)
+    body.set_fill(BG, opacity=1)
+    frame.set_stroke(color, width=2.2)
+    dots = VGroup(
+        *[
+            Dot(head.get_center() + RIGHT * s * 0.15, radius=0.05, color=color)
+            for s in (1, -1)
+        ],
+        Dot(head.get_top() + UP * 0.23, radius=0.055, color=color),
+    )
+    return VGroup(frame, dots).set_height(size)
+
+
+def check(size=0.55, color=IDEA):
+    """Вердикт арбитра: да."""
+    v = VMobject().set_points_as_corners(
+        [LEFT * 0.5 + UP * 0.1, DOWN * 0.45, RIGHT * 0.6 + UP * 0.6]
+    )
+    return v.set_stroke(color, width=6).set_fill(opacity=0).set_width(size)
+
+
+def cross(size=0.55, color=BAD):
+    """Вердикт арбитра: нет."""
+    return Cross(stroke_color=color, stroke_width=6).set_width(size)
+
+
+def span(a, b, gap=0.68):
+    """Ребро от края до края, а не от центра к центру.
+
+    Утолщённое ребро от центров наезжает на контур узла: белая заливка
+    круга его не прячет, порядок слоёв тут не спасает.
+    """
+    d = normalize(b.get_center() - a.get_center())
+    return Line(a.get_center() + d * gap, b.get_center() - d * gap)
 
 
 def dot_ring(center, radius, n=16, color=IDEA, dot_radius=0.045):
