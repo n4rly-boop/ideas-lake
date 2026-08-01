@@ -17,7 +17,8 @@ cd "$(dirname "$0")"
 mkdir -p out
 
 all="write_path:WritePath read_path:ReadPath feedback_path:FeedbackPath
-     idea_synthesis:IdeaSynthesis agent_lake:AgentLake system_map:SystemMap"
+     idea_synthesis:IdeaSynthesis agent_lake:AgentLake system_map:SystemMap
+     system_map_wide:SystemMapWide"
 [ $# -gt 0 ] && all="$*"
 
 for pair in $all; do
@@ -25,7 +26,12 @@ for pair in $all; do
     scene=${pair##*:}
     .venv/bin/manim -qh --disable_caching "$file.py" "$scene"
 
-    mp4=$(ls -t media/videos/"$file"/1080p60/*.mp4 | head -1)
+    # Не 1080p60: широкая полоса рисуется в своём разрешении, папка другая.
+    mp4=$(ls -t media/videos/"$file"/*/*.mp4 | head -1)
+
+    # Ширина гифки: полоса ужимается до 850, остальные до 1000.
+    gifw=1000
+    [ "$file" = system_map_wide ] && gifw=850
     cp "$mp4" "out/$file.mp4"
 
     # 20 fps. Задержка кадра в GIF хранится в сотых долях секунды и делится
@@ -38,10 +44,10 @@ for pair in $all; do
     # С stats_mode=diff кадры получаются частичными, и Keynote, PowerPoint и
     # Quick Look показывают такой GIF одной последней картинкой.
     ffmpeg -y -loglevel error -i "$mp4" \
-        -vf "fps=20,scale=1000:-1:flags=lanczos,palettegen=stats_mode=full" \
+        -vf "fps=20,scale=$gifw:-1:flags=lanczos,palettegen=stats_mode=full" \
         -frames:v 1 out/.palette.png
     ffmpeg -y -loglevel error -i "$mp4" -i out/.palette.png \
-        -lavfi "fps=20,scale=1000:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=none" \
+        -lavfi "fps=20,scale=$gifw:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=none" \
         -loop 0 "out/$file.gif"
     rm -f out/.palette.png
 done
