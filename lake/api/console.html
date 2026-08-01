@@ -166,6 +166,14 @@ svg.graph text.ringlab{fill:var(--ink-2);font-size:10px;font-variant-numeric:tab
 svg.graph text.hitlab{fill:var(--ink);font-size:11.5px}
 svg.graph circle.ideanode{cursor:pointer}
 svg.graph circle.ideanode:hover{stroke:var(--s2);stroke-width:2.5}
+svg.graph text.hitrank{fill:#fff;font-size:9.5px;font-weight:600;pointer-events:none}
+svg.graph circle.hoverring{pointer-events:none}
+.hovercard{position:absolute;z-index:5;max-width:340px;pointer-events:none;
+  background:var(--raised);border:1px solid var(--hair);border-radius:9px;padding:9px 11px;
+  box-shadow:0 8px 24px rgba(0,0,0,.45);font-size:12.5px;line-height:1.42}
+.hovercard .hc-head{color:var(--muted);font-size:11px;margin-bottom:4px;
+  font-variant-numeric:tabular-nums}
+.hovercard .hc-body{color:var(--ink);white-space:pre-wrap}
 .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--ink-2);
   align-items:center}
 .sw{width:11px;height:11px;border-radius:3px;background:var(--muted);display:inline-block}
@@ -581,6 +589,10 @@ const DIAL_RAMP = ["#cde2fb", "#b7d3f6", "#86b6ef", "#6da7ec", "#5598e7",
    Invalidated against `/stats`, so ingest running underneath shows up as a reload, not as
    a picture quietly drawn over yesterday's graph. */
 let GRAPH_CACHE = null;
+/* Leaf texts, filled one hover at a time (see the hover card in the dial view). A thesis
+   is immutable, so a text read once is a text that stays right. */
+const LEAF_TEXT = new Map();
+let leafTimer = null;
 
 async function loadGraph(force = false) {
   const fresh = GRAPH_CACHE && LAST_STATS
@@ -772,7 +784,12 @@ view("dial", "Гипотеза", (host) => {
           + "они, расстояния в нём нет"
         : "· угол ничего не значит")));
 
-    const placed = [];      // y positions already taken by a hit label
+    // Every mark also lands here, and the hover card is driven by a nearest-mark search
+    // rather than by :hover on the element: a leaf is 1.5 px across, and a target that
+    // small is one nobody can point at.
+    const marks = [];
+    const hoverable = (x, y, r, rank, head, body, leaf = null) =>
+      marks.push({ x, y, r, rank, head, body, leaf });
     let onIdeaCount = 0, offIdeaCount = 0;
     const hitIds = new Set(data.hits.map((hit) => hit.thesis_id));
     if (withLeaves.checked) {
@@ -782,10 +799,10 @@ view("dial", "Гипотеза", (host) => {
       for (const p of data.points) {
         if (hitIds.has(p.thesis_id)) continue;
         const r = radius(p.cosine);
-        const dot = mk("circle", { cx: cx + Math.cos(p.angle) * r, cy: cy + Math.sin(p.angle) * r,
-                                   r: leafR, fill: shade(p.cosine), "fill-opacity": leafAlpha });
-        tip(dot, `${p.thesis_id}\ncos ${p.cosine.toFixed(3)}`);
-        gPts.append(dot);
+        const x = cx + Math.cos(p.angle) * r, y = cy + Math.sin(p.angle) * r;
+        gPts.append(mk("circle", { cx: x, cy: y, r: leafR, fill: shade(p.cosine),
+                                   "fill-opacity": leafAlpha }));
+        hoverable(x, y, leafR, 0, `лист · cos ${p.cosine.toFixed(3)}`, p.thesis_id, p.thesis_id);
       }
     }
 
@@ -856,10 +873,11 @@ view("dial", "Гипотеза", (host) => {
         const dot = mk("circle", { cx: x, cy: y, r: 3.6 + 1.5 * Math.sqrt(leaves),
           fill: shade(node.cosine), stroke: parents.has(node.id) ? "var(--s2)" : "var(--surface)",
           "stroke-width": parents.has(node.id) ? 2 : 1, class: "ideanode" });
-        tip(dot, `${node.id}\ncos лучшего листа ${node.cosine.toFixed(3)}\nлистьев ${leaves}\n`
-                 + (node.body ? node.body.text : "(тело идеи не прочитано)"));
         dot.addEventListener("click", () => openIdea(node.id));
         gIdeas.append(dot);
+        hoverable(x, y, 3.6 + 1.5 * Math.sqrt(leaves), 1,
+          `идея · cos лучшего листа ${node.cosine.toFixed(3)} · листьев ${leaves} · клик — открыть`,
+          (node.body ? node.body.text : "(тело идеи не прочитано)") + `\n${node.id}`);
       }
     }
     // The hits are drawn last and joined to the centre: on a plot where the angle means
@@ -877,31 +895,21 @@ view("dial", "Гипотеза", (host) => {
       const y = onIdea ? onIdea[1] : cy + Math.sin(p.angle) * r;
       gHits.append(mk("line", { x1: cx, y1: cy, x2: x, y2: y, stroke: "var(--s2)",
                                 "stroke-width": 1, "stroke-opacity": .45 }));
-      const dot = mk("circle", { cx: x, cy: y, r: onIdea ? 3 : 4.5, fill: "var(--s2)",
+      const top5 = i < 5;
+      const dot = mk("circle", { cx: x, cy: y, r: top5 ? 6.5 : 4, fill: "var(--s2)",
                                  stroke: "var(--surface)", "stroke-width": 2 });
-      tip(dot, `#${i + 1} ${hit.thesis_id}\ncos ${hit.cosine.toFixed(3)}\n${hit.text}`
-               + (onIdea ? `\nпоказан на своей идее ${hit.idea_id}` : ""));
       gHits.append(dot);
-      if (i < 5) {
-        // Right of the dot unless the text would run off the frame; then left. Width is
-        // estimated, not measured — an SVG text node has no box until it is in the DOM,
-        // and one reflow per label to place five of them is not worth it.
-        const text = `${i + 1}. ${cut(hit.text, 46)}`;
-        const width = text.length * 5.9;
-        const toRight = Math.cos(p.angle) >= 0 ? x + 10 + width < w - 8 : x - 10 - width < 8;
-        // Labels that land on the same row overwrite each other; push each one clear of
-        // the rows already taken instead of stacking five lines into one.
-        let ly = y + 4;
-        while (placed.some((taken) => Math.abs(taken - ly) < 14)) ly += 14;
-        placed.push(ly);
-        const label = mk("text", { x: x + (toRight ? 10 : -10), y: ly,
-          class: "hitlab", "text-anchor": toRight ? "start" : "end" });
-        label.textContent = text;
-        gLab.append(label);
-        if (Math.abs(ly - y - 4) > 2) {
-          gLab.append(mk("line", { x1: x, y1: y, x2: x + (toRight ? 8 : -8), y2: ly - 4,
-                                   stroke: "var(--s2)", "stroke-opacity": .35 }));
-        }
+      hoverable(x, y, 8, 2, `#${i + 1} · cos ${hit.cosine.toFixed(3)} · `
+        + (onIdea ? `на своей идее ${hit.idea_id}` : `лист, идея вне показанных (${hit.idea_id})`),
+        hit.text);
+      // The rank rides in the mark, not beside it: five wrapped sentences on the plot
+      // covered the very cluster they described, and the text is one hover away. Only the
+      // first five are numbered — a two-digit badge does not fit the dot, and twelve of
+      // them is the clutter this change removed.
+      if (top5) {
+        const badge = mk("text", { x, y: y + 3.4, class: "hitrank", "text-anchor": "middle" });
+        badge.textContent = String(i + 1);
+        gLab.append(badge);
       }
     });
 
@@ -911,15 +919,77 @@ view("dial", "Гипотеза", (host) => {
     // different claim from "the scale starts here".
     gLab.append(mk("circle", { cx, cy, r: R0, fill: "none", stroke: "var(--hair)",
                                "stroke-dasharray": "2 4" }));
-    const centre = mk("circle", { cx, cy, r: 5, fill: "var(--s2)" });
-    tip(centre, "гипотеза, cos = 1.000 к самой себе");
-    gLab.append(centre);
+    gLab.append(mk("circle", { cx, cy, r: 5, fill: "var(--s2)" }));
+    hoverable(cx, cy, 6, 3, "гипотеза · cos 1.000 к самой себе", data.query || "");
     const note = mk("text", { x: cx, y: cy - R0 - 10, class: "hitlab", "text-anchor": "middle" });
     note.textContent = `гипотеза · разрыв шкалы: 1.000 → ${hi.toFixed(3)}`;
     gLab.append(note);
 
     svg.append(gRings, gPts, gEdges, gIdeas, gHits, gLab);
-    wrap.replaceChildren(svg);
+    const card = el("div", { class: "hovercard hide" });
+    const ring = mk("circle", { class: "hoverring hide", r: 11, fill: "none",
+                                stroke: "var(--s2)", "stroke-width": 1.5 });
+    gLab.append(ring);
+    // The svg is width:100% with a fixed viewBox, so client pixels are not viewBox units
+    // and the box is letterboxed on the axis that has slack. Both are undone here; using
+    // the raw offset put the card a couple of centimetres from the mark it described.
+    const toView = (event) => {
+      const box = svg.getBoundingClientRect();
+      const scale = Math.min(box.width / w, box.height / h);
+      return [(event.clientX - box.left - (box.width - w * scale) / 2) / scale,
+              (event.clientY - box.top - (box.height - h * scale) / 2) / scale, box, scale];
+    };
+    svg.addEventListener("mousemove", (event) => {
+      const [vx, vy, box, scale] = toView(event);
+      let best = null, bestScore = Infinity;
+      for (const m of marks) {
+        // Distance to the edge of the mark, minus a bump for the layers a pointer is
+        // more likely to be aiming at: a hit under a cloud of leaves must still win.
+        const score = Math.hypot(m.x - vx, m.y - vy) - m.r - m.rank * 3;
+        if (score < bestScore) { bestScore = score; best = m; }
+      }
+      if (!best || bestScore > 9) {
+        card.classList.add("hide");
+        ring.classList.add("hide");
+        return;
+      }
+      ring.setAttribute("cx", best.x);
+      ring.setAttribute("cy", best.y);
+      ring.setAttribute("r", best.r + 5);
+      ring.classList.remove("hide");
+      card.replaceChildren(el("div", { class: "hc-head" }, best.head),
+                           el("div", { class: "hc-body" }, LEAF_TEXT.get(best.leaf) || best.body));
+      card.classList.remove("hide");
+      // The leaf's own text is NOT in the dial's payload: 3 040 of them is half a megabyte
+      // per hypothesis, for a line only the hovered dot ever shows. It is fetched on hover
+      // instead, once per leaf, and a dead graph costs that one line and says so — the
+      // dial itself is still index-only.
+      if (best.leaf && !LEAF_TEXT.has(best.leaf)) {
+        const which = best.leaf;
+        clearTimeout(leafTimer);
+        leafTimer = setTimeout(async () => {
+          let text;
+          try { text = (await api(`/theses/${encodeURIComponent(which)}`)).text; }
+          catch (err) { text = `${which}\n(текст не прочитан: ${explain(err)})`; }
+          LEAF_TEXT.set(which, text);
+          const shown = card.querySelector(".hc-body");
+          if (shown && shown.textContent === which) shown.textContent = text;
+        }, 140);
+      }
+      // Placed relative to the wrapper and kept inside it: a card that runs off the panel
+      // is a card whose last words are the ones nobody reads.
+      const px = box.left + (box.width - w * scale) / 2 + best.x * scale;
+      const py = box.top + (box.height - h * scale) / 2 + best.y * scale;
+      const host = wrap.getBoundingClientRect();
+      const cw = card.offsetWidth || 320, ch = card.offsetHeight || 90;
+      card.style.left = `${Math.max(8, Math.min(host.width - cw - 8, px - host.left + 14))}px`;
+      card.style.top = `${Math.max(8, Math.min(host.height - ch - 8, py - host.top + 14))}px`;
+    });
+    svg.addEventListener("mouseleave", () => {
+      card.classList.add("hide");
+      ring.classList.add("hide");
+    });
+    wrap.replaceChildren(svg, card);
     return { ideas: shownIdeas, inside, outside, onIdea: onIdeaCount, offIdea: offIdeaCount };
   }
 
