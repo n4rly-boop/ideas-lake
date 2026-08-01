@@ -19,6 +19,9 @@ from ..research.models import ResearchRequest, ResearchResponse
 MAX_QUERY_CHARS = 4000      # a query is a sentence; anything larger is not a query
 MAX_K = 50                  # k is a page size, not a dump switch
 MAX_PAGE = 200              # ceiling on limit= for every listing
+# Edges only. A row here is five scalars; an idea page carries whole bodies, and the
+# ceiling that is right for those turns one drawing of the lake into 74 round trips.
+MAX_EDGE_PAGE = 5000
 
 T = TypeVar("T")
 

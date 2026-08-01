@@ -184,6 +184,19 @@ def neighbors(ids: list[str], hops: int = 1, min_weight: float | None = None) ->
     return _backend.neighbors(ids, hops, min_weight)
 
 
+@trace(component="graph", op="count_edges")
+def count_edges(min_weight: float | None = None) -> int:
+    """Edges matching the same filter as `all_edges` — the `total` of that page."""
+    return _backend.count_edges(min_weight)
+
+
+@trace(component="graph", op="all_edges")
+def all_edges(limit: int = 200, offset: int = 0, min_weight: float | None = None) -> list[dict]:
+    """Idea-Idea edges in bulk, paged. `neighbors` answers "around these ids"; this one
+    answers "all of them", which is what drawing the lake needs (D12 edges, `GET /edges`)."""
+    return _backend.all_edges(limit, offset, min_weight)
+
+
 @trace(component="graph", op="write_cocitation_edges")
 def write_cocitation_edges(source_id: str, min_ideas: int = 2,
                           dry_run: bool = False) -> list[dict]:

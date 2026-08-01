@@ -444,8 +444,52 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
         assert isinstance(edges[0]["evidence"], list) and edges[0]["evidence"] == \
             [made["source_id"]], edges
         assert client.get("/stats").json()["edges"] == 2, "one pair, both directions"
+
+        # `GET /edges` is the bulk read the drawing needs; the thing worth checking is
+        # that it and `/neighbors` are two views of one graph, not two answers.
+        bulk = client.get("/edges", params={"limit": 100})
+        assert bulk.status_code == 200, bulk.text
+        page = bulk.json()
+        assert page["total"] == client.get("/stats").json()["edges"] == 2, page
+        assert len(page["items"]) == 2, page
+        assert {(e["source_id"], e["target_id"]) for e in page["items"]} \
+               == {(idea_a, idea_b), (idea_b, idea_a)}, page
+        assert all(isinstance(e["evidence"], list) and e["hop"] == 1 for e in page["items"]), page
+        mine = [e for e in page["items"] if e["source_id"] == idea_a]
+        assert mine == client.get(f"/ideas/{idea_a}/neighbors").json(), \
+            "/edges and /neighbors disagree about the same edge"
+        # A page total taken from the page would agree with itself and with nothing else.
+        cut = client.get("/edges", params={"limit": 1}).json()
+        assert cut["total"] == 2 and len(cut["items"]) == 1, cut
+        assert client.get("/edges", params={"limit": 1, "offset": 1}).json()["items"] \
+               != cut["items"], "offset moves nothing: every page is page one"
+        assert client.get("/edges", params={"min_weight": 99}).json() \
+               == {"total": 0, "limit": 2000, "offset": 0, "items": []}, "min_weight ignored"
+        assert client.get("/edges", params={"limit": 100000}).status_code == 400
+        assert client.get("/edges", params={"limit": 0}).status_code == 400
+        # A pre-D12 edge nobody has re-touched still carries `evidence` as a bare string,
+        # and that is what used to 500 `/neighbors` on response validation. The fixture
+        # writes only new-shaped rows, so the legacy shape is put here on purpose —
+        # without it both normalizations are untested code that looks tested.
+        with neo4j_store._session(write=True) as legacy:
+            legacy.run("MATCH (a:Idea {id: $a}), (b:Idea {id: $b}) "
+                       "MERGE (a)-[r:RELATED {type: 'legacy_shape'}]->(b) "
+                       "SET r.evidence = 'one-source-string', r.weight = 1.0",
+                       a=idea_b, b=idea_a)
+        try:
+            legacy_rows = [e for e in client.get("/edges", params={"limit": 100}).json()["items"]
+                           if e["type"] == "legacy_shape"]
+            assert len(legacy_rows) == 1, legacy_rows
+            assert legacy_rows[0]["evidence"] == ["one-source-string"], legacy_rows
+            assert [e for e in client.get(f"/ideas/{idea_b}/neighbors").json()
+                    if e["type"] == "legacy_shape"] == legacy_rows, \
+                "the two reads normalize a legacy row differently"
+        finally:
+            with neo4j_store._session(write=True) as legacy:
+                legacy.run("MATCH ()-[r:RELATED {type: 'legacy_shape'}]->() DELETE r")
         print("ok: GET /ideas/{id}/neighbors serializes a real co-citation edge instead "
-              "of 500ing on response validation (D12 review, 2026-07-31)")
+              "of 500ing on response validation (D12 review, 2026-07-31), and GET /edges "
+              "answers the same edges in bulk with a total that is its own COUNT")
 
         # --- patch --------------------------------------------------------
         patched = client.patch(f"/ideas/{idea_b}", json={"text": "score cheaply, then pay"}).json()

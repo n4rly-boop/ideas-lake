@@ -603,6 +603,48 @@ def counts() -> dict:
         return session.execute_read(txn)
 
 
+def count_edges(min_weight: float | None = None) -> int:
+    """`(:Idea)-[:RELATED]->(:Idea)` rows, same filter as `all_edges`. Its own COUNT,
+    never `len(all_edges(...))`: a page total computed from the page is a number that
+    agrees with itself and with nothing else."""
+    where = " WHERE r.weight >= $min_weight" if min_weight is not None else ""
+    params = {} if min_weight is None else {"min_weight": min_weight}
+    with _session() as session:
+        return session.execute_read(lambda tx: tx.run(
+            "MATCH (:Idea)-[r:RELATED]->(:Idea)" + where + " RETURN count(r) AS c",
+            **params).single()["c"])
+
+
+def all_edges(limit: int = 200, offset: int = 0, min_weight: float | None = None) -> list[dict]:
+    """Every Idea-Idea edge, paged — the bulk read `neighbors` cannot be: drawing the
+    lake through it costs one request per idea (859 of them at the time of writing),
+    which over a tunnel is minutes and on stage is a demo that does not start.
+
+    Row shape is `neighbors`'s, `hop` included and always 1: these are the edges
+    themselves, not a traversal, and a null hop would make `EdgeOut` a different model
+    depending on which route filled it."""
+    where = " WHERE r.weight >= $min_weight" if min_weight is not None else ""
+    params = {"limit": limit, "offset": offset}
+    if min_weight is not None:
+        params["min_weight"] = min_weight
+    query = ("MATCH (a:Idea)-[r:RELATED]->(b:Idea)" + where +
+             " RETURN a.id AS source_id, b.id AS target_id, r.type AS type, r.note AS note,"
+             " r.weight AS weight, r.evidence AS evidence"
+             " ORDER BY a.id, b.id SKIP $offset LIMIT $limit")
+    with _session() as session:
+        rows = session.execute_read(lambda tx: list(tx.run(query, **params)))
+    out = []
+    for row in rows:
+        edge = dict(row)
+        # Same pre-D12 legacy shape `neighbors` normalizes: a bare string `evidence`
+        # fails `EdgeOut` validation and 500s the route.
+        ev = edge.get("evidence")
+        edge["evidence"] = None if ev is None else (ev if isinstance(ev, list) else [ev])
+        edge["hop"] = 1
+        out.append(edge)
+    return out
+
+
 def all_theses() -> list[dict]:
     """Every leaf + vector — the index reconciliation source (§6.19), same JOIN as
     every other "leaf" query here. A row missing `text`/`vector` (a Neo4j node with

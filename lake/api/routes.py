@@ -36,7 +36,8 @@ from ..retrieve import api as retrieve_api
 from ..research import ResearchError, build_default_agent
 from . import jobs
 from ..models import FETCH_DIR
-from .schemas import (MAX_K, MAX_PAGE, MAX_QUERY_CHARS, DialResponse, EdgeOut, ErrorResponse,
+from .schemas import (MAX_EDGE_PAGE, MAX_K, MAX_PAGE, MAX_QUERY_CHARS, DialResponse, EdgeOut,
+                      ErrorResponse,
                       FetchRequest, Health, IdeaOut,
                       IdeaPatch, JobOut, Page, PendingLinkOut, Phase1Request, Phase2Request,
                       ReindexResult, ResearchRequest, ResearchResponse, RetrieveRequest,
@@ -182,6 +183,18 @@ def idea_neighbors(idea_id: str, hops: int = Query(1, ge=1, le=3),
     if not graph_client.get_ideas([idea_id]):
         raise HTTPException(404, f"idea {idea_id} not found")
     return graph_client.neighbors([idea_id], hops, min_weight)
+
+
+@graph.get("/edges", response_model=Page[EdgeOut], responses=_GRAPH_ERRORS,
+           summary="Все рёбра идея—идея, постранично (bulk-чтение вместо N+1)")
+def list_edges(limit: int = Query(2000, gt=0, le=MAX_EDGE_PAGE), offset: int = Query(0, ge=0),
+               min_weight: float | None = None):
+    """`GET /ideas/{id}/neighbors` answers "around this idea" and costs one request per
+    idea — 859 of them to draw the lake. This answers "all of them", in pages of up to
+    `MAX_EDGE_PAGE`: an edge is five scalars, not an idea body, and the ceiling that
+    fits idea pages turns one picture into 74 round trips."""
+    return _page(graph_client.count_edges(min_weight), limit, offset,
+                 graph_client.all_edges(limit, offset, min_weight))
 
 
 @graph.get("/theses", response_model=Page[ThesisOut], responses=_GRAPH_ERRORS, summary="Тезисы-листья, постранично")

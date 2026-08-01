@@ -164,6 +164,8 @@ svg.graph text.ringlab,svg.graph text.hitlab{pointer-events:none;paint-order:str
   stroke:var(--surface-2);stroke-width:3.5px;stroke-linejoin:round}
 svg.graph text.ringlab{fill:var(--ink-2);font-size:10px;font-variant-numeric:tabular-nums}
 svg.graph text.hitlab{fill:var(--ink);font-size:11.5px}
+svg.graph circle.ideanode{cursor:pointer}
+svg.graph circle.ideanode:hover{stroke:var(--s2);stroke-width:2.5}
 .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--ink-2);
   align-items:center}
 .sw{width:11px;height:11px;border-radius:3px;background:var(--muted);display:inline-block}
@@ -573,6 +575,76 @@ view("retrieve", "Retrieve", (host) => {
 const DIAL_RAMP = ["#cde2fb", "#b7d3f6", "#86b6ef", "#6da7ec", "#5598e7",
                    "#3987e5", "#2a78d6", "#256abf", "#1c5cab"];
 
+/* The lake's own shape: every Idea-Idea edge and every idea body, read once per page and
+   reused by each hypothesis. `GET /edges` exists for this — the per-idea neighbours route
+   costs 859 requests to draw the same thing, which on stage is a demo that does not start.
+   Invalidated against `/stats`, so ingest running underneath shows up as a reload, not as
+   a picture quietly drawn over yesterday's graph. */
+let GRAPH_CACHE = null;
+
+async function loadGraph(force = false) {
+  const fresh = GRAPH_CACHE && LAST_STATS
+    && GRAPH_CACHE.edgeTotal === LAST_STATS.edges && GRAPH_CACHE.ideaTotal === LAST_STATS.ideas;
+  if (GRAPH_CACHE && !force && (fresh || !LAST_STATS)) return GRAPH_CACHE;
+  const edges = [];
+  let edgeTotal = 0;
+  for (let offset = 0; ; offset += 5000) {
+    const page = await api(`/edges?limit=5000&offset=${offset}`);
+    edgeTotal = page.total;
+    edges.push(...page.items);
+    if (!page.items.length || edges.length >= edgeTotal) break;
+  }
+  const ideas = new Map();
+  let ideaTotal = 0;
+  for (let offset = 0; ; offset += 200) {
+    const page = await api(`/ideas?limit=200&offset=${offset}`);
+    ideaTotal = page.total;
+    for (const body of page.items) ideas.set(body.id, body);
+    if (!page.items.length || ideas.size >= ideaTotal) break;
+  }
+  GRAPH_CACHE = { edges, ideas, edgeTotal, ideaTotal };
+  return GRAPH_CACHE;
+}
+
+/* Angle-only force layout. The radius is the cosine and stays nailed down — moving a node
+   toward its neighbours in radius would be the projection lie all over again — so the only
+   free coordinate is the angle: connected ideas swing together, unrelated ones spread.
+   Separation is asked for in pixels and converted per node (arc = r·dθ), otherwise nodes
+   near the centre pile up while the rim stays empty. */
+function ringLayout(nodes, links, iters = 400, gapPx = 19) {
+  if (nodes.length < 2) return;
+  const index = new Map(nodes.map((n, i) => [n.id, i]));
+  const edges = links.map((e) => [index.get(e.source), index.get(e.target), e.weight || 1])
+                     .filter(([a, b]) => a !== undefined && b !== undefined && a !== b);
+  const TWO_PI = Math.PI * 2;
+  const wrap = (a) => ((a % TWO_PI) + TWO_PI) % TWO_PI;
+  const delta = (a, b) => { const d = wrap(a - b); return d > Math.PI ? d - TWO_PI : d; };
+  for (let step = 0; step < iters; step++) {
+    const pull = 0.10 * (1 - step / iters) + 0.01;
+    for (const [a, b, weight] of edges) {
+      const d = delta(nodes[a].angle, nodes[b].angle) * pull * Math.min(1, Math.log1p(weight));
+      nodes[a].angle = wrap(nodes[a].angle - d);
+      nodes[b].angle = wrap(nodes[b].angle + d);
+    }
+    // Three separation passes per step: one only halves the deficit of each adjacent
+    // pair, and with the edges pulling every step the ideas collapsed into a clump that
+    // looked like one dense cluster the graph does not have.
+    for (let pass = 0; pass < 3; pass++) {
+      const order = nodes.map((n, i) => i).sort((i, j) => nodes[i].angle - nodes[j].angle);
+      for (let pos = 0; pos < order.length; pos++) {
+        const a = nodes[order[pos]], b = nodes[order[(pos + 1) % order.length]];
+        const want = gapPx / Math.max(24, Math.min(a.r, b.r));
+        const gap = wrap(b.angle - a.angle);
+        if (gap < want) {
+          const push = (want - gap) / 2;
+          a.angle = wrap(a.angle - push);
+          b.angle = wrap(b.angle + push);
+        }
+      }
+    }
+  }
+}
+
 view("dial", "Гипотеза", (host) => {
   const statusHost = el("div"), wrap = el("div", { class: "graphwrap" });
   const legendHost = el("div"), listHost = el("div"), ideasHost = el("div");
@@ -581,6 +653,11 @@ view("dial", "Гипотеза", (host) => {
     style: "width:100%;background:var(--surface-2);border:1px solid var(--hair);"
          + "border-radius:8px;padding:10px;color:var(--ink);font:inherit;resize:vertical" });
   const k = el("input", { type: "number", min: 1, max: 50, value: 12 });
+  // 30 by default because the top ideas all sit in a thin band of cosine — their radii
+  // are nearly equal, and that ring only fits so many circles before they overlap.
+  const top = el("input", { type: "number", min: 5, max: 300, value: 30 });
+  const withGraph = el("input", { type: "checkbox", checked: true });
+  const withLeaves = el("input", { type: "checkbox", checked: true });
   let generation = 0;
 
   async function fire() {
@@ -592,6 +669,16 @@ view("dial", "Гипотеза", (host) => {
       api(`/dial?q=${encodeURIComponent(text)}&k=${Number(k.value) || 12}`));
     if (stale() || !data) return;
 
+    // The graph is a separate read and a separate failure: a dead Neo4j costs the idea
+    // layer and says so, while the dial — which is index-only — still stands.
+    let graph = null, graphError = null;
+    if (withGraph.checked) {
+      busy(statusHost, "читаю идеи и рёбра…");
+      try { graph = await loadGraph(); }
+      catch (err) { if (!(err instanceof ApiError)) throw err; graphError = err; }
+      if (stale()) return;
+    }
+
     // `total` is the server's count of index rows, not points.length: the two differing
     // would mean the payload lost rows on the way, and that must not read as a thinner lake.
     const lost = data.total !== data.points.length;
@@ -601,8 +688,9 @@ view("dial", "Гипотеза", (host) => {
            : `${fmt(data.total)} листьев расставлены: ближайший ${data.cosine.max.toFixed(3)}, `
              + `медиана озера ${data.cosine.median.toFixed(3)}`);
 
+    let drawn = null;
     try {
-      drawDial(data);
+      drawn = drawDial(data, graph);
     } catch (err) {
       // A throw here used to mean an empty box under a green 200 — same lie as an empty
       // list for a broken store.
@@ -610,11 +698,29 @@ view("dial", "Гипотеза", (host) => {
       setStatus(statusHost, "err", null, "отрисовка упала: " + err.message);
       return;
     }
+    // The dial's own line first, then what the graph layer did or did not manage: two
+    // reads, two verdicts, and the second must not be able to overwrite the first.
+    if (graphError) {
+      statusHost.append(el("div", { class: "status " + (graphError.status === 503 ? "err" : "warn") },
+        el("span", { class: "code" }, graphError.status || "—"),
+        `${explain(graphError)} — идеи и рёбра не прочитаны. Циферблат считается из индекса `
+        + "и от графа не зависит."));
+    } else if (drawn && drawn.ideas) {
+      statusHost.append(el("div", { class: "status" },
+        `идей на картинке ${drawn.ideas} из ${fmt(graph.ideaTotal)}, рёбер между ними `
+        + `${fmt(drawn.inside)}; наружу из показанных ведут ещё ${fmt(drawn.outside)} — `
+        + "окрестность продолжается за кадром, всего в озере "
+        + `${fmt(graph.edgeTotal)} рёбер`
+        + (drawn.offIdea
+            ? `. Попаданий на своей идее ${drawn.onIdea}, на листе ${drawn.offIdea}: `
+              + "их идея не вошла в показанные по косинусу лучшего листа"
+            : "")));
+    }
     renderHits(data);
     loadIdeas(data, stale);
   }
 
-  function drawDial(data) {
+  function drawDial(data, graph) {
     const w = wrap.clientWidth || 1100, h = Math.min(680, Math.round(window.innerHeight * 0.72));
     const cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 42, R0 = R * 0.13;
     const cos = data.points.map((p) => p.cosine);
@@ -634,7 +740,8 @@ view("dial", "Гипотеза", (host) => {
     };
     const tip = (parent, txt) => { const t = mk("title"); t.textContent = txt; parent.append(t); };
     const svg = mk("svg", { class: "graph", viewBox: `0 0 ${w} ${h}` });
-    const gRings = mk("g"), gPts = mk("g"), gHits = mk("g"), gLab = mk("g");
+    const gRings = mk("g"), gPts = mk("g"), gEdges = mk("g"), gIdeas = mk("g"),
+          gHits = mk("g"), gLab = mk("g");
 
     const share = (c) => data.points.filter((p) => p.cosine >= c).length;
     // On the ring goes the number and nothing else — the sentence explaining it lands in
@@ -659,29 +766,121 @@ view("dial", "Гипотеза", (host) => {
       ...rings.reverse().map(([value, label]) => el("span", {},
         `${label} ${value.toFixed(3)} — ближе ${fmt(share(value))} из ${fmt(data.total)}`)),
       el("span", {}, `дальний край ${lo.toFixed(3)}`),
-      el("span", { class: "dim" }, "· радиус = косинус, цвет = он же, угол ничего не значит")));
+      el("span", { class: "dim" }, "· радиус = косинус, цвет = он же"),
+      el("span", { class: "dim" }, graph
+        ? "· крупные узлы — идеи, линии между ними — рёбра co-citation; угол задают только "
+          + "они, расстояния в нём нет"
+        : "· угол ничего не значит")));
 
     const placed = [];      // y positions already taken by a hit label
+    let onIdeaCount = 0, offIdeaCount = 0;
     const hitIds = new Set(data.hits.map((hit) => hit.thesis_id));
-    for (const p of data.points) {
-      if (hitIds.has(p.thesis_id)) continue;
-      const r = radius(p.cosine);
-      const dot = mk("circle", { cx: cx + Math.cos(p.angle) * r, cy: cy + Math.sin(p.angle) * r,
-                                 r: 1.9, fill: shade(p.cosine), "fill-opacity": .72 });
-      tip(dot, `${p.thesis_id}\ncos ${p.cosine.toFixed(3)}`);
-      gPts.append(dot);
+    if (withLeaves.checked) {
+      // Leaves step back when the idea layer is on: 3 000 dots at full strength read as
+      // the subject of the picture, and there the subject is the graph.
+      const leafAlpha = graph ? 0.3 : 0.72, leafR = graph ? 1.5 : 1.9;
+      for (const p of data.points) {
+        if (hitIds.has(p.thesis_id)) continue;
+        const r = radius(p.cosine);
+        const dot = mk("circle", { cx: cx + Math.cos(p.angle) * r, cy: cy + Math.sin(p.angle) * r,
+                                   r: leafR, fill: shade(p.cosine), "fill-opacity": leafAlpha });
+        tip(dot, `${p.thesis_id}\ncos ${p.cosine.toFixed(3)}`);
+        gPts.append(dot);
+      }
+    }
+
+    // --- the lake's own topology, on the same radial scale --------------------
+    // An idea's radius is the cosine of its BEST leaf, which is the read path's own rule
+    // for lifting a hit to an idea (§5.3) — not an average, and not the idea's own vector,
+    // which nothing in retrieval ever compares against.
+    let shownIdeas = 0, inside = 0, outside = 0;
+    const ideaAt = new Map();   // idea_id -> [x, y] once the ring layout has run
+    if (graph) {
+      const best = new Map();
+      for (const p of data.points) {
+        const seen = best.get(p.idea_id);
+        if (!seen || p.cosine > seen.cosine) best.set(p.idea_id, p);
+      }
+      const wanted = Math.min(300, Math.max(5, Number(top.value) || 60));
+      const nodes = [...best.entries()]
+        .sort((a, b) => b[1].cosine - a[1].cosine)
+        .slice(0, wanted)
+        // Seeded on the golden angle, NOT at the leaf's projected angle and not in rank
+        // order. The projected angle carries ~10 % of the residual variance and drew the
+        // ideas as one arc; seeding by rank drew a spiral, because rank and radius move
+        // together. Off a decorrelated ring, every grouping left on screen is the edges'
+        // doing and nothing else.
+        .map(([id, point], i) => ({
+          id, cosine: point.cosine, r: radius(point.cosine),
+          angle: ((i * 0.6180339887) % 1) * Math.PI * 2, body: graph.ideas.get(id) || null,
+        }));
+      const on = new Set(nodes.map((n) => n.id));
+      const seenEdge = new Set();
+      const links = [];
+      for (const edge of graph.edges) {
+        const here = on.has(edge.source_id), there = on.has(edge.target_id);
+        if (!here && !there) continue;
+        if (!here || !there) { outside++; continue; }
+        // Stored both directions (write_cocitation_edges); one line per pair.
+        const key = [edge.source_id, edge.target_id].sort().join("|");
+        if (seenEdge.has(key)) continue;
+        seenEdge.add(key);
+        links.push({ source: edge.source_id, target: edge.target_id, weight: edge.weight || 1 });
+      }
+      inside = links.length;
+      shownIdeas = nodes.length;
+      ringLayout(nodes, links);
+      const pos = new Map(nodes.map((n) => [n.id, n]));
+      const at = (n) => [cx + Math.cos(n.angle) * n.r, cy + Math.sin(n.angle) * n.r];
+      for (const link of links) {
+        const a = pos.get(link.source), b = pos.get(link.target);
+        const [x1, y1] = at(a), [x2, y2] = at(b);
+        // Quadratic through a point pulled toward the centre: straight chords across the
+        // disc would all pile through the middle, where the hypothesis is.
+        const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+        const line = mk("path", {
+          d: `M${x1.toFixed(1)} ${y1.toFixed(1)} Q${(cx + (mx - cx) * 0.55).toFixed(1)} `
+             + `${(cy + (my - cy) * 0.55).toFixed(1)} ${x2.toFixed(1)} ${y2.toFixed(1)}`,
+          fill: "none", stroke: "var(--ink-2)",
+          "stroke-opacity": Math.min(0.75, 0.34 + 0.14 * Math.log1p(link.weight)),
+          "stroke-width": Math.min(2.4, 0.8 + 0.5 * Math.log1p(link.weight)),
+        });
+        tip(line, `${link.source} — ${link.target}\nвес ${link.weight}`);
+        gEdges.append(line);
+      }
+      const parents = new Set(data.hits.map((hit) => hit.idea_id));
+      for (const node of nodes) {
+        const [x, y] = at(node);
+        ideaAt.set(node.id, [x, y]);
+        const leaves = node.body ? (node.body.theses || []).length : 0;
+        const dot = mk("circle", { cx: x, cy: y, r: 3.6 + 1.5 * Math.sqrt(leaves),
+          fill: shade(node.cosine), stroke: parents.has(node.id) ? "var(--s2)" : "var(--surface)",
+          "stroke-width": parents.has(node.id) ? 2 : 1, class: "ideanode" });
+        tip(dot, `${node.id}\ncos лучшего листа ${node.cosine.toFixed(3)}\nлистьев ${leaves}\n`
+                 + (node.body ? node.body.text : "(тело идеи не прочитано)"));
+        dot.addEventListener("click", () => openIdea(node.id));
+        gIdeas.append(dot);
+      }
     }
     // The hits are drawn last and joined to the centre: on a plot where the angle means
     // nothing, the line is what carries "this one is actually near", not the position.
     data.hits.forEach((hit, i) => {
       const p = data.points.find((pt) => pt.thesis_id === hit.thesis_id);
       if (!p) return;
-      const r = radius(p.cosine), x = cx + Math.cos(p.angle) * r, y = cy + Math.sin(p.angle) * r;
+      const r = radius(p.cosine);
+      // With the graph layer on, the spoke ends on the IDEA the read path would return,
+      // not on the leaf that matched: two markers for one hit, at unrelated angles, is a
+      // picture that invites the question "why is #1 not on its own idea".
+      const onIdea = ideaAt.get(hit.idea_id);
+      if (onIdea) onIdeaCount++; else offIdeaCount++;
+      const x = onIdea ? onIdea[0] : cx + Math.cos(p.angle) * r;
+      const y = onIdea ? onIdea[1] : cy + Math.sin(p.angle) * r;
       gHits.append(mk("line", { x1: cx, y1: cy, x2: x, y2: y, stroke: "var(--s2)",
                                 "stroke-width": 1, "stroke-opacity": .45 }));
-      const dot = mk("circle", { cx: x, cy: y, r: 4.5, fill: "var(--s2)",
+      const dot = mk("circle", { cx: x, cy: y, r: onIdea ? 3 : 4.5, fill: "var(--s2)",
                                  stroke: "var(--surface)", "stroke-width": 2 });
-      tip(dot, `#${i + 1} ${hit.thesis_id}\ncos ${hit.cosine.toFixed(3)}\n${hit.text}`);
+      tip(dot, `#${i + 1} ${hit.thesis_id}\ncos ${hit.cosine.toFixed(3)}\n${hit.text}`
+               + (onIdea ? `\nпоказан на своей идее ${hit.idea_id}` : ""));
       gHits.append(dot);
       if (i < 5) {
         // Right of the dot unless the text would run off the frame; then left. Width is
@@ -719,8 +918,9 @@ view("dial", "Гипотеза", (host) => {
     note.textContent = `гипотеза · разрыв шкалы: 1.000 → ${hi.toFixed(3)}`;
     gLab.append(note);
 
-    svg.append(gRings, gPts, gHits, gLab);
+    svg.append(gRings, gPts, gEdges, gIdeas, gHits, gLab);
     wrap.replaceChildren(svg);
+    return { ideas: shownIdeas, inside, outside, onIdea: onIdeaCount, offIdea: offIdeaCount };
   }
 
   function renderHits(data) {
@@ -779,7 +979,17 @@ view("dial", "Гипотеза", (host) => {
         + "(лог замера A/B) строки не остаётся."),
       el("div", { class: "row" }, el("label", { class: "f grow" }, "гипотеза", q),
         el("label", { class: "f" }, "k", k),
+        el("label", { class: "f" }, "идей", top),
         el("button", { class: "act", onclick: fire }, "Разложить")),
+      el("div", { class: "row" },
+        el("label", { class: "cb" }, withGraph, "идеи и рёбра"),
+        el("label", { class: "cb" }, withLeaves, "точки-листья"),
+        el("button", { class: "ghost sm", onclick: async () => {
+          // The graph is cached per page load; ingest running underneath is exactly when
+          // an operator needs to say "re-read it" without reloading the tab.
+          await run(statusHost, "перечитываю идеи и рёбра…", () => loadGraph(true));
+          fire();
+        } }, "Перечитать граф")),
       statusHost),
     el("div", { class: "panel" }, wrap, legendHost, listHost),
     el("div", { class: "panel" }, el("h2", {}, "Идеи рядом"), ideasHost));
