@@ -239,6 +239,12 @@ const cut = (s, n) => (s || "").length > n ? s.slice(0, n - 1) + "…" : (s || "
 /* ---------------------------------------------------------------- transport */
 
 let API_KEY = sessionStorage.getItem(KEY_STORE) || "";
+/* Set only after the server has ANSWERED a keyless request: `--no-auth` is a thing an
+   operator types for a loopback port, and demanding a key the server does not check is
+   friction that teaches people to paste secrets into forms that ignore them. The
+   direction stays fail-closed — this is never assumed, only observed, and a 401 puts
+   the gate back. */
+let NO_AUTH = false;
 
 class ApiError extends Error {
   constructor(status, message, body) {
@@ -378,7 +384,7 @@ let LAST_STATS = null;
 
 async function refreshStrip() {
   const strip = $("#strip");
-  if (!API_KEY) { strip.replaceChildren(el("span", { class: "chip warn" },
+  if (!API_KEY && !NO_AUTH) { strip.replaceChildren(el("span", { class: "chip warn" },
     el("span", { class: "dot" }), "ключ не задан")); return; }
   let health, stats;
   try {
@@ -396,6 +402,9 @@ async function refreshStrip() {
     el("span", { class: "dot" }), ...kids));
   add(health.status === "ok" ? "ok" : "bad", "healthz ", el("b", {}, health.status),
       health.mock ? " (mock)" : "");
+  // Said out loud, because from the inside an open server looks exactly like a guarded
+  // one: this port answers everything to anyone who can reach it.
+  if (NO_AUTH) add("warn", "сервер ", el("b", {}, "--no-auth"), " — ручки открыты");
   add(stats.in_sync ? "ok" : "bad", "индекс/хранилище ",
       el("b", {}, `${fmt(stats.theses_indexed)}/${fmt(stats.theses)}`));
   add("", "источники ", el("b", {}, fmt(stats.sources)));
@@ -477,12 +486,22 @@ function ideaCard(item, rank) {
           : [el("div", { class: "fv" }, "листьев нет — для origin=extracted это нарушение инварианта")])));
 }
 
-function answerBlock(answer, label) {
+function answerBlock(answer, label, rewriteAsked) {
   const ideas = answer.ideas || [];
   const padded = ideas.filter((i) => i.via === "padding").length;
   const best = ideas.length ? Math.max(...ideas.map((i) => i.cosine_similarity ?? -1)) : null;
+  // The answer body carries no `rewrite_failed` (that field lives in the retrieval log),
+  // but it does carry the cost — and a rewrite that ran always spends input tokens. Zero
+  // with the arm ON means the step degraded to the raw query: usually no LAKE_KEY_9B, or
+  // the school's server refused. Saying "rewrite on" over that would report an ablation
+  // arm that never ran.
+  const rewriteDead = rewriteAsked && answer.cost.tokens_in === 0;
   return el("div", {},
     el("div", { class: "col-h" }, el("b", {}, label),
+      rewriteDead ? el("span", { class: "badge", style: "border-color:var(--warning);color:var(--warning)",
+        title: "0 входных токенов при включённом rewrite: шаг деградировал до сырого запроса. "
+             + "Обычно это отсутствующий LAKE_KEY_9B или отказ сервера модели." },
+        "rewrite не отработал") : null,
       el("span", { class: "dim mono" },
         `${answer.cost.wall_ms.toFixed(0)} мс · ${answer.cost.tokens_in}+${answer.cost.tokens_out} ток. · ${answer.log_id}`),
       best !== null ? el("span", { class: "badge" }, `лучший cosine ${best.toFixed(3)}`) : null,
@@ -519,7 +538,7 @@ view("retrieve", "Retrieve", (host) => {
     const totalMs = answers.reduce((s, [, a]) => s + a.cost.wall_ms, 0);
     setStatus(statusHost, "ok", 200, `${answers.length} вызов(а) · ${totalMs.toFixed(0)} мс суммарно`);
     out.replaceChildren(el("div", { class: answers.length > 1 ? "ab" : "" },
-      ...answers.map(([rw, a]) => answerBlock(a, rw ? "rewrite on" : "rewrite off"))));
+      ...answers.map(([rw, a]) => answerBlock(a, rw ? "rewrite on" : "rewrite off", rw))));
   }
 
   host.replaceChildren(
@@ -1386,7 +1405,7 @@ function render() {
   }, v.title)));
   const main = $("#main");
   main.replaceChildren();
-  if (!API_KEY) { openGate(""); return; }
+  if (!API_KEY && !NO_AUTH) { openGate(""); return; }
   const chosen = VIEWS.find((v) => v.id === CURRENT) || VIEWS[0];
   chosen.mount(main);
 }
@@ -1396,8 +1415,15 @@ window.addEventListener("hashchange", () => {
   if (id && id !== CURRENT) { CURRENT = id; render(); }
 });
 
-render();
-if (API_KEY) { refreshStrip(); setInterval(refreshStrip, 20000); } else openGate("");
+(async function boot() {
+  if (!API_KEY) {
+    // One keyless probe. 200 means this server runs --no-auth; a 401 means it does not,
+    // and `api()` has already put the gate up.
+    try { await api("/healthz", { timeout: 10000 }); NO_AUTH = true; } catch { /* gate */ }
+  }
+  render();
+  if (API_KEY || NO_AUTH) { refreshStrip(); setInterval(refreshStrip, 20000); }
+})();
 </script>
 </body>
 </html>
