@@ -1,183 +1,167 @@
-"""Agent lake — lake/api/routes.py:246, lake/research/agent.py:192
+"""Agent lake, вертикальный кадр 800×850: агентский поиск поверх озера.
 
-агентский RAG: ретрив → «хватило?» → веб-поиск → развилка. Отчёт уходит
-вызывающему сразу (`routes.py:261`), а найденные статьи тем же вызовом
-встают в очередь ингеста (`research/agent.py:330-365`) — и находятся
-следующим вопросом.
+Озеро сверху, агент под ним, веб сбоку, выдача внизу строкой.
 
 Ролик идёт по коду, а не по `12-decisions-meetings.md:118` («из веба в
 эволюцию — только через озеро»): встреча 4 требовала ждать переваривания,
-код отвечает сразу и кладёт в озеро параллельно.
+код отвечает сразу и кладёт найденное в озеро параллельно —
+`lake/api/routes.py:246,261`, `lake/research/agent.py:330-365`.
 """
 
 from manim import *
 
 from theme import *
 
-LAKE_C = LEFT * 4.4 + DOWN * 0.4
-LAKE_R = 1.95
-INNER = [UP * 0.85, RIGHT * 0.95 + DOWN * 0.3, LEFT * 0.75 + DOWN * 0.85]
+portrait()
+
+LAKE_C = UP * 2.1
+LAKE_R = 1.55
+INNER = [UP * 0.65, RIGHT * 0.75 + DOWN * 0.25, LEFT * 0.6 + DOWN * 0.65]
 INNER_EDGES = [(0, 1), (0, 2)]
-AGENT_C = RIGHT * 0.3 + DOWN * 0.4
-WEB_C = RIGHT * 0.3 + UP * 2.7
-DOCS = [RIGHT * 2.8 + UP * 2.5, RIGHT * 4.5 + UP * 2.5]
-SLOTS = [RIGHT * 3.6 + UP * y for y in (1.35, 0.35, -0.65, -1.65)]
+AGENT_C = DOWN * 1.0
+WEB_C = LEFT * 2.6 + DOWN * 1.0
+DOCS = [RIGHT * 2.55 + DOWN * 0.55, RIGHT * 2.55 + DOWN * 1.8]
+SLOTS = [RIGHT * (1.75 - 1.2 * i) + DOWN * 3.5 for i in range(4)]
 
 
 class AgentLake(PipelineScene):
     def construct(self):
-        # --- озеро уже есть ---------------------------------------------------
-        rim = dot_ring(LAKE_C, LAKE_R, 44, IDEA, 0.035)
-        nodes = VGroup(*[idea(0.34).move_to(LAKE_C + p) for p in INNER])
+        # --- озеро уже есть -------------------------------------------------------
+        rim = dot_ring(LAKE_C, LAKE_R, 40, IDEA, 0.032)
+        nodes = VGroup(*[idea(0.3).move_to(LAKE_C + p) for p in INNER])
         edges = VGroup(
             *[
-                span(nodes[a], nodes[b], 0.38).set_stroke(FAINT, width=2)
+                span(nodes[a], nodes[b], 0.34).set_stroke(FAINT, width=2)
                 for a, b in INNER_EDGES
             ]
         )
-        leaves = VGroup(*[thesis(0.17).move_to(n.get_center()) for n in nodes[:2]])
+        leaves = VGroup(*[thesis(0.15).move_to(n.get_center()) for n in nodes[:2]])
         edges.set_z_index(-2)
         leaves.set_z_index(1)
         self.add(rim, edges, nodes, leaves)
-        lake = self.note("lake", rim, UP, buff=0.26, color=IDEA, size=21)
+        lake = self.note("lake", rim, UP, buff=0.2, color=IDEA, size=21)
         self.wait(0.5)
 
-        agent = robot(1.7).move_to(AGENT_C)
+        agent = robot(1.4).move_to(AGENT_C)
         # Агент — главный герой ролика: его имя висит до конца.
-        who = self.note("lake agent", agent, DOWN, buff=0.28, color=INK, size=21)
+        # Имя под роботом: справа встают найденные страницы.
+        who = self.note("lake agent", agent, DOWN, buff=0.26, color=INK, size=20)
         self.play(Create(agent), run_time=0.8)
         self.wait(0.3)
         self.drop_notes(lake, who)
 
-        # --- первый ретрив: пришло мало ---------------------------------------
+        # --- первый ретрив: пришло мало --------------------------------------------
         ask = Arrow(
-            agent.get_left(), rim.get_right(), buff=0.2, stroke_width=2.4
+            agent.get_top(), rim.get_bottom(), buff=0.12, stroke_width=2.4
         ).set_color(DIM)
-        # Подпись поднята выше стрелки: на малом отступе она садится
-        # на самого агента.
-        self.note("retrieve", ask, UP, buff=0.55, color=DIM)
-        self.play(GrowArrow(ask), run_time=0.7)
+        self.note("retrieve", ask, LEFT, buff=0.24, color=DIM)
+        self.play(GrowArrow(ask), run_time=0.6)
         got = self.lift(nodes[:2], SLOTS[:2])
+        self.wait(0.3)
+        self.drop_notes(lake, who)
+
+        few = cross(0.6).next_to(got, LEFT, buff=0.4)
+        self.note("not enough", few, UP, buff=0.24, color=BAD, size=18)
+        self.play(FadeIn(few), run_time=0.5)
         self.wait(0.4)
         self.drop_notes(lake, who)
 
-        few = cross(0.7).next_to(got, RIGHT, buff=0.5)
-        self.note("not enough", few, UP, buff=0.26, color=BAD, shift=RIGHT * 0.35)
-        self.play(FadeIn(few), run_time=0.5)
-        self.wait(0.5)
-        self.drop_notes(lake, who)
-
-        # --- веб: агент ищет сам, но кладёт найденное в озеро -------------------
-        web = globe(0.6).move_to(WEB_C)
+        # --- веб --------------------------------------------------------------------
+        web = globe(0.5).move_to(WEB_C)
         out = Arrow(
-            agent.get_top(), web.get_bottom(), buff=0.18, stroke_width=2.4
+            agent.get_left(), web.get_right(), buff=0.14, stroke_width=2.4
         ).set_color(DIM)
-        self.note("search the web", web, LEFT, buff=0.32, color=INK)
-        self.play(FadeOut(few), GrowArrow(out), Create(web), run_time=1.1)
+        self.note("search the web", web, UP, buff=0.24, color=INK, size=18)
+        self.play(FadeOut(few), GrowArrow(out), Create(web), run_time=1.0)
 
-        pages = VGroup(*[doc(0.8, 1.1, 5).move_to(p) for p in DOCS])
-        self.note("links found", pages, UP, buff=0.26, color=INK)
+        pages = VGroup(*[doc(0.85, 1.15, 5).move_to(p) for p in DOCS])
+        self.note("links found", pages, UP, buff=0.24, color=INK, size=18)
         self.play(
-            LaggedStart(*[FadeIn(p, shift=RIGHT * 0.3) for p in pages], lag_ratio=0.3),
-            run_time=1.0,
+            LaggedStart(*[FadeIn(p, shift=DOWN * 0.25) for p in pages], lag_ratio=0.3),
+            run_time=0.9,
         )
         self.wait(0.3)
         self.drop_notes(lake, who)
 
-        # Развилка: ответ уходит в эволюцию сразу (`/research` синтезирует отчёт
-        # и возвращает его вызывающему, `api/routes.py:246-261`), а найденное
-        # тем же вызовом ставится в очередь ингеста (`research/agent.py:330-365`).
-        # Ждать озеро незачем: ингест идёт минутами, ответ нужен сейчас.
+        # Развилка: отчёт уходит вызывающему сразу, а найденное тем же вызовом
+        # встаёт в очередь ингеста. Ждать озеро незачем — ингест идёт минутами.
+        # Стрелка вниз-вправо, подпись — над страницами: справа от них до
+        # борта меньше единицы, там подпись не стоит.
         now = Arrow(
-            pages.get_right(), RIGHT * 6.9 + UP * 2.5, buff=0.2, stroke_width=2.6
+            pages.get_bottom(), RIGHT * 3.4 + DOWN * 3.1, buff=0.18, stroke_width=2.6
         ).set_color(IDEA)
         self.note(
-            "to evolution\nright away",
-            now,
-            DOWN,
-            buff=0.24,
-            color=IDEA,
-            size=17,
-            shift=RIGHT * 0.45,
+            "to evolution\nright away", pages, UP, buff=0.26, color=IDEA, size=17
         )
         shot = pages.copy()
         self.add(shot)
-        self.play(GrowArrow(now), run_time=0.6)
+        self.play(GrowArrow(now), run_time=0.5)
         self.play(
-            shot.animate.move_to(RIGHT * 7.6 + UP * 2.5).set_opacity(0), run_time=0.9
+            shot.animate.scale(0.5).move_to(RIGHT * 3.9 + DOWN * 3.5).set_opacity(0),
+            run_time=0.8,
         )
         self.remove(shot)
         self.drop_notes(lake, who)
 
-        # --- и та же находка ложится в озеро — на будущее ------------------------
-        # Подпись сверху: слева стоит глобус, снизу страницы улетают в озеро.
-        self.note("and into the lake", pages, UP, buff=0.28, color=THESIS)
+        # --- и та же находка ложится в озеро — на будущее ------------------------------
+        # Снизу, а не слева: слева от страниц стоит агент.
+        self.note("and into the lake", pages, DOWN, buff=0.26, color=THESIS, size=18)
         self.play(
-            pages.animate.scale(0.5).move_to(LAKE_C + UP * 0.1).set_opacity(0),
+            pages.animate.scale(0.5).move_to(LAKE_C).set_opacity(0),
             FadeOut(out, web, now),
-            run_time=1.3,
+            run_time=1.2,
         )
         self.remove(pages)
         self.drop_notes(lake, who)
 
-        # тезисы страницы собираются в новую идею — write path в одну строку.
-        # Место свободное: над центром уже стоит узел, туда класть нельзя.
-        spot = LAKE_C + LEFT * 1.0 + UP * 0.35
-        squares = VGroup(*[thesis(0.17) for _ in range(3)])
-        squares.arrange(RIGHT, buff=0.1).move_to(spot)
-        fresh = idea(0.34).move_to(spot).set_z_index(-1)
-        self.note("ingest, minutes", rim, DOWN, buff=0.26, color=THESIS)
-        self.play(FadeIn(squares, scale=0.6), run_time=0.7)
+        # тезисы страницы собираются в новую идею — write path в одну строку
+        spot = LAKE_C + RIGHT * 0.7 + UP * 0.5
+        squares = VGroup(*[thesis(0.15) for _ in range(3)])
+        squares.arrange(RIGHT, buff=0.08).move_to(spot)
+        fresh = idea(0.3).move_to(spot).set_z_index(-1)
+        self.note("ingest, minutes", rim, LEFT, buff=0.24, color=THESIS, size=18)
+        self.play(FadeIn(squares, scale=0.6), run_time=0.6)
         self.play(
-            squares.animate.scale(0.75).move_to(spot),
-            Create(fresh),
-            run_time=1.0,
+            squares.animate.scale(0.75).move_to(spot), Create(fresh), run_time=0.9
         )
-        self.wait(0.4)
+        self.wait(0.3)
         self.drop_notes(lake, who)
 
-        # --- следующий вопрос: найденное уже лежит в озере ------------------------
-        # В две строки: в один ряд подпись шире промежутка между озером
-        # и агентом и садится либо на пунктир, либо на агента.
-        self.note("next\nquestion", ask, UP, buff=0.35, color=DIM)
+        # --- следующий вопрос: найденное уже лежит в озере -------------------------------
+        self.note("next question", ask, LEFT, buff=0.24, color=DIM, size=18)
         self.play(Flash(ask.get_center(), color=DIM, line_length=0.12), run_time=0.5)
         more = self.lift([fresh, nodes[2]], SLOTS[2:])
-        self.wait(0.4)
+        self.wait(0.3)
         self.drop_notes(lake, who)
 
         full = VGroup(got, more)
-        ok = check(0.7).next_to(full, RIGHT, buff=0.5)
-        # В две строки: в одну подпись шире галочки и заезжает на колонку идей.
-        self.note("reused,\nenough", ok, UP, buff=0.26, color=IDEA)
+        ok = check(0.6).next_to(full, LEFT, buff=0.4)
+        self.note("reused,\nenough", ok, UP, buff=0.24, color=IDEA, size=18)
         self.play(FadeIn(ok), run_time=0.5)
         self.wait(0.5)
         self.drop_notes(lake, who)
 
         away = Arrow(
-            full.get_right() + RIGHT * 0.3,
-            RIGHT * 6.8,
-            buff=0.1,
-            stroke_width=2.6,
+            full.get_bottom() + DOWN * 0.12, DOWN * 4.1, buff=0.05, stroke_width=2.6
         ).set_color(IDEA)
-        self.note("to evolution", away, UP, buff=0.2, color=IDEA)
-        # Галочка уходит раньше стрелки: они на одной высоте, и вместе
-        # стрелка идёт прямо сквозь неё.
-        self.play(FadeOut(ok), run_time=0.35)
-        self.play(GrowArrow(away), run_time=0.7)
-        self.wait(1.2)
+        self.note("to evolution", away, LEFT, buff=0.26, color=IDEA, size=18)
+        # Галочка уходит раньше стрелки: вместе они спорят за одно место.
+        self.play(FadeOut(ok), run_time=0.3)
+        self.play(GrowArrow(away), run_time=0.6)
+        self.wait(1.1)
 
     def lift(self, src, slots):
-        """Идеи из озера встают колонкой справа от агента."""
+        """Идеи из озера встают строкой под агентом."""
         got = VGroup(*[s.copy() for s in src])
         self.add(got)
         self.play(
             LaggedStart(
                 *[
-                    c.animate.scale(0.42 / 0.34).move_to(p)
+                    c.animate.scale(0.38 / 0.3).move_to(p)
                     for c, p in zip(got, slots)
                 ],
                 lag_ratio=0.3,
             ),
-            run_time=1.3,
+            run_time=1.2,
         )
         return got

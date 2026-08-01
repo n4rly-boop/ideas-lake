@@ -1,7 +1,8 @@
 #!/bin/sh
-# Рендер сцен в out/: mp4 1080p60 для слайдов + gif 1000px 20fps.
+# Рендер сцен в out/: mp4 для слайдов + gif 20fps.
 #
-# Без аргументов гонит все шесть. Можно назвать нужные:
+# Кадров 16:9 больше нет: пять роликов идут в 800×850, карта системы — в
+# полосе 850×280. Без аргументов гонит все шесть. Можно назвать нужные:
 #   ./render.sh system_map:SystemMap
 #
 # Окружение (один раз, .venv под игнором):
@@ -17,10 +18,7 @@ cd "$(dirname "$0")"
 mkdir -p out
 
 all="write_path:WritePath read_path:ReadPath feedback_path:FeedbackPath
-     idea_synthesis:IdeaSynthesis agent_lake:AgentLake system_map:SystemMap
-     system_map_wide:SystemMapWide
-     write_path_v:WritePathV read_path_v:ReadPathV feedback_path_v:FeedbackPathV
-     idea_synthesis_v:IdeaSynthesisV agent_lake_v:AgentLakeV"
+     idea_synthesis:IdeaSynthesis agent_lake:AgentLake system_map:SystemMap"
 [ $# -gt 0 ] && all="$*"
 
 for pair in $all; do
@@ -31,11 +29,12 @@ for pair in $all; do
     # Не 1080p60: широкая полоса рисуется в своём разрешении, папка другая.
     mp4=$(ls -t media/videos/"$file"/*/*.mp4 | head -1)
 
-    # Ширина гифки: полоса 850, вертикальные 800, широкие 1000.
+    # Ширина гифки: полоса 850, остальные вертикальные 800. Кадр рисуется
+    # кратно крупнее (см. portrait() и шапку system_map.py) и ужимается сюда:
+    # на нативном размере контур рвётся, а мелкий текст плывёт.
     case "$file" in
-        system_map_wide) gifw=850 ;;
-        *_v) gifw=800 ;;
-        *) gifw=1000 ;;
+        system_map) gifw=850 ;;
+        *) gifw=800 ;;
     esac
     cp "$mp4" "out/$file.mp4"
 
@@ -45,6 +44,10 @@ for pair in $all; do
     # быстрее mp4; 5 cs выше любого известного порога и играется как записано.
     # 60 fps формат не берёт вовсе — половина кадров получила бы 1 cs.
     #
+    # dither=none: рисунок плоский, 256 цветов покрывают его с запасом, а
+    # байеровский растр сыпал по белому фону регулярную сетку — она и
+    # читалась «низким разрешением».
+    #
     # stats_mode=full + diff_mode=none: каждый кадр самодостаточный.
     # С stats_mode=diff кадры получаются частичными, и Keynote, PowerPoint и
     # Quick Look показывают такой GIF одной последней картинкой.
@@ -52,7 +55,7 @@ for pair in $all; do
         -vf "fps=20,scale=$gifw:-1:flags=lanczos,palettegen=stats_mode=full" \
         -frames:v 1 out/.palette.png
     ffmpeg -y -loglevel error -i "$mp4" -i out/.palette.png \
-        -lavfi "fps=20,scale=$gifw:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=none" \
+        -lavfi "fps=20,scale=$gifw:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=none:diff_mode=none" \
         -loop 0 "out/$file.gif"
     rm -f out/.palette.png
 done
