@@ -26,7 +26,6 @@ SLOTS = [UP * 1.71, UP * 0.57, DOWN * 0.57, DOWN * 1.71]  # 4 места в вы
 class ReadPath(PipelineScene):
     def construct(self):
         # --- запрос от эволюции ----------------------------------------------
-        self.step("запрос", THESIS)
         # Пустой прямоугольник читался как «какая-то карточка»; подписываем.
         chip = (
             RoundedRectangle(width=2.1, height=1.1, corner_radius=0.1)
@@ -35,19 +34,23 @@ class ReadPath(PipelineScene):
             .move_to(QUERY_POS)
         )
         qtext = label("query", 24, INK, MEDIUM).move_to(chip)
+        ask = self.note(
+            "what evolution\nneeds?", chip, UP, buff=0.3, color=INK, size=20
+        )
         self.play(Create(chip), run_time=0.8)
         self.play(FadeIn(qtext), run_time=0.5)
-        self.wait(0.4)
+        self.wait(0.35)
 
         # --- индекс тезисов: BM25 + cosine -------------------------------------
-        self.step("индекс тезисов", THESIS)
         cells = VGroup(*[thesis(0.44, FAINT) for _ in range(20)])
         cells.arrange_in_grid(rows=4, cols=5, buff=0.26).move_to(GRID_POS)
+        idx = self.note("theses index", cells, UP, buff=0.3, color=THESIS, size=20)
         self.play(
             LaggedStart(*[FadeIn(c, scale=0.8) for c in cells], lag_ratio=0.04),
             run_time=1.2,
         )
 
+        self.note("bm25+cosine", cells, DOWN, buff=0.3, color=DIM)
         scan = Line(cells.get_top(), cells.get_bottom()).set_stroke(THESIS, width=2.4)
         scan.next_to(cells, LEFT, buff=0.15)
         self.play(FadeIn(scan), run_time=0.2)
@@ -72,11 +75,11 @@ class ReadPath(PipelineScene):
             ),
             run_time=1.5,
         )
-        self.wait(0.4)
+        self.wait(0.5)
+        self.drop_notes(ask, idx)
 
         # --- подъём: попавшие тезисы выходят из индекса отдельной колонкой ------
         # Так стрелки к идеям не проходят поверх остальных ячеек.
-        self.step("тезис → идея", IDEA)
         column = [RIGHT * LIFT_X + UP * (1.4 - 0.7 * i) for i in range(5)]
         rest = VGroup(*[c for i, c in enumerate(cells) if i not in HITS])
         self.play(
@@ -108,6 +111,7 @@ class ReadPath(PipelineScene):
                 born.add(o)
                 parts.append(Create(ideas[o]))
             beats.append(AnimationGroup(*parts, lag_ratio=0.3))
+        self.note("parent ideas", ideas, UP, buff=0.3, color=IDEA, size=20)
         self.play(LaggedStart(*beats, lag_ratio=0.45), run_time=2.6)
         self.wait(0.4)
 
@@ -115,29 +119,31 @@ class ReadPath(PipelineScene):
         # Подсвечиваем стрелки, а не обводку круга: обводка занята trust,
         # и утолщение круга здесь читалось бы как «эта идея релевантнее».
         dup = VGroup(*[arrows[i] for i in (0, 1, 3, 4)])
+        dd = self.note("dedup by idea", dup, DOWN, buff=0.3, color=THESIS)
         self.play(dup.animate.set_stroke(THESIS, width=3.4), run_time=0.8)
         self.wait(0.5)
-        self.play(dup.animate.set_stroke(FAINT, width=2), run_time=0.6)
+        self.play(dup.animate.set_stroke(FAINT, width=2), FadeOut(dd), run_time=0.6)
+        self._notes.remove(dd)
 
         # --- ранжирование --------------------------------------------------------
-        self.step("ранжирование", IDEA)
         vals = VGroup(
             *[
                 label(r, 17, INK).next_to(ideas[i], RIGHT, buff=0.52)
                 for i, r in enumerate(RANKS)
             ]
         )
+        self.note("score", vals[0], UP, buff=0.24, color=DIM, size=17)
         self.play(LaggedStart(*[FadeIn(v) for v in vals], lag_ratio=0.25), run_time=1.3)
         self.wait(0.4)
 
         # --- идей мало → обход рёбер; найденный сосед остаётся в выдаче ------------
-        self.step("обход рёбер", EDGE)
         far = idea(0.42).move_to(ideas[1].get_center() + RIGHT * 2.4 + DOWN * 0.9)
         link = Line(ideas[1].get_center(), far.get_center()).set_stroke(EDGE, width=2)
         link.set_z_index(-2)
+        nb = self.note("too few: add neighbours", far, DOWN, buff=0.3, color=EDGE)
         self.play(Create(link), run_time=0.9)
         self.play(Create(far), run_time=0.7)
-        self.wait(0.3)
+        self.wait(0.35)
 
         # Сосед встаёт в конец ранжирования, ребро тянется за ним. Дуга, а не
         # прямая: прямая от второй идеи к четвёртой прошла бы сквозь третью.
@@ -149,8 +155,10 @@ class ReadPath(PipelineScene):
         self.play(
             far.animate.move_to(slot),
             Transform(link, docked),
+            FadeOut(nb),
             run_time=1.2,
         )
+        self._notes.remove(nb)
         self.play(
             FadeIn(label(NEIGHBOUR_RANK, 17, INK).next_to(far, RIGHT, buff=0.52)),
             run_time=0.5,
@@ -158,7 +166,7 @@ class ReadPath(PipelineScene):
         self.wait(0.4)
 
         # --- выдача: верхняя идея + её листья + trust -------------------------------
-        self.step("выдача", IDEA)
+        self.drop_notes()
         card = (
             RoundedRectangle(width=2.9, height=3.5, corner_radius=0.1)
             .set_fill(BG, opacity=1)
@@ -173,6 +181,7 @@ class ReadPath(PipelineScene):
         ring = tick_ring(head.get_center(), 0.52, 0.88, IDEA, length=0.12)
         val = label("trust  0.88", 17, IDEA, MEDIUM).next_to(leaves, DOWN, buff=0.34)
 
+        self.note("result", card, UP, buff=0.28, color=INK, size=20)
         self.play(Create(card), run_time=0.9)
         self.play(ReplacementTransform(ideas[0].copy(), head), run_time=0.9)
         self.play(LaggedStart(*[Create(l) for l in leaves], lag_ratio=0.2), run_time=1.2)

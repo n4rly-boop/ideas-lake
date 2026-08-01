@@ -34,8 +34,25 @@ FAINT = "#D6D2CC"
 STROKE = 2.2
 
 
+TEXT_BASE = 96  # кегль, на котором рисуем всегда
+
+
 def label(text, size=20, color=INK, weight=NORMAL):
-    return Text(text, font=FONT, font_size=size, color=color, weight=weight)
+    """Текст нужного размера, отрисованный крупно и уменьшенный.
+
+    Напрямую мелкий кегль брать нельзя: manim ставит глифы по пиксельной
+    сетке, и на 19–24 pt внутри слова появляются разрывы («p arse p aper»).
+    На 96 pt округление незаметно, а scale() уже не трогает расстановку.
+    """
+    def one(s):
+        return Text(s, font=FONT, font_size=TEXT_BASE, color=color, weight=weight)
+
+    if "\n" in text:
+        # Text выравнивает строки по левому краю; собираем сами, чтобы
+        # вторая строка встала по центру первой.
+        lines = VGroup(*[one(s) for s in text.split("\n")])
+        return lines.arrange(DOWN, buff=0.22).scale(size / TEXT_BASE)
+    return one(text).scale(size / TEXT_BASE)
 
 
 def thesis(size=0.78, color=THESIS):
@@ -102,38 +119,34 @@ def doc(width=2.4, height=3.3, lines=8):
 
 
 class PipelineScene(Scene):
-    """Светлый фон и один короткий бейдж шага слева сверху.
+    """Светлый фон и короткие подписи у самих фигур.
 
-    Больше текста в кадре нет: пояснения живут на слайде, не в ролике.
+    Названия шагов из угла кадра убраны: подпись стоит там, куда смотрят.
+    Развёрнутый текст живёт на слайде, не в ролике.
     """
-
-    BADGE_ANCHOR = UP * 3.45 + LEFT * 6.4
 
     def setup(self):
         self.camera.background_color = BG
-        self._badge = None
-        self._rule = None
+        self._notes = VGroup()
 
-    def step(self, text, accent=IDEA):
-        """Сменить бейдж шага.
+    def note(
+        self, text, target, direction=UP, buff=0.3, size=19, color=DIM, shift=None
+    ):
+        """Подпись у фигуры. Висит, пока её не снимет drop_notes().
 
-        Слово меняется на месте, без сдвигов — текст не «едет». Гасим и
-        зажигаем последовательно и быстро: одновременно две разные строки
-        в одной точке дают призрак, а долгая пауза — заметный разрыв.
-        Линейка под словом не гаснет вовсе, только перекрашивается.
+        shift — сдвиг от края кадра: подпись шире фигуры и у самого борта
+        обрезается.
         """
-        cap = label(text, 26, INK, MEDIUM).move_to(
-            self.BADGE_ANCHOR, aligned_edge=LEFT
-        )
-        if self._badge is None:
-            self._rule = Line(LEFT * 0.55, RIGHT * 0.55).set_stroke(accent, width=3)
-            self._rule.move_to(self.BADGE_ANCHOR + DOWN * 0.42, aligned_edge=LEFT)
-            self.play(FadeIn(cap), FadeIn(self._rule), run_time=0.4)
-        else:
-            self.play(
-                FadeOut(self._badge),
-                self._rule.animate.set_stroke(accent),
-                run_time=0.2,
-            )
-            self.play(FadeIn(cap), run_time=0.25)
-        self._badge = cap
+        cap = label(text, size, color).next_to(target, direction, buff=buff)
+        if shift is not None:
+            cap.shift(shift)
+        self.play(FadeIn(cap), run_time=0.35)
+        self._notes.add(cap)
+        return cap
+
+    def drop_notes(self, *keep, run_time=0.3):
+        """Снять подписи, кроме перечисленных."""
+        gone = [c for c in self._notes if c not in keep]
+        if gone:
+            self.play(*[FadeOut(c) for c in gone], run_time=run_time)
+            self._notes.remove(*gone)

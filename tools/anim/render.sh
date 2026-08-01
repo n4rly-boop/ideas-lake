@@ -21,12 +21,21 @@ for pair in write_path:WritePath read_path:ReadPath feedback_path:FeedbackPath; 
     mp4=$(ls -t media/videos/"$file"/1080p60/*.mp4 | head -1)
     cp "$mp4" "out/$file.mp4"
 
+    # 20 fps. Задержка кадра в GIF хранится в сотых долях секунды и делится
+    # нацело только на 50/25/20/10. Выше 20 не идём: 2 cs (50 fps) лежит на
+    # пороге, ниже которого декодеры подменяют задержку своей, и ролик идёт
+    # быстрее mp4; 5 cs выше любого известного порога и играется как записано.
+    # 60 fps формат не берёт вовсе — половина кадров получила бы 1 cs.
+    #
+    # stats_mode=full + diff_mode=none: каждый кадр самодостаточный.
+    # С stats_mode=diff кадры получаются частичными, и Keynote, PowerPoint и
+    # Quick Look показывают такой GIF одной последней картинкой.
     ffmpeg -y -loglevel error -i "$mp4" \
-        -vf "fps=15,scale=1000:-1:flags=lanczos,palettegen=stats_mode=diff" \
+        -vf "fps=20,scale=1000:-1:flags=lanczos,palettegen=stats_mode=full" \
         -frames:v 1 out/.palette.png
     ffmpeg -y -loglevel error -i "$mp4" -i out/.palette.png \
-        -lavfi "fps=15,scale=1000:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3" \
-        "out/$file.gif"
+        -lavfi "fps=20,scale=1000:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3:diff_mode=none" \
+        -loop 0 "out/$file.gif"
     rm -f out/.palette.png
 done
 
