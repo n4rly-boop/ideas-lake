@@ -190,9 +190,12 @@ class ReadPath(PipelineScene):
         self.note("result", VGroup(card, stack), UP, buff=0.28, color=INK, size=20)
         self.play(
             FadeOut(cells, ideas, VGroup(*arrows), link, vals, nval),
-            LaggedStart(FadeIn(stack), Create(card), lag_ratio=0.4),
+            Create(card),
             run_time=1.1,
         )
+        # Стопка появляется после передней карточки: сначала показываем одну
+        # выдачу, потом что таких в ответе несколько.
+        self.play(FadeIn(stack, shift=(RIGHT + UP) * 0.1), run_time=0.6)
         self.play(Create(head), run_time=0.7)
         self.play(LaggedStart(*[Create(l) for l in leaves], lag_ratio=0.2), run_time=1.1)
         self.play(

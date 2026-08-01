@@ -66,8 +66,11 @@ class SystemMap(PipelineScene):
         shapes = VGroup(paper, nodes, leaves, agent, evo, web, giga, wheel)
         shapes.set_stroke(width=WIDE_STROKE)
 
-        feed = self.link(paper.get_right(), LAKE_C + LEFT * LAKE_R, DIM)
-        talk = self.link(LAKE_C + RIGHT * LAKE_R, agent.get_left(), IDEA, both=True)
+        # Все стрелки серые: цвет здесь означает «идёт прямо сейчас», а не
+        # тип связи — тип держат подписи и сами фишки. Стрелка красится
+        # только на время проезда, см. send().
+        feed = self.link(paper.get_right(), LAKE_C + LEFT * LAKE_R)
+        talk = self.link(LAKE_C + RIGHT * LAKE_R, agent.get_left(), both=True)
         # От края глобуса, а не от его центра: из центра стрелка идёт поверх
         # меридианов, и веб читается перечёркнутым.
         # В плечо, а не в угол рамки робота: в угол стрелка приходит полого
@@ -75,11 +78,10 @@ class SystemMap(PipelineScene):
         surf = self.link(
             WEB_C + rotate_vector(RIGHT * 0.32, -PI / 4),
             agent.get_left() + UP * 0.22,
-            DIM,
             both=True,
         )
-        pass_ = self.link(agent.get_right(), evo.get_left(), IDEA, both=True)
-        into = self.link(evo.get_right(), giga.get_left(), IDEA, both=True)
+        pass_ = self.link(agent.get_right(), evo.get_left(), both=True)
+        into = self.link(evo.get_right(), giga.get_left(), both=True)
         # От нижнего левого угла, а не от середины низа: из середины дуга
         # уходит вправо и пересекает борт коробки. Знак угла отрицательный —
         # при положительном дуга выгибается вверх и идёт по ногам роботов.
@@ -87,7 +89,7 @@ class SystemMap(PipelineScene):
             giga.get_corner(DL) + DOWN * 0.08,
             LAKE_C + rotate_vector(RIGHT * LAKE_R, -PI / 3),
             angle=-PI / 10,
-        ).set_stroke(LOG, width=2.6)
+        ).set_stroke(DIM, width=2.6)
         home.add_tip(tip_length=0.2, tip_width=0.16)
 
         # Имена узлов — сверху, отношения — снизу: нижняя треть полосы
@@ -121,26 +123,32 @@ class SystemMap(PipelineScene):
             self.pulse(giga),
             run_time=1.2,
         )
-        self.send([runlog(0.2) for _ in range(3)], into, back=True)
+        self.send([runlog(0.2) for _ in range(3)], into, LOG, back=True)
         self.play(self.pulse(evo), run_time=0.6)
 
-        self.send([label("?", 26, DIM) for _ in range(2)], pass_, back=True)
+        self.send([label("?", 26, INK) for _ in range(2)], pass_, INK, back=True)
         self.play(self.pulse(agent), run_time=0.6)
 
         # Озеро и веб — одним движением: агент спрашивает оба сразу.
-        self.send([idea(0.16) for _ in range(2)], talk, back=True, extra=surf)
-        self.send([idea(0.16), thesis(0.2)], talk)
+        self.send([idea(0.16) for _ in range(2)], talk, IDEA, back=True, extra=surf)
+        self.send([idea(0.16), thesis(0.2)], talk, IDEA)
 
-        self.send([idea(0.18) for _ in range(2)], pass_)
-        self.send([idea(0.18) for _ in range(2)], into)
+        self.send([idea(0.18) for _ in range(2)], pass_, IDEA)
+        self.send([idea(0.18) for _ in range(2)], into, IDEA)
         self.play(
             Rotate(wheel, TAU, about_point=GIGA_C, rate_func=linear),
             self.pulse(giga),
             run_time=1.0,
         )
 
-        self.send([runlog(0.2) for _ in range(3)], home, run_time=1.5)
-        self.wait(1.6)
+        self.send([runlog(0.2) for _ in range(3)], home, LOG, run_time=1.5)
+
+        # Круг замкнулся — озеро крутится: пунктир идёт по кольцу, и на
+        # последних секундах видно, что система работает дальше.
+        self.play(
+            Rotate(rim, TAU / 4, about_point=LAKE_C, rate_func=linear), run_time=2.4
+        )
+        self.wait(0.8)
 
     def pulse(self, m, factor=1.07):
         """Внимание к узлу — размером, а не цветом.
@@ -150,7 +158,7 @@ class SystemMap(PipelineScene):
         """
         return m.animate(rate_func=there_and_back).scale(factor)
 
-    def link(self, a, b, color, both=False):
+    def link(self, a, b, both=False):
         """Стрелка схемы. Один вес и один размер наконечника на всю полосу."""
         kind = DoubleArrow if both else Arrow
         return kind(
@@ -160,17 +168,23 @@ class SystemMap(PipelineScene):
             stroke_width=2.6,
             tip_length=0.18,
             max_tip_length_to_length_ratio=1.0,
-        ).set_color(color)
+        ).set_color(DIM)
 
     def tag(self, text, target, direction, buff, color, size):
         """Подпись схемы. Все висят с первого кадра до последнего."""
         return label(text, size, color).next_to(target, direction, buff=buff)
 
-    def thicken(self, path, width=4.6):
-        """Стрелка на время проезда толстеет, но цвета не меняет."""
-        return path.animate(rate_func=there_and_back).set_stroke(width=width)
+    def thicken(self, path, color, width=4.6):
+        """Стрелка на время проезда толстеет и берёт цвет того, что по ней едет.
 
-    def send(self, tokens, path, back=False, run_time=1.1, extra=None):
+        set_color, а не set_stroke: наконечник — заливка, и от одного
+        контурного цвета он остался бы серым.
+        """
+        return path.animate(rate_func=there_and_back).set_color(color).set_stroke(
+            width=width
+        )
+
+    def send(self, tokens, path, color, back=False, run_time=1.1, extra=None):
         """Фишки едут по стрелке; сама стрелка на это время подсвечивается.
 
         back — против нарисованного направления: двусторонняя стрелка одна,
@@ -196,8 +210,8 @@ class SystemMap(PipelineScene):
                 *[MoveAlongPath(t, p, rate_func=rate) for t, p in zip(group, paths)],
                 lag_ratio=0.3,
             ),
-            self.thicken(path),
-            *([self.thicken(extra)] if extra else []),
+            self.thicken(path, color),
+            *([self.thicken(extra, color)] if extra else []),
             run_time=run_time,
         )
         self.play(FadeOut(group), run_time=0.25)
