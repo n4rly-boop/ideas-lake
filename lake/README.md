@@ -356,13 +356,22 @@ C пишет ветку, которая никогда не сработает.
 нужно исследовать. Агент:
 
 1. получает небольшой список карточек через локальный `/retrieve` только для
-   gap/duplicate analysis;
+   gap/duplicate analysis; сохраняет bounded thesis URL/текст как untrusted
+   provenance, а не независимо проверенный web source;
 2. планирует до пяти разных запросов (при сбое модели использует deterministic
    coverage fallback);
 3. параллельно ищет в SearXNG и читает страницы через Crawl4AI, а PDF/arXiv —
    через Docling;
 4. возвращает language report, `queries`, independently fetched `sources` и
    per-round token/latency cost.
+
+При `LAKE_RESEARCH_WEB=0` шаги 2–3 не выполняются. RAG-only synthesis оставляет
+`sources=[]`, потому что источник не был независимо прочитан в этом раунде, но
+сохраняет доступные thesis URL в untrusted prior context. Источник и grounded
+claim предпочтительны, но не обязательны для task-local гипотезы: Core оставляет
+её `unverified` и проверяет только через нормальную эволюцию. При ошибке
+structured synthesis bounded RAG context остаётся в report, поэтому успешный
+retrieval не теряется.
 
 Планирование запросов и synthesis в `lake/research/agent.py` работают на
 `Qwen3.6-35B-A3B` (`llm.QWEN_35B`) с таймаутом одного вызова

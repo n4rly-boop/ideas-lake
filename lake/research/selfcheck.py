@@ -117,10 +117,12 @@ class RecordingModel:
     def __init__(self) -> None:
         self.ops: list[str] = []
         self.prompts: dict[str, str] = {}
+        self.kwargs: dict[str, dict] = {}
 
     def __call__(self, prompt: str, *, op: str, **kwargs):
         self.ops.append(op)
         self.prompts[op] = prompt
+        self.kwargs[op] = kwargs
         return _model(prompt, op=op, **kwargs)
 
 
@@ -158,15 +160,57 @@ def main() -> None:
     default_agent = build_default_agent()
     assert default_agent._model is llm.QWEN_35B
     assert default_agent._timeout_s == DEFAULT_RESEARCH_LLM_TIMEOUT_S
+    prior_web = os.environ.get("LAKE_RESEARCH_WEB")
+    try:
+        os.environ["LAKE_RESEARCH_WEB"] = "0"
+        graph_factory = build_default_agent()
+        assert graph_factory._search is None
+        assert graph_factory._model is llm.QWEN_35B
+        factory_model = RecordingModel()
+        graph_factory._complete = factory_model
+        graph_factory._retrieve = lambda *args, **kwargs: (200, {
+            "log_id": "rag-factory-graph-only",
+            "ideas": [{"text": "factory prior", "applicability_conditions": ""}],
+        })
+        factory_response = asyncio.run(graph_factory.research(
+            ResearchRequest(query="factory graph-only contract")
+        ))
+        assert factory_response.queries == [] and factory_response.sources == []
+        assert "web_disabled:graph_only_mode" in factory_response.warnings
+        assert "research_plan" not in factory_model.ops
+    finally:
+        if prior_web is None:
+            os.environ.pop("LAKE_RESEARCH_WEB", None)
+        else:
+            os.environ["LAKE_RESEARCH_WEB"] = prior_web
     prior_timeout = os.environ.get("LAKE_RESEARCH_LLM_TIMEOUT_S")
+    prior_web_for_timeout = os.environ.get("LAKE_RESEARCH_WEB")
     try:
         os.environ["LAKE_RESEARCH_LLM_TIMEOUT_S"] = "123"
-        assert build_default_agent()._timeout_s == 123
+        os.environ["LAKE_RESEARCH_WEB"] = "1"
+        timeout_agent = build_default_agent()
+        assert timeout_agent._timeout_s == 123
+        timeout_model = RecordingModel()
+        timeout_agent._complete = timeout_model
+        timeout_agent._search = FakeSearch()
+        timeout_agent._retrieve = lambda *args, **kwargs: (200, {
+            "log_id": "rag-timeout-override",
+            "ideas": [{"text": "timeout prior", "applicability_conditions": ""}],
+        })
+        asyncio.run(timeout_agent.research(
+            ResearchRequest(query="timeout override contract")
+        ))
+        for op in ("research_plan", "research_synthesis"):
+            assert timeout_model.kwargs[op]["timeout"] == 123
     finally:
         if prior_timeout is None:
             os.environ.pop("LAKE_RESEARCH_LLM_TIMEOUT_S", None)
         else:
             os.environ["LAKE_RESEARCH_LLM_TIMEOUT_S"] = prior_timeout
+        if prior_web_for_timeout is None:
+            os.environ.pop("LAKE_RESEARCH_WEB", None)
+        else:
+            os.environ["LAKE_RESEARCH_WEB"] = prior_web_for_timeout
 
     # Offline guard for an online failure that cost a whole prod round every time:
     # llama.cpp expands a bounded-length string into explicit grammar repetitions and
@@ -227,9 +271,10 @@ def main() -> None:
     assert queries == ["primary research alternative mechanism"], queries
 
     search = FakeSearch()
+    web_model = RecordingModel()
     agent = DeepResearchAgent(
         search_client=search,
-        model_complete=_model,
+        model_complete=web_model,
         rag_retrieve=lambda *args, **kwargs: (200, {
             "log_id": "rag-1",
             "ideas": [{"text": "known prior", "applicability_conditions": "bounded budget"}],
@@ -241,6 +286,10 @@ def main() -> None:
     assert "source-grounded" not in response.report.lower()  # report is concrete, not a refusal
     assert "https://arxiv.org/abs/2401.00001" in response.report
     assert search.queries, "the agent must independently query the web even with RAG priors"
+    assert agent._model is llm.QWEN_35B
+    for op in ("research_plan", "research_synthesis"):
+        assert web_model.kwargs[op]["model"] is llm.QWEN_35B
+        assert web_model.kwargs[op]["timeout"] == DEFAULT_RESEARCH_LLM_TIMEOUT_S
 
     degraded = DeepResearchAgent(
         search_client=FakeSearch(), model_complete=_model,
@@ -272,7 +321,13 @@ def main() -> None:
         search_client=None, model_complete=graph_only_model,
         rag_retrieve=lambda *args, **kwargs: (200, {
             "log_id": "rag-graph-only",
-            "ideas": [{"text": "prior idea", "applicability_conditions": "bounded budget"}],
+            "ideas": [{
+                "text": "prior idea", "applicability_conditions": "bounded budget",
+                "theses": [{
+                    "text": "prior thesis mechanism", "title": "Prior paper",
+                    "url": "https://example.org/prior", "effect": "", "locator": "p.1",
+                }],
+            }],
         }),
     )
     graph_only_response = asyncio.run(graph_only.research(request))
@@ -295,6 +350,44 @@ def main() -> None:
     assert "LAKE_RESEARCH_WEB=0" in graph_only_synthesis_prompt
     assert "leave source_ids empty" in graph_only_synthesis_prompt
     assert "IDs of sources actually used" not in graph_only_synthesis_prompt
+    assert "https://example.org/prior" in graph_only_synthesis_prompt
+    assert "https://example.org/prior" in graph_only_response.report
+    assert "Untrusted Ideas Lake prior context" in graph_only_response.report
+    assert graph_only_response.rag_ideas == 1
+    synthesis_kwargs = graph_only_model.kwargs["research_synthesis"]
+    assert synthesis_kwargs["model"] is llm.QWEN_35B
+    assert synthesis_kwargs["timeout"] == DEFAULT_RESEARCH_LLM_TIMEOUT_S
+
+    # A transient malformed 35B synthesis must not erase the useful graph
+    # retrieval that already succeeded. The fallback exposes bounded priors as
+    # untrusted language context, still with no fabricated web source.
+    def failing_synthesis(prompt: str, *, op: str, **kwargs):
+        if op == "research_synthesis":
+            raise RuntimeError("malformed structured answer")
+        return _model(prompt, op=op, **kwargs)
+
+    graph_only_failed_synthesis = DeepResearchAgent(
+        search_client=None, model_complete=failing_synthesis,
+        rag_retrieve=lambda *args, **kwargs: (200, {
+            "log_id": "rag-graph-only-fallback",
+            "ideas": [{
+                "text": "retain this prior mechanism",
+                "applicability_conditions": "bounded budget",
+                "theses": [{
+                    "text": "retain this prior thesis", "title": "Prior source",
+                    "url": "https://example.org/retained",
+                }],
+            }],
+        }),
+    )
+    failed_synthesis_response = asyncio.run(
+        graph_only_failed_synthesis.research(request)
+    )
+    assert "synthesis_failed:RuntimeError" in failed_synthesis_response.warnings
+    assert "retain this prior mechanism" in failed_synthesis_response.report
+    assert "https://example.org/retained" in failed_synthesis_response.report
+    assert "Untrusted Ideas Lake prior context" in failed_synthesis_response.report
+    assert failed_synthesis_response.sources == []
 
     # 2. graph-only, dead RAG: with the web off, RAG is the only channel left: if
     # it also fails there is zero evidence of any kind, and 1.4's guard has to 503
@@ -309,6 +402,33 @@ def main() -> None:
         pass
     else:
         raise AssertionError("graph-only mode with a dead RAG must not look like an empty success")
+
+    graph_only_invalid_rag = DeepResearchAgent(
+        search_client=None, model_complete=_model,
+        rag_retrieve=lambda *args, **kwargs: (200, {
+            "log_id": "rag-invalid-ideas", "ideas": {"not": "a list"},
+        }),
+    )
+    try:
+        asyncio.run(graph_only_invalid_rag.research(request))
+    except ResearchError:
+        pass
+    else:
+        raise AssertionError("malformed RAG ideas must not look like evidence")
+
+    graph_only_blank_rag = DeepResearchAgent(
+        search_client=None, model_complete=_model,
+        rag_retrieve=lambda *args, **kwargs: (200, {
+            "log_id": "rag-blank-idea",
+            "ideas": [{"text": "", "applicability_conditions": ""}],
+        }),
+    )
+    try:
+        asyncio.run(graph_only_blank_rag.research(request))
+    except ResearchError:
+        pass
+    else:
+        raise AssertionError("blank RAG cards must not count as evidence")
 
     # 3. web enabled, RAG answers cleanly but has nothing, and the web returns zero
     # hits with no exception at all. Before 1.4 this was `rag_status == "empty"`
