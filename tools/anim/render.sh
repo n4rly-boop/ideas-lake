@@ -18,7 +18,9 @@ mkdir -p out
 
 all="write_path:WritePath read_path:ReadPath feedback_path:FeedbackPath
      idea_synthesis:IdeaSynthesis agent_lake:AgentLake system_map:SystemMap
-     system_map_wide:SystemMapWide"
+     system_map_wide:SystemMapWide
+     write_path_v:WritePathV read_path_v:ReadPathV feedback_path_v:FeedbackPathV
+     idea_synthesis_v:IdeaSynthesisV agent_lake_v:AgentLakeV"
 [ $# -gt 0 ] && all="$*"
 
 for pair in $all; do
@@ -29,9 +31,12 @@ for pair in $all; do
     # Не 1080p60: широкая полоса рисуется в своём разрешении, папка другая.
     mp4=$(ls -t media/videos/"$file"/*/*.mp4 | head -1)
 
-    # Ширина гифки: полоса ужимается до 850, остальные до 1000.
-    gifw=1000
-    [ "$file" = system_map_wide ] && gifw=850
+    # Ширина гифки: полоса 850, вертикальные 800, широкие 1000.
+    case "$file" in
+        system_map_wide) gifw=850 ;;
+        *_v) gifw=800 ;;
+        *) gifw=1000 ;;
+    esac
     cp "$mp4" "out/$file.mp4"
 
     # 20 fps. Задержка кадра в GIF хранится в сотых долях секунды и делится
