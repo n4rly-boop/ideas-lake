@@ -1,8 +1,13 @@
-"""Agent lake — knowledge/12-decisions-meetings.md:118-124
+"""Agent lake — lake/api/routes.py:246, lake/research/agent.py:192
 
-агентский RAG: ретрив → «хватило?» → веб-поиск → fetch найденного в озеро →
-переваривание → повторный ретрив → выдача в эволюцию.
-Из веба в эволюцию — только через озеро, прямого пути нет.
+агентский RAG: ретрив → «хватило?» → веб-поиск → развилка. Отчёт уходит
+вызывающему сразу (`routes.py:261`), а найденные статьи тем же вызовом
+встают в очередь ингеста (`research/agent.py:330-365`) — и находятся
+следующим вопросом.
+
+Ролик идёт по коду, а не по `12-decisions-meetings.md:118` («из веба в
+эволюцию — только через озеро»): встреча 4 требовала ждать переваривания,
+код отвечает сразу и кладёт в озеро параллельно.
 """
 
 from manim import *
@@ -79,33 +84,37 @@ class AgentLake(PipelineScene):
         self.wait(0.3)
         self.drop_notes(lake, who)
 
-        # Прямой путь «веб → эволюция» перечёркнут: озеро общее, второго
-        # приёма данных не будет.
-        skip = DashedLine(
-            pages[1].get_right() + DOWN * 0.2, RIGHT * 6.4 + DOWN * 0.6, dash_length=0.14
-        ).set_stroke(DIM, width=2)
-        bar = cross(0.62).move_to(skip.get_center())
+        # Развилка: ответ уходит в эволюцию сразу (`/research` синтезирует отчёт
+        # и возвращает его вызывающему, `api/routes.py:246-261`), а найденное
+        # тем же вызовом ставится в очередь ингеста (`research/agent.py:330-365`).
+        # Ждать озеро незачем: ингест идёт минутами, ответ нужен сейчас.
+        now = Arrow(
+            pages.get_right(), RIGHT * 6.9 + UP * 2.5, buff=0.2, stroke_width=2.6
+        ).set_color(IDEA)
         self.note(
-            "never straight\nto evolution",
-            skip,
+            "to evolution\nright away",
+            now,
             DOWN,
-            buff=0.3,
-            color=BAD,
-            size=18,
-            shift=LEFT * 0.35,
+            buff=0.24,
+            color=IDEA,
+            size=17,
+            shift=RIGHT * 0.45,
         )
-        self.play(Create(skip), run_time=0.6)
-        self.play(FadeIn(bar, scale=0.7), run_time=0.4)
-        self.wait(0.6)
-        self.play(FadeOut(skip, bar), run_time=0.4)
+        shot = pages.copy()
+        self.add(shot)
+        self.play(GrowArrow(now), run_time=0.6)
+        self.play(
+            shot.animate.move_to(RIGHT * 7.6 + UP * 2.5).set_opacity(0), run_time=0.9
+        )
+        self.remove(shot)
         self.drop_notes(lake, who)
 
-        # --- fetch: страницы падают в озеро и перевариваются --------------------
-        # Подпись сверху: снизу страницы пролетают прямо по ней.
-        self.note("fetch into the lake", pages, UP, buff=0.26, color=THESIS)
+        # --- и та же находка ложится в озеро — на будущее ------------------------
+        # Подпись сверху: слева стоит глобус, снизу страницы улетают в озеро.
+        self.note("and into the lake", pages, UP, buff=0.28, color=THESIS)
         self.play(
             pages.animate.scale(0.5).move_to(LAKE_C + UP * 0.1).set_opacity(0),
-            FadeOut(out, web),
+            FadeOut(out, web, now),
             run_time=1.3,
         )
         self.remove(pages)
@@ -117,7 +126,7 @@ class AgentLake(PipelineScene):
         squares = VGroup(*[thesis(0.17) for _ in range(3)])
         squares.arrange(RIGHT, buff=0.1).move_to(spot)
         fresh = idea(0.34).move_to(spot).set_z_index(-1)
-        self.note("ingest", rim, DOWN, buff=0.26, color=THESIS)
+        self.note("ingest, minutes", rim, DOWN, buff=0.26, color=THESIS)
         self.play(FadeIn(squares, scale=0.6), run_time=0.7)
         self.play(
             squares.animate.scale(0.75).move_to(spot),
@@ -127,10 +136,10 @@ class AgentLake(PipelineScene):
         self.wait(0.4)
         self.drop_notes(lake, who)
 
-        # --- повторный ретрив: теперь хватает -----------------------------------
+        # --- следующий вопрос: найденное уже лежит в озере ------------------------
         # В две строки: в один ряд подпись шире промежутка между озером и
         # агентом и садится либо на пунктир, либо на коробку.
-        self.note("retrieve\nagain", ask, UP, buff=0.35, color=DIM)
+        self.note("next\nquestion", ask, UP, buff=0.35, color=DIM)
         self.play(Flash(ask.get_center(), color=DIM, line_length=0.12), run_time=0.5)
         more = self.lift([fresh, nodes[2]], SLOTS[2:])
         self.wait(0.4)
@@ -138,7 +147,7 @@ class AgentLake(PipelineScene):
 
         full = VGroup(got, more)
         ok = check(0.7).next_to(full, RIGHT, buff=0.5)
-        self.note("enough", ok, UP, buff=0.26, color=IDEA)
+        self.note("reused, enough", ok, UP, buff=0.26, color=IDEA)
         self.play(FadeIn(ok), run_time=0.5)
         self.wait(0.5)
         self.drop_notes(lake, who)
