@@ -42,8 +42,8 @@ class AgentLake(PipelineScene):
         lake = self.note("lake", rim, UP, buff=0.26, color=IDEA, size=21)
         self.wait(0.5)
 
-        agent = box(2.4, 1.4).move_to(AGENT_C)
-        # Коробка — главный герой ролика: её имя висит до конца.
+        agent = robot(1.7).move_to(AGENT_C)
+        # Агент — главный герой ролика: его имя висит до конца.
         who = self.note("lake agent", agent, DOWN, buff=0.28, color=INK, size=21)
         self.play(Create(agent), run_time=0.8)
         self.wait(0.3)
@@ -53,8 +53,8 @@ class AgentLake(PipelineScene):
         ask = Arrow(
             agent.get_left(), rim.get_right(), buff=0.2, stroke_width=2.4
         ).set_color(DIM)
-        # Подпись поднята выше стрелки: она шире промежутка и на малом
-        # отступе заезжает на коробку агента.
+        # Подпись поднята выше стрелки: на малом отступе она садится
+        # на самого агента.
         self.note("retrieve", ask, UP, buff=0.55, color=DIM)
         self.play(GrowArrow(ask), run_time=0.7)
         got = self.lift(nodes[:2], SLOTS[:2])
@@ -137,8 +137,8 @@ class AgentLake(PipelineScene):
         self.drop_notes(lake, who)
 
         # --- следующий вопрос: найденное уже лежит в озере ------------------------
-        # В две строки: в один ряд подпись шире промежутка между озером и
-        # агентом и садится либо на пунктир, либо на коробку.
+        # В две строки: в один ряд подпись шире промежутка между озером
+        # и агентом и садится либо на пунктир, либо на агента.
         self.note("next\nquestion", ask, UP, buff=0.35, color=DIM)
         self.play(Flash(ask.get_center(), color=DIM, line_length=0.12), run_time=0.5)
         more = self.lift([fresh, nodes[2]], SLOTS[2:])
@@ -160,7 +160,10 @@ class AgentLake(PipelineScene):
             stroke_width=2.6,
         ).set_color(IDEA)
         self.note("to evolution", away, UP, buff=0.2, color=IDEA)
-        self.play(FadeOut(ok), GrowArrow(away), run_time=0.8)
+        # Галочка уходит раньше стрелки: они на одной высоте, и вместе
+        # стрелка идёт прямо сквозь неё.
+        self.play(FadeOut(ok), run_time=0.35)
+        self.play(GrowArrow(away), run_time=0.7)
         self.wait(1.2)
 
     def lift(self, src, slots):
