@@ -60,9 +60,12 @@ class ReadPath(PipelineScene):
         self.play(scan.animate.next_to(cells, DOWN, buff=0.12), run_time=1.2)
         self.play(FadeOut(scan), run_time=0.2)
 
+        # Число — внутри ячейки. Над ней оно не помещается: вертикальный
+        # зазор сетки 0.2, столько же занимает подпись с отступом, и она
+        # садится на ячейку выше.
         scores = VGroup(
             *[
-                label(s, 14, THESIS).next_to(cells[i], UP, buff=0.06)
+                label(s, 12, THESIS).move_to(cells[i])
                 for i, s in zip(HITS, SCORES)
             ]
         )
@@ -128,8 +131,11 @@ class ReadPath(PipelineScene):
 
         # dedup: два тезиса привели в одну идею. Подсвечиваем стрелки, а не
         # обводку круга: обводка занята trust.
+        # Слева от самой идеи, а не сбоку от пучка стрелок: пучок широкий,
+        # и подпись у его края ложится на вторую стрелку. В две строки —
+        # в одну она вылезает за борт.
         dup = VGroup(arrows[0], arrows[1])
-        dd = self.note("dedup by idea", dup, RIGHT, buff=0.24, color=THESIS, size=19)
+        dd = self.note("dedup\nby idea", ideas[0], LEFT, buff=0.3, color=THESIS, size=19)
         self.play(dup.animate.set_stroke(THESIS, width=3.4), run_time=0.7)
         self.wait(0.4)
         self.play(dup.animate.set_stroke(FAINT, width=2), FadeOut(dd), run_time=0.5)
@@ -169,10 +175,22 @@ class ReadPath(PipelineScene):
         ring = tick_ring(head.get_center(), 0.54, 0.88, IDEA, length=0.12)
         val = label("trust  0.88", 17, IDEA, MEDIUM).next_to(leaves, DOWN, buff=0.34)
 
-        self.note("result", card, UP, buff=0.28, color=INK, size=20)
+        # Карточек в стопке несколько: выдача — список идей, а не одна.
+        # Задние бледнее передней, иначе три одинаковых контура читаются
+        # рамкой в рамке.
+        stack = VGroup(
+            *[
+                box(3.0, 3.6, FAINT if k == 2 else DIM)
+                .move_to(card.get_center() + (RIGHT + UP) * 0.17 * k)
+                .set_z_index(-3)
+                for k in (2, 1)
+            ]
+        )
+
+        self.note("result", VGroup(card, stack), UP, buff=0.28, color=INK, size=20)
         self.play(
             FadeOut(cells, ideas, VGroup(*arrows), link, vals, nval),
-            Create(card),
+            LaggedStart(FadeIn(stack), Create(card), lag_ratio=0.4),
             run_time=1.1,
         )
         self.play(Create(head), run_time=0.7)

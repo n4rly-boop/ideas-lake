@@ -118,14 +118,14 @@ class SystemMap(PipelineScene):
         # --- один обход, от прогона ------------------------------------------
         self.play(
             Rotate(wheel, TAU, about_point=GIGA_C, rate_func=linear),
-            Indicate(giga, color=INK, scale_factor=1.0),
+            self.pulse(giga),
             run_time=1.2,
         )
         self.send([runlog(0.2) for _ in range(3)], into, back=True)
-        self.play(Indicate(evo, color=IDEA, scale_factor=1.0), run_time=0.6)
+        self.play(self.pulse(evo), run_time=0.6)
 
         self.send([label("?", 26, DIM) for _ in range(2)], pass_, back=True)
-        self.play(Indicate(agent, color=IDEA, scale_factor=1.0), run_time=0.6)
+        self.play(self.pulse(agent), run_time=0.6)
 
         # Озеро и веб — одним движением: агент спрашивает оба сразу.
         self.send([idea(0.16) for _ in range(2)], talk, back=True, extra=surf)
@@ -135,14 +135,20 @@ class SystemMap(PipelineScene):
         self.send([idea(0.18) for _ in range(2)], into)
         self.play(
             Rotate(wheel, TAU, about_point=GIGA_C, rate_func=linear),
-            Indicate(giga, color=INK, scale_factor=1.0),
+            self.pulse(giga),
             run_time=1.0,
         )
 
         self.send([runlog(0.2) for _ in range(3)], home, run_time=1.5)
-        # Статьи — отдельный канал: озеро наполняется и без прогона.
-        self.send([doc(0.3, 0.42, 3) for _ in range(2)], feed)
         self.wait(1.6)
+
+    def pulse(self, m, factor=1.07):
+        """Внимание к узлу — размером, а не цветом.
+
+        Indicate красит фигуру в свой цвет и возвращает обратно; на схеме,
+        где всё стоит неподвижно, это читается чёрной вспышкой.
+        """
+        return m.animate(rate_func=there_and_back).scale(factor)
 
     def link(self, a, b, color, both=False):
         """Стрелка схемы. Один вес и один размер наконечника на всю полосу."""
@@ -159,6 +165,10 @@ class SystemMap(PipelineScene):
     def tag(self, text, target, direction, buff, color, size):
         """Подпись схемы. Все висят с первого кадра до последнего."""
         return label(text, size, color).next_to(target, direction, buff=buff)
+
+    def thicken(self, path, width=4.6):
+        """Стрелка на время проезда толстеет, но цвета не меняет."""
+        return path.animate(rate_func=there_and_back).set_stroke(width=width)
 
     def send(self, tokens, path, back=False, run_time=1.1, extra=None):
         """Фишки едут по стрелке; сама стрелка на это время подсвечивается.
@@ -186,8 +196,8 @@ class SystemMap(PipelineScene):
                 *[MoveAlongPath(t, p, rate_func=rate) for t, p in zip(group, paths)],
                 lag_ratio=0.3,
             ),
-            Indicate(path, color=INK, scale_factor=1.0),
-            *([Indicate(extra, color=INK, scale_factor=1.0)] if extra else []),
+            self.thicken(path),
+            *([self.thicken(extra)] if extra else []),
             run_time=run_time,
         )
         self.play(FadeOut(group), run_time=0.25)
