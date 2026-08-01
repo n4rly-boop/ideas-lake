@@ -147,7 +147,8 @@ class AgentLake(PipelineScene):
 
         full = VGroup(got, more)
         ok = check(0.7).next_to(full, RIGHT, buff=0.5)
-        self.note("reused, enough", ok, UP, buff=0.26, color=IDEA)
+        # В две строки: в одну подпись шире галочки и заезжает на колонку идей.
+        self.note("reused,\nenough", ok, UP, buff=0.26, color=IDEA)
         self.play(FadeIn(ok), run_time=0.5)
         self.wait(0.5)
         self.drop_notes(lake, who)
