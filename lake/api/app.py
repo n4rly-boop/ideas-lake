@@ -48,6 +48,7 @@ import argparse
 import hmac
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -111,6 +112,60 @@ OPEN_ENDPOINTS: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/theses"), ("GET", "/theses/{thesis_id}"),
     ("GET", "/search"), ("GET", "/dial"),
 })
+
+
+# The two open reads that cost real work: both walk every thesis in the lake.
+# `/stats`, `/ideas` and friends are a page out of the store and are left alone.
+COSTLY_OPEN = ("/dial", "/search")
+# Per client, per minute. Generous for a room of people poking a dial by hand
+# (a person manages a handful a minute), useless for a loop. `LAKE_OPEN_RPM=0`
+# turns it off for a loopback-only port where it buys nothing.
+OPEN_RPM = int(os.environ.get("LAKE_OPEN_RPM", "30"))
+_BUCKETS: dict[str, list[float]] = {}
+
+
+def _key_ok(request: Request, expected: str) -> bool:
+    """One place, two callers: the gate below and the throttle exemption above."""
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    # compare_digest, not `==`: the comparison is over a secret and against whatever
+    # the caller sent. Both sides encoded, so a non-ASCII header cannot raise
+    # TypeError out of the middleware and become a 500.
+    return scheme.lower() == "bearer" and hmac.compare_digest(
+        token.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _throttle(request: Request) -> JSONResponse | None:
+    """`None` to let it through, a 429 to refuse. Only ever called for open reads.
+
+    A dict of timestamps per client, not a library: one process, one port, and the
+    thing being defended is CPU on this box. It is deliberately per PROCESS — behind
+    several workers a caller gets the limit times the worker count, which is still
+    orders of magnitude below what a loop wants. `time.monotonic`, not wall clock, so
+    a clock step cannot hand out a free window.
+    """
+    if OPEN_RPM <= 0 or not request.url.path.startswith(COSTLY_OPEN):
+        return None
+    now = time.monotonic()
+    who = request.client.host if request.client else "?"
+    seen = [t for t in _BUCKETS.get(who, ()) if now - t < 60.0]
+    if len(seen) >= OPEN_RPM:
+        _BUCKETS[who] = seen
+        # The wait is until the OLDEST call in the window ages out, which is when a
+        # slot actually frees — a flat "try in 60s" would be a number that lies.
+        retry = max(1, int(60.0 - (now - seen[0])) + 1)
+        return JSONResponse(status_code=429,
+                            content={"error": f"too many requests: {OPEN_RPM} per minute "
+                                              f"per client on this route without a key"},
+                            headers={"Retry-After": str(retry)})
+    seen.append(now)
+    _BUCKETS[who] = seen
+    # Nobody ever removes a client that stopped calling, so the dict would grow one
+    # entry per address forever. Swept only when it is big enough to matter, and only
+    # of entries whose whole window has aged out.
+    if len(_BUCKETS) > 4096:
+        for addr in [a for a, ts in _BUCKETS.items() if not ts or now - ts[-1] >= 60.0]:
+            del _BUCKETS[addr]
+    return None
 
 
 def _open_route_matchers(app: FastAPI) -> tuple[re.Pattern[str], ...]:
@@ -274,18 +329,26 @@ def create_app(mock: bool = False, warmup: bool = True, api_key=None,
         # self-check) without running `lifespan` sees, and "the key is missing" must
         # not read as "the lake is unreachable" for a route that was never behind it.
         if expected is False or is_open:
+            # Open reads are the only thing a stranger can reach, and two of them
+            # (`/dial`, `/search`) walk all 3 040 theses per call. On a port bound to
+            # the loopback that costs nothing; on a public one a single `while true`
+            # loop is enough to take the dial down, and the dial is the demo.
+            #
+            # A caller holding the key is never throttled — the operator is not the
+            # threat, and the first cut of this DID throttle them, because `is_open`
+            # returns before the header is ever looked at. The key has to be checked
+            # here explicitly for that reason, not reused from below.
+            if not (expected is False or _key_ok(request, expected)):
+                limited = _throttle(request)
+                if limited is not None:
+                    return limited
             return await call_next(request)
         if not expected:
             # Unreachable once `lifespan` has run, and 503 rather than "let it through"
             # if it ever is: a server with no key configured is broken, not open.
             return JSONResponse(status_code=503,
                                 content={"error": "server started without LAKE_API_KEY"})
-        scheme, _, token = request.headers.get("authorization", "").partition(" ")
-        # compare_digest, not `==`: the comparison is over a secret and against
-        # whatever the caller sent. Both sides encoded, so a non-ASCII header cannot
-        # raise TypeError out of the middleware and become a 500.
-        if scheme.lower() != "bearer" or not hmac.compare_digest(
-                token.encode("utf-8"), expected.encode("utf-8")):
+        if not _key_ok(request, expected):
             return JSONResponse(status_code=401, content={"error": "missing or wrong API key"},
                                 headers={"WWW-Authenticate": "Bearer"})
         return await call_next(request)
