@@ -384,6 +384,40 @@ async function run(host, label, fn) {
   }
 }
 
+/* §4.2: one disable-wrapper for every action button, so a double click cannot fire a
+   second `run()` (a second POST /retrieve into retrieve.jsonl, a second 35B judging
+   pass, a 409 on a phase whose slot the operator just took themselves). Reads the
+   button off the click event itself (`currentTarget`, not a captured variable) so the
+   same wrapper works whether `fn` is attached through `el()`'s onclick or assigned
+   directly. `finally` clears `disabled` on EVERY exit — success, an ApiError caught
+   inside `fn`'s own `run()`, or a plain throw `run()` never sees — because a wrapper
+   that only re-enables on the happy path is a button stuck grey forever the first time
+   the network drops, which is a new silent failure of its own. */
+function guard(fn) {
+  return async (event) => {
+    const btn = event.currentTarget;
+    btn.disabled = true;
+    try {
+      await fn(event);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+/* §4.2: `window.confirm()` blocks the page's own JS thread synchronously until
+   answered — including, it turns out, the very call stack that opened it. A plain
+   `confirm(msg)` called directly inside a click handler never lets that handler's own
+   dispatch finish first, which is invisible to a human clicking the button but freezes
+   an automated driver that invokes the click and then separately waits for the dialog
+   to appear (`tools/e2e_console.py`'s `wait_for_dialog`/`handle_dialog` — the click
+   itself never returns control, so the wait is never reached). Deferred one macrotask
+   (a bare `setTimeout(0)`, not a microtask — a `Promise.resolve()` await still resolves
+   inside the SAME script turn and would not help): the click finishes dispatching, is a
+   real 0ms delay from a human's perspective, and the dialog then opens on its own turn
+   where a driver watching for it can see it. */
+const askConfirm = (msg) => new Promise((resolve) => setTimeout(() => resolve(confirm(msg)), 0));
+
 /* ----------------------------------------------------------------- key gate */
 
 function openGate(message) {
@@ -395,7 +429,7 @@ function openGate(message) {
   $("#key-input").focus();
 }
 $("#key-btn").onclick = () => openGate("Ключ доступа к озеру.");
-$("#key-save").onclick = async () => {
+$("#key-save").onclick = guard(async () => {
   const value = $("#key-input").value.trim();
   if (!value) { $("#key-msg").textContent = "пустой ключ — сервер такой не примет"; return; }
   API_KEY = value;
@@ -414,7 +448,7 @@ $("#key-save").onclick = async () => {
   AUTH = "open";
   startStrip();
   render();
-};
+});
 $("#key-input")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("#key-save").click(); });
 
 $("#theme-btn").onclick = () => {
@@ -568,43 +602,79 @@ function answerBlock(answer, label, rewriteAsked) {
           "выдача пуста, и это ДАННЫЕ: живое хранилище ответило нулём идей (не 503)"));
 }
 
-view("retrieve", "Retrieve", (host) => {
+view("retrieve", "Retrieve", (host, ctx) => {
   const out = el("div"), statusHost = el("div");
-  const q = el("input", { class: "grow", placeholder: "как задача или как решение…", value: "" });
-  const k = el("input", { type: "number", min: 1, max: 50, value: 5 });
-  const budget = el("input", { type: "number", min: 1, placeholder: "по умолчанию" });
-  const runId = el("input", { placeholder: "run_id (в трейс)" });
-  const rewrite = el("input", { type: "checkbox", checked: "" });
+  const p = ctx.params;
+  const q = el("input", { class: "grow", placeholder: "как задача или как решение…", value: p.q || "" });
+  const k = el("input", { type: "number", min: 1, max: 50, value: Number(p.k) || 5 });
+  const budget = el("input", { type: "number", min: 1, placeholder: "по умолчанию", value: p.budget || "" });
+  const runId = el("input", { placeholder: "run_id (в трейс)", value: p.run_id || "" });
+  const rewrite = el("input", { type: "checkbox", checked: p.rewrite === "0" ? null : true });
+
+  function syncParams() {
+    setParams({
+      q: q.value.trim() || undefined,
+      k: (Number(k.value) || 5) !== 5 ? k.value : undefined,
+      budget: budget.value || undefined,
+      run_id: runId.value.trim() || undefined,
+      rewrite: rewrite.checked ? undefined : "0",
+    });
+  }
+  for (const [field, evt] of [[q, "input"], [k, "input"], [budget, "input"], [runId, "input"],
+                               [rewrite, "change"]])
+    field.addEventListener(evt, syncParams);
+
+  // Pure render of an already-answered call — no `api()` call, so the mount-time restore
+  // path below can call it on a cached `res` without a request.
+  function renderAnswer(res) {
+    const totalMs = res.reduce((s, [, a]) => s + a.cost.wall_ms, 0);
+    // Each arm's own code, checked rather than assumed: nothing in the protocol says two
+    // POSTs to the same route must answer with the same status. Print one only if they
+    // in fact agree; otherwise show both, so a mixed result cannot read as a clean one.
+    const codes = new Set(res.map(([, a]) => codeOf(a)));
+    setStatus(statusHost, "ok", [...codes].join("/"),
+      `${res.length} вызов(а) · ${totalMs.toFixed(0)} мс суммарно`);
+    out.replaceChildren(el("div", { class: res.length > 1 ? "ab" : "" },
+      ...res.map(([rw, a]) => answerBlock(a, rw ? "rewrite on" : "rewrite off", rw))));
+  }
 
   async function fire(both) {
     const query = q.value.trim();
     if (!query) { setStatus(statusHost, "warn", null, "пустой запрос — сервер ответит 400"); return; }
+    syncParams();
     const base = { query, k: Number(k.value) || 5 };
     if (budget.value) base.budget = Number(budget.value);
     if (runId.value.trim()) base.run_id = runId.value.trim();
     const arms = both ? [true, false] : [rewrite.checked];
+    // §4.1 (defect 1): on `ctx.state`, not a local `let seq = 0` — a per-mount counter
+    // starts back at 0 every time this tab is left and reopened, so okSeq/errSeq minted in
+    // different mounts could tie or compare backwards (see the dial view for the full story).
+    const mine = ctx.state.seq = (ctx.state.seq || 0) + 1;
+    // §4.1: the params THIS call answers — see the dial view for why this has to travel
+    // with the result rather than being re-read off the fields later.
+    const reqParams = { query, k: base.k, arms: arms.slice() };
     out.replaceChildren();
     await run(statusHost, both ? "гоню оба плеча…" : "запрос в озеро…", async () => {
-      const res = [];
-      for (const rw of arms) res.push([rw, await api("/retrieve", { method: "POST", body: { ...base, rewrite: rw } })]);
-      // A 200 body of the wrong shape (captive portal, transparent proxy) must throw
-      // here, not surface as a spinner stuck forever after the caller already moved on.
-      for (const [, a] of res) {
-        if (!a || typeof a !== "object" || !Array.isArray(a.ideas) || !a.cost
-            || typeof a.cost.wall_ms !== "number" || typeof a.cost.tokens_in !== "number"
-            || typeof a.cost.tokens_out !== "number")
-          throw new Error("ответ /retrieve — не {ideas, cost}: " + JSON.stringify(a).slice(0, 200));
+      try {
+        const res = [];
+        for (const rw of arms) res.push([rw, await api("/retrieve", { method: "POST", body: { ...base, rewrite: rw } })]);
+        // A 200 body of the wrong shape (captive portal, transparent proxy) must throw
+        // here, not surface as a spinner stuck forever after the caller already moved on.
+        for (const [, a] of res) {
+          if (!a || typeof a !== "object" || !Array.isArray(a.ideas) || !a.cost
+              || typeof a.cost.wall_ms !== "number" || typeof a.cost.tokens_in !== "number"
+              || typeof a.cost.tokens_out !== "number")
+            throw new Error("ответ /retrieve — не {ideas, cost}: " + JSON.stringify(a).slice(0, 200));
+        }
+        renderAnswer(res);
+        ctx.state.res = res;   // §2.2: cached for the mount-time restore path below
+        ctx.state.reqParams = reqParams; ctx.state.okSeq = mine;
+        return res;
+      } catch (err) {
+        // §4.1 regime 2: a failed call must read back as failed after a tab switch.
+        ctx.state.err = err; ctx.state.errParams = reqParams; ctx.state.errSeq = mine;
+        throw err;
       }
-      const totalMs = res.reduce((s, [, a]) => s + a.cost.wall_ms, 0);
-      // Each arm's own code, checked rather than assumed: nothing in the protocol says two
-      // POSTs to the same route must answer with the same status. Print one only if they
-      // in fact agree; otherwise show both, so a mixed result cannot read as a clean one.
-      const codes = new Set(res.map(([, a]) => codeOf(a)));
-      setStatus(statusHost, "ok", [...codes].join("/"),
-        `${res.length} вызов(а) · ${totalMs.toFixed(0)} мс суммарно`);
-      out.replaceChildren(el("div", { class: res.length > 1 ? "ab" : "" },
-        ...res.map(([rw, a]) => answerBlock(a, rw ? "rewrite on" : "rewrite off", rw))));
-      return res;
     });
   }
 
@@ -613,17 +683,39 @@ view("retrieve", "Retrieve", (host) => {
       el("h2", {}, "POST /retrieve"),
       el("p", { class: "help" }, "Запрос эволюции → идеи с провенансом. Recall-first: отказа по низкому "
         + "скору нет, выдача дозаполняется до k — поэтому смотри via и cosine, а не score."),
+      ignoredRunNote(ctx),
       el("div", { class: "row" },
         el("label", { class: "f grow" }, "запрос", q),
         el("label", { class: "f" }, "k", k),
         el("label", { class: "f" }, "budget (ток.)", budget),
         el("label", { class: "f" }, "run_id", runId),
         el("label", { class: "cb" }, rewrite, "rewrite"),
-        el("button", { class: "act", onclick: () => fire(false) }, "Спросить озеро"),
-        el("button", { class: "ghost", onclick: () => fire(true) }, "Оба плеча рядом")),
+        el("button", { class: "act", onclick: guard(() => fire(false)) }, "Спросить озеро"),
+        el("button", { class: "ghost", onclick: guard(() => fire(true)) }, "Оба плеча рядом")),
       statusHost),
     out);
   q.focus();
+  // §2.2: a previous answer lives on this tab's own VIEW_STATE entry — redraw it, no
+  // request. `run=1` is deliberately NOT honoured here (§9.3): a fired /retrieve writes a
+  // row to retrieve.jsonl, the A/B measurement, so this tab never fires on its own.
+  const curForMatch = { query: p.q || "", k: Number(p.k) || 5, rewrite: p.rewrite !== "0" };
+  if (ctx.state.errSeq && ctx.state.errSeq > (ctx.state.okSeq || 0)) {
+    // §4.1 regime 2: the last call on this tab failed — show that again, not the green
+    // line of a query that happened to succeed before it.
+    failed(statusHost, ctx.state.err);
+    const ep = ctx.state.errParams;
+    if (ep && (ep.query !== curForMatch.query || ep.k !== curForMatch.k
+        || !ep.arms.includes(curForMatch.rewrite)))
+      statusHost.append(el("div", { class: "status warn" },
+        `неудачным был запрос «${ep.query}» (k=${ep.k}) — текущий запрос другой, жми «Спросить озеро» для него`));
+  } else if (ctx.state.res) {
+    renderAnswer(ctx.state.res);
+    const rp = ctx.state.reqParams;
+    if (rp && (rp.query !== curForMatch.query || rp.k !== curForMatch.k
+        || !rp.arms.includes(curForMatch.rewrite)))
+      markAnswerStale(statusHost,
+        `показан ответ на прежний запрос «${rp.query}» (k=${rp.k}) — текущий запрос другой, жми «Спросить озеро» для него`);
+  }
 });
 
 /* --------------------------------------------------------------- 1b. циферблат */
@@ -643,7 +735,33 @@ let GRAPH_CACHE = null;
 /* Leaf texts, filled one hover at a time (see the hover card in the dial view). A thesis
    is immutable, so a text read once is a text that stays right. */
 const LEAF_TEXT = new Map();
-let leafTimer = null;
+
+/* §2.2: one object per TAB, never per mount. `render()` hands this to `mount(host, ctx)`
+   as `ctx.state` and never clears it — a view that stashes its last response body (and
+   its query params, and its own timer ids) here survives a tab switch instead of losing
+   everything the moment `render()` wipes `#main` (§0.2). Kept in a plain module-level
+   `Map`, next to `GRAPH_CACHE`, and NOT in `sessionStorage`: a `/dial` answer alone is
+   ~285 KB, and `sessionStorage` would mean putting the lake's own data into browser
+   storage — something nothing else in this console does. */
+const VIEW_STATE = new Map();
+function stateFor(tab) {
+  if (!VIEW_STATE.has(tab)) VIEW_STATE.set(tab, {});
+  return VIEW_STATE.get(tab);
+}
+
+/* §4.1 (restoration-from-VIEW_STATE defect): a mount-time redraw of `ctx.state` is a redraw
+   of whatever request produced it — which is not necessarily the request the fields/address
+   show right now (the field was edited after the answer came back, or a later call on the
+   same tab failed). Green can only mean "this is the answer to what's on screen"; anything
+   else has to say in words which request it is actually showing. `markAnswerStale` demotes
+   the already-rendered status box (never re-creates it — that would erase whatever the
+   view appended after its own `setStatus`, e.g. the dial's graph-coverage line) and adds
+   one line naming the mismatch. */
+function markAnswerStale(statusHost, message) {
+  const box = statusHost.firstElementChild;
+  if (box) { box.classList.remove("ok"); if (!box.classList.contains("err")) box.classList.add("warn"); }
+  statusHost.insertBefore(el("div", { class: "status warn" }, message), box ? box.nextSibling : null);
+}
 
 async function loadGraph(force = false) {
   const fresh = GRAPH_CACHE && LAST_STATS
@@ -722,80 +840,148 @@ function nearestMark(marks, x, y) {
   return { mark, score };
 }
 
-view("dial", "Гипотеза", (host) => {
+view("dial", "Гипотеза", (host, ctx) => {
   const statusHost = el("div"), wrap = el("div", { class: "graphwrap" });
   const legendHost = el("div"), listHost = el("div"), ideasHost = el("div");
+  const p = ctx.params;
   const q = el("textarea", { class: "grow", rows: 2, placeholder:
     "гипотеза словами: «шедулить мутации по тому, как часто потомок бьёт родителя»",
     style: "width:100%;background:var(--surface-2);border:1px solid var(--hair);"
          + "border-radius:8px;padding:10px;color:var(--ink);font:inherit;resize:vertical" });
-  const k = el("input", { type: "number", min: 1, max: 50, value: 12 });
+  // `<textarea>` has no `value` ATTRIBUTE — unlike `<input>`, the browser only reads its
+  // initial value off child text content, so `el()`'s `setAttribute("value", …)` above
+  // would have been silently ignored and every restored/linked hypothesis would render
+  // as an empty box. Set as the DOM property instead, which is what actually works.
+  q.value = p.q || "";
+  const k = el("input", { type: "number", min: 1, max: 50, value: Number(p.k) || 12 });
   // 30 by default because the top ideas all sit in a thin band of cosine — their radii
   // are nearly equal, and that ring only fits so many circles before they overlap.
-  const top = el("input", { type: "number", min: 5, max: 300, value: 30 });
-  const withGraph = el("input", { type: "checkbox", checked: true });
-  const withLeaves = el("input", { type: "checkbox", checked: true });
-  let generation = 0;
+  const top = el("input", { type: "number", min: 5, max: 300, value: Number(p.top) || 30 });
+  const withGraph = el("input", { type: "checkbox", checked: p.graph === "0" ? null : true });
+  const withLeaves = el("input", { type: "checkbox", checked: p.leaves === "0" ? null : true });
+
+  // §2.2: the address mirrors the form so the view is a link, not just a screen. Called
+  // on every field change AND at the top of `fire()` (a button click "тоже обновляет
+  // адрес" even if no field's own listener already caught the value) — `replaceState`
+  // only, so this never remounts the view out from under the SVG it is about to draw.
+  function syncParams() {
+    setParams({
+      q: q.value.trim() || undefined,
+      k: (Number(k.value) || 12) !== 12 ? k.value : undefined,
+      top: (Number(top.value) || 30) !== 30 ? top.value : undefined,
+      graph: withGraph.checked ? undefined : "0",
+      leaves: withLeaves.checked ? undefined : "0",
+    });
+  }
+  for (const [field, evt] of [[q, "input"], [k, "input"], [top, "input"],
+                               [withGraph, "change"], [withLeaves, "change"]])
+    field.addEventListener(evt, syncParams);
+
+  // Everything the picture needs, given an already-fetched `/dial` answer and an already
+  // -loaded (or already-failed) graph read — no `api()` call anywhere in here. Shared by
+  // a live `fire()` and by the mount-time restore below, which is what makes "switch tabs
+  // and back redraws without a request" true rather than aspirational.
+  function renderAll(data, graph, graphError, ideasInfo) {
+    // `total` is the server's count of index rows, not points.length: the two differing
+    // would mean the payload lost rows on the way, and that must not read as a thinner lake.
+    const lost = data.total !== data.points.length;
+    setStatus(statusHost, lost ? "warn" : "ok", codeOf(data),
+      lost ? `сервер насчитал ${fmt(data.total)} листьев, доехало ${fmt(data.points.length)} — `
+             + "картинка неполная, числам ниже верить нельзя"
+           : `${fmt(data.total)} листьев расставлены: ближайший ${data.cosine.max.toFixed(3)}, `
+             + `медиана озера ${data.cosine.median.toFixed(3)}`);
+
+    let drawn = null;
+    try {
+      drawn = drawDial(data, graph);
+    } catch (err) {
+      // A throw here used to mean an empty box under a green 200 — same lie as an empty
+      // list for a broken store.
+      wrap.replaceChildren();
+      setStatus(statusHost, "err", null, "отрисовка упала: " + err.message);
+      return;
+    }
+    // The dial's own line first, then what the graph layer did or did not manage: two
+    // reads, two verdicts, and the second must not be able to overwrite the first.
+    // Defect 2: all of this is gated on the LIVE checkbox. `graph`/`graphError` here are
+    // whatever ctx.state cached from whichever fetch produced `data` — possibly one where
+    // "идеи и рёбра" was checked differently than it is right now. If the box says off,
+    // the picture already draws no idea layer (above) and there is nothing honest to say
+    // about it. If the box says on but nothing was ever fetched for it (a cached answer
+    // from a graph-off request, or the very first restore of an old answer), the coverage
+    // line above cannot be printed — no drawn.ideas exists — so say in words that this
+    // picture predates the current setting, not green.
+    if (!withGraph.checked) {
+      // nothing to report — checkbox and picture already agree (no layer, no claim about one)
+    } else if (graphError) {
+      statusHost.append(el("div", { class: "status " + (graphError.status === 503 ? "err" : "warn") },
+        el("span", { class: "code" }, graphError.status || "—"),
+        `${explain(graphError)} — идеи и рёбра не прочитаны. Циферблат считается из индекса `
+        + "и от графа не зависит."));
+    } else if (drawn && drawn.ideas) {
+      statusHost.append(el("div", { class: "status" },
+        `идей на картинке ${drawn.ideas} из ${fmt(graph.ideaTotal)}, рёбер между ними `
+        + `${fmt(drawn.inside)}; наружу из показанных ведут ещё ${fmt(drawn.outside)} — `
+        + "окрестность продолжается за кадром, всего в озере "
+        + `${fmt(graph.edgeTotal)} рёбер`
+        + (drawn.offIdea
+            ? `. Попаданий на своей идее ${drawn.onIdea}, на листе ${drawn.offIdea}: `
+              + "их идея не вошла в показанные по косинусу лучшего листа"
+            : "")));
+    } else if (!graph) {
+      statusHost.append(el("div", { class: "status warn" },
+        `«идеи и рёбра» включены, но показанный ответ прочитан без графа — картинка отвечает `
+        + "прежней настройке, жми «Разложить» заново, чтобы прочитать идеи и рёбра"));
+    }
+    renderHits(data);
+    if (ideasInfo) renderIdeasBlock(ideasInfo);
+  }
 
   async function fire() {
     const text = q.value.trim();
     if (!text) { setStatus(statusHost, "warn", null, "пустой q → 400"); return; }
-    const mine = ++generation;
-    const stale = () => mine !== generation;
+    syncParams();
+    // §4.1 (defect 1): the counter lives on `ctx.state`, not a local closure variable — a
+    // `let` here starts back at 0 on every mount, so an okSeq/errSeq minted by mount 1 and
+    // one minted by mount 2 could collide (both "1") or compare backwards, and the ranking
+    // below (`errSeq > okSeq`) would pick the wrong outcome after a tab switch. `ctx.state`
+    // is the one thing that survives a mount (§2.2), so the counter rides there instead.
+    const mine = ctx.state.seq = (ctx.state.seq || 0) + 1;
+    const stale = () => mine !== ctx.state.seq;
+    // §4.1: the params THIS call answers, stashed with whatever it returns — a later mount
+    // compares them against the fields/address instead of trusting that a cached body still
+    // matches whatever text happens to sit in the textarea by then.
+    const reqParams = { q: text, k: Number(k.value) || 12 };
     await run(statusHost, "считаю косинус до каждого листа…", async () => {
-      const data = await api(`/dial?q=${encodeURIComponent(text)}&k=${Number(k.value) || 12}`);
-      if (stale()) return data;
-
-      // The graph is a separate read and a separate failure: a dead Neo4j costs the idea
-      // layer and says so, while the dial — which is index-only — still stands.
-      let graph = null, graphError = null;
-      if (withGraph.checked) {
-        busy(statusHost, "читаю идеи и рёбра…");
-        try { graph = await loadGraph(); }
-        catch (err) { if (!(err instanceof ApiError)) throw err; graphError = err; }
-        if (stale()) return data;
-      }
-
-      // `total` is the server's count of index rows, not points.length: the two differing
-      // would mean the payload lost rows on the way, and that must not read as a thinner lake.
-      const lost = data.total !== data.points.length;
-      setStatus(statusHost, lost ? "warn" : "ok", codeOf(data),
-        lost ? `сервер насчитал ${fmt(data.total)} листьев, доехало ${fmt(data.points.length)} — `
-               + "картинка неполная, числам ниже верить нельзя"
-             : `${fmt(data.total)} листьев расставлены: ближайший ${data.cosine.max.toFixed(3)}, `
-               + `медиана озера ${data.cosine.median.toFixed(3)}`);
-
-      let drawn = null;
       try {
-        drawn = drawDial(data, graph);
-      } catch (err) {
-        // A throw here used to mean an empty box under a green 200 — same lie as an empty
-        // list for a broken store.
-        wrap.replaceChildren();
-        setStatus(statusHost, "err", null, "отрисовка упала: " + err.message);
+        const data = await api(`/dial?q=${encodeURIComponent(text)}&k=${Number(k.value) || 12}`);
+        if (stale()) return data;
+
+        // The graph is a separate read and a separate failure: a dead Neo4j costs the idea
+        // layer and says so, while the dial — which is index-only — still stands.
+        let graph = null, graphError = null;
+        if (withGraph.checked) {
+          busy(statusHost, "читаю идеи и рёбра…");
+          try { graph = await loadGraph(); }
+          catch (err) { if (!(err instanceof ApiError)) throw err; graphError = err; }
+          if (stale()) return data;
+        }
+
+        const ideasInfo = await loadIdeas(data, stale);
+        if (stale()) return data;
+        renderAll(data, graph, graphError, ideasInfo);
+        // Cached for the mount-time restore path (§2.2): the whole point is that leaving
+        // this tab and coming back redraws THIS, not a fresh /dial + graph + N /ideas reads.
+        ctx.state.data = data; ctx.state.graph = graph; ctx.state.graphError = graphError;
+        ctx.state.ideas = ideasInfo; ctx.state.reqParams = reqParams; ctx.state.okSeq = mine;
         return data;
+      } catch (err) {
+        // §4.1 regime 2: a failed call must read back as failed after a tab switch, not as
+        // the green line of whichever hypothesis last succeeded. `stale()` keeps a
+        // superseded request's late failure from clobbering a newer request's own outcome.
+        if (!stale()) { ctx.state.err = err; ctx.state.errParams = reqParams; ctx.state.errSeq = mine; }
+        throw err;
       }
-      // The dial's own line first, then what the graph layer did or did not manage: two
-      // reads, two verdicts, and the second must not be able to overwrite the first.
-      if (graphError) {
-        statusHost.append(el("div", { class: "status " + (graphError.status === 503 ? "err" : "warn") },
-          el("span", { class: "code" }, graphError.status || "—"),
-          `${explain(graphError)} — идеи и рёбра не прочитаны. Циферблат считается из индекса `
-          + "и от графа не зависит."));
-      } else if (drawn && drawn.ideas) {
-        statusHost.append(el("div", { class: "status" },
-          `идей на картинке ${drawn.ideas} из ${fmt(graph.ideaTotal)}, рёбер между ними `
-          + `${fmt(drawn.inside)}; наружу из показанных ведут ещё ${fmt(drawn.outside)} — `
-          + "окрестность продолжается за кадром, всего в озере "
-          + `${fmt(graph.edgeTotal)} рёбер`
-          + (drawn.offIdea
-              ? `. Попаданий на своей идее ${drawn.onIdea}, на листе ${drawn.offIdea}: `
-                + "их идея не вошла в показанные по косинусу лучшего листа"
-              : "")));
-      }
-      renderHits(data);
-      loadIdeas(data, stale);
-      return data;
     });
   }
 
@@ -840,13 +1026,19 @@ view("dial", "Гипотеза", (host) => {
     }
     gRings.append(mk("circle", { cx, cy, r: R, fill: "none", stroke: "var(--axis)" }));
     ringLabel(R, lo.toFixed(3));
+    // Single source of truth for "is the idea layer actually going to be drawn this pass":
+    // the checkbox alone lies after a tab switch (cached `graph` from a graph-off fetch),
+    // and `graph` alone lies too (stale cache from BEFORE the checkbox was unticked). Every
+    // place that used to repeat `withGraph.checked && graph` — the legend caption, the leaf
+    // dimming below, and the idea/edge draw itself — reads this one flag instead.
+    const drawIdeas = Boolean(withGraph.checked && graph);
     legendHost.replaceChildren(el("div", { class: "legend wrap" },
       el("span", { class: "dim" }, "кольца:"),
       ...rings.reverse().map(([value, label]) => el("span", {},
         `${label} ${value.toFixed(3)} — ближе ${fmt(share(value))} из ${fmt(data.total)}`)),
       el("span", {}, `дальний край ${lo.toFixed(3)}`),
       el("span", { class: "dim" }, "· радиус = косинус, цвет = он же"),
-      el("span", { class: "dim" }, graph
+      el("span", { class: "dim" }, drawIdeas
         ? "· крупные узлы — идеи, линии между ними — рёбра co-citation; угол задают только "
           + "они, расстояния в нём нет"
         : "· угол ничего не значит")));
@@ -861,8 +1053,10 @@ view("dial", "Гипотеза", (host) => {
     const hitIds = new Set(data.hits.map((hit) => hit.thesis_id));
     if (withLeaves.checked) {
       // Leaves step back when the idea layer is on: 3 000 dots at full strength read as
-      // the subject of the picture, and there the subject is the graph.
-      const leafAlpha = graph ? 0.3 : 0.72, leafR = graph ? 1.5 : 1.9;
+      // the subject of the picture, and there the subject is the graph. Gated on `drawIdeas`,
+      // not on `graph` alone — a cached graph from an earlier fetch must not dim the leaves
+      // for a layer that (per the checkbox) isn't actually drawn this pass.
+      const leafAlpha = drawIdeas ? 0.3 : 0.72, leafR = drawIdeas ? 1.5 : 1.9;
       for (const p of data.points) {
         if (hitIds.has(p.thesis_id)) continue;
         const r = radius(p.cosine);
@@ -879,7 +1073,7 @@ view("dial", "Гипотеза", (host) => {
     // which nothing in retrieval ever compares against.
     let shownIdeas = 0, inside = 0, outside = 0;
     const ideaAt = new Map();   // idea_id -> [x, y] once the ring layout has run
-    if (graph) {
+    if (drawIdeas) {
       const best = new Map();
       for (const p of data.points) {
         const seen = best.get(p.idea_id);
@@ -1027,8 +1221,11 @@ view("dial", "Гипотеза", (host) => {
       // dial itself is still index-only.
       if (best.leaf && !LEAF_TEXT.has(best.leaf)) {
         const which = best.leaf;
-        clearTimeout(leafTimer);
-        leafTimer = setTimeout(async () => {
+        // Lives on the TAB's own state, not a module-level variable: §4.2 requires this
+        // timer to die when the operator leaves the dial, and a variable shared by every
+        // future mount can only ever be cleared by whichever mount's closure created it.
+        clearTimeout(ctx.state.leafTimer);
+        ctx.state.leafTimer = setTimeout(async () => {
           let text;
           try { text = (await api(`/theses/${encodeURIComponent(which)}`)).text; }
           catch (err) { text = `${which}\n(текст не прочитан: ${explain(err)})`; }
@@ -1074,19 +1271,17 @@ view("dial", "Гипотеза", (host) => {
           el("td", { class: "num mono" }, hit.vec_rank ?? "—")))))));
   }
 
-  /* The dial itself never touches the graph. The idea cards do — so a dead graph costs
-     the cards and says so, instead of taking the whole answer down with it. */
-  async function loadIdeas(data, stale) {
-    const ids = [];
-    for (const hit of data.hits) if (!ids.includes(hit.idea_id)) ids.push(hit.idea_id);
-    ideasHost.replaceChildren(el("p", { class: "help" }, `Идеи-родители найденных листьев: `
-      + `${ids.length} на ${data.hits.length} попаданий. Поиск идёт по тезисам, поэтому это `
-      + `идея ближайшего листа, а не ближайшая по своему тексту идея.`));
-    let failure = null;
-    const bodies = await pool(ids, (id) => api(`/ideas/${encodeURIComponent(id)}`)
-      .catch((err) => { failure = failure || err; return null; }));
-    if (stale()) return;
-    const found = new Map(bodies.filter(([, body]) => body));
+  function ideasIntro(ids, hitsLen) {
+    return el("p", { class: "help" }, `Идеи-родители найденных листьев: `
+      + `${ids.length} на ${hitsLen} попаданий. Поиск идёт по тезисам, поэтому это `
+      + `идея ближайшего листа, а не ближайшая по своему тексту идея.`);
+  }
+
+  // Pure render of what `loadIdeas` fetched -- no `api()` call, so the mount-time restore
+  // path below can call it directly on a cached `ideasInfo` without a request.
+  function renderIdeasBlock(info) {
+    const { ids, found, failure, hitsLen } = info;
+    ideasHost.replaceChildren(ideasIntro(ids, hitsLen));
     if (failure) {
       ideasHost.append(el("div", { class: "status " + (failure.status === 503 ? "err" : "warn") },
         el("span", { class: "code" }, failure.status || "—"),
@@ -1102,6 +1297,22 @@ view("dial", "Гипотеза", (host) => {
     }
   }
 
+  /* The dial itself never touches the graph. The idea cards do -- so a dead graph costs
+     the cards and says so, instead of taking the whole answer down with it. Returns the
+     fetched bodies (not just side-effects) so `fire()` can cache them for the mount-time
+     restore path -- the whole reason this used to be void. */
+  async function loadIdeas(data, stale) {
+    const ids = [];
+    for (const hit of data.hits) if (!ids.includes(hit.idea_id)) ids.push(hit.idea_id);
+    ideasHost.replaceChildren(ideasIntro(ids, data.hits.length));
+    let failure = null;
+    const bodies = await pool(ids, (id) => api(`/ideas/${encodeURIComponent(id)}`)
+      .catch((err) => { failure = failure || err; return null; }));
+    if (stale()) return null;
+    const found = new Map(bodies.filter(([, body]) => body));
+    return { ids, found, failure, hitsLen: data.hits.length };
+  }
+
   host.replaceChildren(
     el("div", { class: "panel" },
       el("h2", {}, "GET /dial — гипотеза против всего озера"),
@@ -1111,11 +1322,11 @@ view("dial", "Гипотеза", (host) => {
       el("div", { class: "row" }, el("label", { class: "f grow" }, "гипотеза", q),
         el("label", { class: "f" }, "k", k),
         el("label", { class: "f" }, "идей", top),
-        el("button", { class: "act", onclick: fire }, "Разложить")),
+        el("button", { class: "act", onclick: guard(fire) }, "Разложить")),
       el("div", { class: "row" },
         el("label", { class: "cb" }, withGraph, "идеи и рёбра"),
         el("label", { class: "cb" }, withLeaves, "точки-листья"),
-        el("button", { class: "ghost sm", onclick: async () => {
+        el("button", { class: "ghost sm", onclick: guard(async () => {
           // The graph is cached per page load; ingest running underneath is exactly when
           // an operator needs to say "re-read it" without reloading the tab. loadGraph(true)
           // only overwrites GRAPH_CACHE after BOTH paged reads finish clean, so a failure
@@ -1137,47 +1348,104 @@ view("dial", "Гипотеза", (host) => {
             return true;
           });
           if (fresh) fire();
-        } }, "Перечитать граф")),
+        }) }, "Перечитать граф")),
       statusHost),
     el("div", { class: "panel" }, wrap, legendHost, listHost),
     el("div", { class: "panel" }, el("h2", {}, "Идеи рядом"), ideasHost));
   q.focus();
+
+  // §4.1: three mutually exclusive outcomes for whatever this tab last did, ranked by
+  // `okSeq`/`errSeq` (both fed by the same `ctx.state.seq` counter `fire()` already used to
+  // reject its own stale responses) — whichever is higher is the last thing that actually
+  // happened, so a success that predates a later failure must not outrank it. Living on
+  // `ctx.state` (not a local variable) is what makes the two numbers comparable ACROSS a
+  // tab switch, not just within one mount.
+  if (ctx.state.errSeq && ctx.state.errSeq > (ctx.state.okSeq || 0)) {
+    // Regime 2: the last call on this tab failed. Redraw whatever earlier answer exists
+    // (real data, not garbage — same as the mismatch branch below), then paint the failure
+    // on top, exactly like the live screen looked the moment it happened — not the green
+    // line of the success that came before it.
+    if (ctx.state.data) renderAll(ctx.state.data, ctx.state.graph, ctx.state.graphError, ctx.state.ideas);
+    failed(statusHost, ctx.state.err);
+    const ep = ctx.state.errParams;
+    if (ep && (ep.q !== (p.q || "") || ep.k !== (Number(p.k) || 12)))
+      statusHost.append(el("div", { class: "status warn" },
+        `неудачным был запрос «${ep.q}» (k=${ep.k}) — текущая гипотеза другая, жми «Разложить» для неё`));
+  } else if (ctx.state.data) {
+    // §2.2: a previous answer lives on this tab's own VIEW_STATE entry — redraw it, no
+    // request. This is the entire fix for "switch tabs and back loses the dial".
+    renderAll(ctx.state.data, ctx.state.graph, ctx.state.graphError, ctx.state.ideas);
+    const rp = ctx.state.reqParams;
+    const cur = { q: p.q || "", k: Number(p.k) || 12 };
+    if (rp && (rp.q !== cur.q || rp.k !== cur.k))
+      markAnswerStale(statusHost,
+        `показан ответ на прежний запрос «${rp.q}» (k=${rp.k}) — текущая гипотеза другая, жми «Разложить» для ответа на неё`);
+  } else if (p.run === "1" && p.q) {
+    // The ONE exception to "no auto-request on open" (§2.2, §9.3): `/dial` only reads the
+    // index and writes nowhere — no retrieve.jsonl row, no log_id, nothing an A/B
+    // measurement depends on — so a link with an explicit `run=1` is safe to fire without
+    // a click. Every other tab ignores this param (see their own mount, below).
+    fire();
+  }
 });
 
 /* ----------------------------------------------------------------- 2. search */
 
-view("search", "Индекс", (host) => {
+view("search", "Индекс", (host, ctx) => {
   const out = el("div"), statusHost = el("div");
-  const q = el("input", { class: "grow", placeholder: "слова как есть, без rewrite" });
-  const k = el("input", { type: "number", min: 1, max: 50, value: 10 });
+  const q = el("input", { class: "grow", placeholder: "слова как есть, без rewrite", value: ctx.params.q || "" });
+  const k = el("input", { type: "number", min: 1, max: 50, value: Number(ctx.params.k) || 10 });
+  for (const field of [q, k])
+    field.addEventListener("input", () => setParams({ q: q.value.trim() || undefined,
+      k: (Number(k.value) || 10) !== 10 ? k.value : undefined }));
+
+  function renderHits(hits) {
+    setStatus(statusHost, hits.deadFts ? "warn" : "ok", hits.code,
+      hits.deadFts ? "BM25 не вернул ни одной строки: гибрид работает на одном косинусе — проверь FTS-индекс"
+                   : `${hits.length} попаданий, обе руки индекса живы`);
+    out.replaceChildren(hits.length ? el("div", { class: "scroller" },
+      el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["#", "тезис", "идея", "RRF score", "BM25 rank", "vector rank"]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...hits.map((h, i) => el("tr", {},
+          el("td", { class: "num" }, i + 1),
+          el("td", { class: "mono" }, h.thesis_id),
+          el("td", { class: "mono" },
+            el("a", { href: "#", onclick: (e) => { e.preventDefault(); openIdea(h.idea_id); } }, h.idea_id)),
+          el("td", { class: "num mono" }, h.score.toFixed(5)),
+          el("td", { class: "num mono" }, h.bm25_rank ?? "—"),
+          el("td", { class: "num mono" }, h.vec_rank ?? "—"))))))
+      : el("div", { class: "status warn" }, el("span", { class: "code" }, hits.code),
+          "индекс ответил нулём строк — это данные, а не поломка"));
+  }
 
   async function fire() {
-    if (!q.value.trim()) { setStatus(statusHost, "warn", null, "пустой q → 400"); return; }
+    const text = q.value.trim();
+    if (!text) { setStatus(statusHost, "warn", null, "пустой q → 400"); return; }
+    setParams({ q: text, k: (Number(k.value) || 10) !== 10 ? k.value : undefined });
+    // §4.1 (defect 1): on `ctx.state`, not a local `let seq = 0` — see the dial view for why
+    // a per-mount counter makes okSeq/errSeq incomparable across a tab switch.
+    const mine = ctx.state.seq = (ctx.state.seq || 0) + 1;
+    // §4.1: the params THIS call answers — see the dial view for why.
+    const reqParams = { q: text, k: Number(k.value) || 10 };
     await run(statusHost, "ищу по тезисам…", async () => {
-      const hits = await api(`/search?q=${encodeURIComponent(q.value.trim())}&k=${Number(k.value) || 10}`);
-      // `hits.length` alone treats any non-array body (a shape mismatch) as the falsy
-      // "zero rows" case below — a captive portal's `{surprise: ...}` would read as a
-      // clean empty result instead of the broken response it is.
-      if (!Array.isArray(hits)) throw new Error("ответ /search — не массив: " + JSON.stringify(hits).slice(0, 200));
-      const deadFts = hits.length && hits.every((h) => h.bm25_rank === null);
-      setStatus(statusHost, deadFts ? "warn" : "ok", codeOf(hits),
-        deadFts ? "BM25 не вернул ни одной строки: гибрид работает на одном косинусе — проверь FTS-индекс"
-                : `${hits.length} попаданий, обе руки индекса живы`);
-      out.replaceChildren(hits.length ? el("div", { class: "scroller" },
-        el("table", { class: "tbl" },
-          el("thead", {}, el("tr", {}, ...["#", "тезис", "идея", "RRF score", "BM25 rank", "vector rank"]
-            .map((h) => el("th", {}, h)))),
-          el("tbody", {}, ...hits.map((h, i) => el("tr", {},
-            el("td", { class: "num" }, i + 1),
-            el("td", { class: "mono" }, h.thesis_id),
-            el("td", { class: "mono" },
-              el("a", { href: "#", onclick: (e) => { e.preventDefault(); openIdea(h.idea_id); } }, h.idea_id)),
-            el("td", { class: "num mono" }, h.score.toFixed(5)),
-            el("td", { class: "num mono" }, h.bm25_rank ?? "—"),
-            el("td", { class: "num mono" }, h.vec_rank ?? "—"))))))
-        : el("div", { class: "status warn" }, el("span", { class: "code" }, codeOf(hits)),
-            "индекс ответил нулём строк — это данные, а не поломка"));
-      return hits;
+      try {
+        const hits = await api(`/search?q=${encodeURIComponent(text)}&k=${reqParams.k}`);
+        // `hits.length` alone treats any non-array body (a shape mismatch) as the falsy
+        // "zero rows" case below — a captive portal's `{surprise: ...}` would read as a
+        // clean empty result instead of the broken response it is.
+        if (!Array.isArray(hits)) throw new Error("ответ /search — не массив: " + JSON.stringify(hits).slice(0, 200));
+        hits.deadFts = hits.length && hits.every((h) => h.bm25_rank === null);
+        hits.code = codeOf(hits);
+        renderHits(hits);
+        ctx.state.hits = hits;   // §2.2: cached for the mount-time restore path below
+        ctx.state.reqParams = reqParams; ctx.state.okSeq = mine;
+        return hits;
+      } catch (err) {
+        // §4.1 regime 2: a failed call must read back as failed after a tab switch.
+        ctx.state.err = err; ctx.state.errParams = reqParams; ctx.state.errSeq = mine;
+        throw err;
+      }
     });
   }
 
@@ -1186,12 +1454,31 @@ view("search", "Индекс", (host) => {
       el("h2", {}, "GET /search"),
       el("p", { class: "help" }, "Сырой гибрид: BM25 + косинус, слитые RRF. Ни rewrite, ни подъёма к "
         + "идеям. Пустая колонка BM25 у всех строк = FTS-индекс мёртв, и это видно только здесь."),
+      ignoredRunNote(ctx),
       el("div", { class: "row" },
         el("label", { class: "f grow" }, "q", q),
         el("label", { class: "f" }, "k", k),
-        el("button", { class: "act", onclick: fire }, "Искать")),
+        el("button", { class: "act", onclick: guard(fire) }, "Искать")),
       statusHost),
     out);
+  // §2.2: a previous answer lives on this tab's own VIEW_STATE entry — redraw it, no
+  // request. No auto-fire on a bare open, same as every non-dial view (§9.3).
+  const curSearch = { q: ctx.params.q || "", k: Number(ctx.params.k) || 10 };
+  if (ctx.state.errSeq && ctx.state.errSeq > (ctx.state.okSeq || 0)) {
+    // §4.1 regime 2: the last call on this tab failed — show that again, not the green
+    // line of a query that happened to succeed before it.
+    failed(statusHost, ctx.state.err);
+    const ep = ctx.state.errParams;
+    if (ep && (ep.q !== curSearch.q || ep.k !== curSearch.k))
+      statusHost.append(el("div", { class: "status warn" },
+        `неудачным был запрос «${ep.q}» (k=${ep.k}) — текущий запрос другой, жми «Искать» для него`));
+  } else if (ctx.state.hits) {
+    renderHits(ctx.state.hits);
+    const rp = ctx.state.reqParams;
+    if (rp && (rp.q !== curSearch.q || rp.k !== curSearch.k))
+      markAnswerStale(statusHost,
+        `показан ответ на прежний запрос «${rp.q}» (k=${rp.k}) — текущий запрос другой, жми «Искать» для него`);
+  }
 });
 
 /* ------------------------------------------------------------------ 3. ideas */
@@ -1224,7 +1511,12 @@ view("ideas", "Идеи", (host, ctx) => {
   // chip strip wraps to several lines and the header's real height is nothing like its
   // desktop height, so it is measured fresh right before each scroll instead.
   const writeStatus = el("div");
-  const state = { offset: 0, limit: PAGE };
+  // §2.2: this IS ctx.state — the same object across every mount of this tab, not a
+  // fresh `{offset: 0}` literal. `offset` still comes from the URL first (a shared link
+  // has to win), falling back to whatever this tab last remembered.
+  const state = ctx.state;
+  state.limit = PAGE;
+  state.offset = Number(ctx.params.offset) || 0;
   const jump = el("input", { class: "mono", placeholder: "idea_…" });
   let shownIdeaId = null;
   // Same guard as the dial/graph views: two `show()` calls can be in flight at once (a
@@ -1233,6 +1525,26 @@ view("ideas", "Идеи", (host, ctx) => {
   // the DOM regardless of which one the operator actually meant, which is how two idea
   // ids ended up with two live PATCH forms on screen at once.
   let generation = 0;
+
+  // Pure render of an already-fetched page — no `api()` call, so the mount-time restore
+  // path below can call it on `state.page` directly.
+  function renderPage(page) {
+    setStatus(statusHost, "ok", codeOf(page), `${page.items.length} строк на странице, total ${fmt(page.total)}`);
+    out.replaceChildren(
+      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["идея", "текст", "trust", "листьев", "origin", "обновлена", ""]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...page.items.map((idea) => el("tr", {},
+          el("td", { class: "mono" }, idea.id),
+          el("td", {}, cut(idea.text, 150)),
+          el("td", { class: "num" }, idea.trust_score.toFixed(1),
+            idea.dirty ? el("span", { class: "badge b-dirty", style: "margin-left:6px" }, "dirty") : null),
+          el("td", { class: "num" }, idea.theses.length),
+          el("td", {}, idea.origin),
+          el("td", { class: "mono dim" }, idea.updated_at || "«»"),
+          el("td", {}, el("button", { class: "ghost sm", onclick: () => openIdea(idea.id) }, "открыть"))))))),
+      pager(state, page.total, load));
+  }
 
   async function load(offset = state.offset) {
     await run(statusHost, "читаю идеи…", async () => {
@@ -1243,21 +1555,10 @@ view("ideas", "Идеи", (host, ctx) => {
       if (!Array.isArray(page.items) || typeof page.total !== "number")
         throw new Error("ответ /ideas — не страница: " + JSON.stringify(page).slice(0, 200));
       state.offset = offset;   // committed only now — the page actually has items+total
-      setStatus(statusHost, "ok", codeOf(page), `${page.items.length} строк на странице, total ${fmt(page.total)}`);
-      out.replaceChildren(
-        el("div", { class: "scroller" }, el("table", { class: "tbl" },
-          el("thead", {}, el("tr", {}, ...["идея", "текст", "trust", "листьев", "origin", "обновлена", ""]
-            .map((h) => el("th", {}, h)))),
-          el("tbody", {}, ...page.items.map((idea) => el("tr", {},
-            el("td", { class: "mono" }, idea.id),
-            el("td", {}, cut(idea.text, 150)),
-            el("td", { class: "num" }, idea.trust_score.toFixed(1),
-              idea.dirty ? el("span", { class: "badge b-dirty", style: "margin-left:6px" }, "dirty") : null),
-            el("td", { class: "num" }, idea.theses.length),
-            el("td", {}, idea.origin),
-            el("td", { class: "mono dim" }, idea.updated_at || "«»"),
-            el("td", {}, el("button", { class: "ghost sm", onclick: () => openIdea(idea.id) }, "открыть"))))))),
-        pager(state, page.total, load));
+      setParams({ offset: offset || undefined });
+      state.page = page;
+      state.pageOffset = offset;   // §2.2: what the CACHED page above actually is
+      renderPage(page);
       return page;
     });
   }
@@ -1314,7 +1615,7 @@ view("ideas", "Идеи", (host, ctx) => {
         return el("label", { class: "f grow", style: "margin-bottom:8px" }, field, input);
       }),
       el("div", { class: "row" },
-        el("button", { class: "act", onclick: async () => {
+        el("button", { class: "act", onclick: guard(async () => {
           const body = {};
           for (const field of editable) {
             const now = inputs[field].value;
@@ -1356,7 +1657,7 @@ view("ideas", "Идеи", (host, ctx) => {
             $("nav.tabs").getBoundingClientRect().bottom) + 10) + "px";
           writeStatus.scrollIntoView({ behavior: "smooth", block: "start" });
           show(ideaId); load();
-        } }, "Записать изменения"),
+        }) }, "Записать изменения"),
         el("button", { class: "ghost", onclick: () => show(ideaId) }, "Сбросить")),
       patchStatus);
 
@@ -1406,13 +1707,18 @@ view("ideas", "Идеи", (host, ctx) => {
     el("div", { class: "panel" },
       el("h2", {}, "GET /ideas"),
       el("p", { class: "help" }, "Ноды графа с листьями. Открытая карточка даёт рёбра и правку полей."),
+      ignoredRunNote(ctx),
       el("div", { class: "row" },
         el("label", { class: "f grow" }, "открыть по id", jump),
         el("button", { class: "act", onclick: () => jump.value.trim() && openIdea(jump.value.trim()) }, "Открыть"),
         el("button", { class: "ghost", onclick: () => load() }, "Обновить список")),
       statusHost),
     writeStatus, detail, out);
-  load();
+  // §2.2: the exact page for this offset is already sitting in state — redraw it, no
+  // request. A different offset (a shared link, a hand-edited hash) still fetches: this
+  // is the "листание в идеях, уход и возврат — offset не потерян" check, not a reason to
+  // ever show the wrong page.
+  if (state.page && state.pageOffset === state.offset) renderPage(state.page); else load(state.offset);
   // The one place `openIdea` actually lands: a route arrives here as `ctx.arg`, already
   // mounted (not `setTimeout`-raced against mounting), so the idea opens on the FIRST
   // click, from any tab, on a page that has never shown this tab before.
@@ -1421,11 +1727,37 @@ view("ideas", "Идеи", (host, ctx) => {
 
 /* ----------------------------------------------------------------- 4. theses */
 
-view("theses", "Тезисы", (host) => {
+view("theses", "Тезисы", (host, ctx) => {
   const out = el("div"), statusHost = el("div");
-  const state = { offset: 0, limit: PAGE };
-  const byIdea = el("input", { class: "mono", placeholder: "idea_…" });
-  const bySource = el("input", { class: "mono", placeholder: "источник" });
+  // §2.2: ctx.state itself, not a fresh literal — see «Идеи» above for why.
+  const state = ctx.state;
+  state.limit = PAGE;
+  state.offset = Number(ctx.params.offset) || 0;
+  const byIdea = el("input", { class: "mono", placeholder: "idea_…", value: ctx.params.idea_id || "" });
+  const bySource = el("input", { class: "mono", placeholder: "источник", value: ctx.params.source_id || "" });
+  // What the LAST fetched `state.page` was actually filtered by — a fresh navigation with
+  // a different filter (the «тезисы» button in «Источники») must refetch, not show
+  // yesterday's cached page for someone else's source_id.
+  const fingerprint = () => `${state.offset}|${byIdea.value.trim()}|${bySource.value.trim()}`;
+
+  function renderPage(page) {
+    setStatus(statusHost, "ok", codeOf(page), `total ${fmt(page.total)} при этом фильтре`);
+    out.replaceChildren(
+      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["тезис", "текст", "эффект", "локатор", "источник", "идея"]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...page.items.map((leaf) => el("tr", {},
+          el("td", { class: "mono" }, leaf.id),
+          el("td", {}, cut(leaf.text, 180)),
+          el("td", {}, leaf.effect || "—"),
+          el("td", { class: "mono dim" }, leaf.locator || "—"),
+          el("td", {}, el("a", { href: leaf.source_url, target: "_blank", rel: "noreferrer" },
+            cut(leaf.source_title, 60)),
+            el("span", { class: "badge b-" + leaf.source_type, style: "margin-left:6px" }, leaf.source_type)),
+          el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
+            e.preventDefault(); openIdea(leaf.idea_id); } }, leaf.idea_id))))))),
+      pager(state, page.total, load));
+  }
 
   async function load(offset = state.offset) {
     const params = new URLSearchParams({ limit: state.limit, offset });
@@ -1439,22 +1771,11 @@ view("theses", "Тезисы", (host) => {
       if (!Array.isArray(page.items) || typeof page.total !== "number")
         throw new Error("ответ /theses — не страница: " + JSON.stringify(page).slice(0, 200));
       state.offset = offset;   // committed only now — the page actually has items+total
-      setStatus(statusHost, "ok", codeOf(page), `total ${fmt(page.total)} при этом фильтре`);
-      out.replaceChildren(
-        el("div", { class: "scroller" }, el("table", { class: "tbl" },
-          el("thead", {}, el("tr", {}, ...["тезис", "текст", "эффект", "локатор", "источник", "идея"]
-            .map((h) => el("th", {}, h)))),
-          el("tbody", {}, ...page.items.map((leaf) => el("tr", {},
-            el("td", { class: "mono" }, leaf.id),
-            el("td", {}, cut(leaf.text, 180)),
-            el("td", {}, leaf.effect || "—"),
-            el("td", { class: "mono dim" }, leaf.locator || "—"),
-            el("td", {}, el("a", { href: leaf.source_url, target: "_blank", rel: "noreferrer" },
-              cut(leaf.source_title, 60)),
-              el("span", { class: "badge b-" + leaf.source_type, style: "margin-left:6px" }, leaf.source_type)),
-            el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
-              e.preventDefault(); openIdea(leaf.idea_id); } }, leaf.idea_id))))))),
-        pager(state, page.total, load));
+      setParams({ offset: offset || undefined, idea_id: byIdea.value.trim() || undefined,
+                  source_id: bySource.value.trim() || undefined });
+      state.page = page;
+      state.pageFp = fingerprint();
+      renderPage(page);
       return page;
     });
   }
@@ -1464,20 +1785,52 @@ view("theses", "Тезисы", (host) => {
       el("h2", {}, "GET /theses"),
       el("p", { class: "help" }, "Листья. Ручки на запись тезиса нет и не будет: тезис неизменяем и "
         + "создаётся только фазой 2, которая назначает ему идею через арбитра."),
+      ignoredRunNote(ctx),
       el("div", { class: "row" },
         el("label", { class: "f" }, "idea_id", byIdea),
         el("label", { class: "f" }, "source_id", bySource),
-        el("button", { class: "act", onclick: () => load(0) }, "Фильтровать")),
+        el("button", { class: "act", onclick: guard(() => load(0)) }, "Фильтровать")),
       statusHost),
     out);
-  load();
+  // §2.2: reuse the cached page only if it was fetched with these exact filters+offset —
+  // a `source_id` arriving via a fresh link (§4.2's item 6, the «Источники» → «Тезисы»
+  // navigation) must fetch, not show a stale unfiltered (or differently filtered) page.
+  if (state.page && state.pageFp === fingerprint()) renderPage(state.page); else load(state.offset);
 });
 
 /* ---------------------------------------------------------------- 5. sources */
 
-view("sources", "Источники", (host) => {
+view("sources", "Источники", (host, ctx) => {
   const out = el("div"), statusHost = el("div"), formStatus = el("div");
-  const state = { offset: 0, limit: PAGE };
+  // §2.2: ctx.state itself, not a fresh literal — see «Идеи» above for why.
+  const state = ctx.state;
+  state.limit = PAGE;
+  state.offset = Number(ctx.params.offset) || 0;
+
+  function renderPage(page) {
+    setStatus(statusHost, "ok", codeOf(page), `total ${fmt(page.total)}`);
+    out.replaceChildren(
+      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["источник", "тип", "название", "версия", "получен", "прогон", ""]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...page.items.map((src) => el("tr", {},
+          el("td", { class: "mono" }, src.id),
+          el("td", {}, el("span", { class: "badge b-" + src.type }, src.type)),
+          el("td", {}, el("a", { href: src.url, target: "_blank", rel: "noreferrer" }, cut(src.title, 90))),
+          el("td", { class: "mono" }, src.version),
+          el("td", { class: "mono dim" }, (src.retrieved_at || "").slice(0, 16)),
+          el("td", {}, src.run_success === null || src.run_success === undefined ? "—"
+            : el("span", { class: "badge " + (src.run_success ? "b-ok" : "b-failed") },
+                src.run_success ? "успех" : "провал")),
+          el("td", {}, el("button", { class: "ghost sm", onclick: () => {
+            // §4.2 item 6: a real route, not a fake click. "Открыть по source_id" IS what
+            // «Тезисы»'s own mount already does with `ctx.params.source_id` — no
+            // `setTimeout`, no placeholder-text lookup, no guessing which button is "the"
+            // act button under #main.
+            location.hash = formatHash("theses", null, { source_id: src.id });
+          } }, "тезисы"))))))),
+      pager(state, page.total, load));
+  }
 
   async function load(offset = state.offset) {
     await run(statusHost, "читаю источники…", async () => {
@@ -1488,29 +1841,10 @@ view("sources", "Источники", (host) => {
       if (!Array.isArray(page.items) || typeof page.total !== "number")
         throw new Error("ответ /sources — не страница: " + JSON.stringify(page).slice(0, 200));
       state.offset = offset;   // committed only now — the page actually has items+total
-      setStatus(statusHost, "ok", codeOf(page), `total ${fmt(page.total)}`);
-      out.replaceChildren(
-        el("div", { class: "scroller" }, el("table", { class: "tbl" },
-          el("thead", {}, el("tr", {}, ...["источник", "тип", "название", "версия", "получен", "прогон", ""]
-            .map((h) => el("th", {}, h)))),
-          el("tbody", {}, ...page.items.map((src) => el("tr", {},
-            el("td", { class: "mono" }, src.id),
-            el("td", {}, el("span", { class: "badge b-" + src.type }, src.type)),
-            el("td", {}, el("a", { href: src.url, target: "_blank", rel: "noreferrer" }, cut(src.title, 90))),
-            el("td", { class: "mono" }, src.version),
-            el("td", { class: "mono dim" }, (src.retrieved_at || "").slice(0, 16)),
-            el("td", {}, src.run_success === null || src.run_success === undefined ? "—"
-              : el("span", { class: "badge " + (src.run_success ? "b-ok" : "b-failed") },
-                  src.run_success ? "успех" : "провал")),
-            el("td", {}, el("button", { class: "ghost sm", onclick: () => {
-              // ponytail: still the setTimeout race §2.1 removed from openIdea, plus a
-              // placeholder-text lookup and "first .act under #main" guess — left as is,
-              // waiting on §2.2 (tabs reading ctx.params), the right place for this one.
-              switchTo("theses");
-              setTimeout(() => { $("main input.mono[placeholder='источник']").value = src.id;
-                                 $("main button.act").click(); }, 0);
-            } }, "тезисы"))))))),
-        pager(state, page.total, load));
+      setParams({ offset: offset || undefined });
+      state.page = page;
+      state.pageOffset = offset;
+      renderPage(page);
       return page;
     });
   }
@@ -1529,6 +1863,7 @@ view("sources", "Источники", (host) => {
       el("h2", {}, "GET /sources"),
       el("p", { class: "help" }, "Статьи, документация и логи прогонов. id выводится из (url, version), "
         + "поэтому повторный POST заменяет строку, а не плодит вторую."),
+      ignoredRunNote(ctx),
       el("div", { class: "row" }, el("button", { class: "ghost", onclick: () => load() }, "Обновить")),
       statusHost),
     el("details", { class: "panel" },
@@ -1544,7 +1879,7 @@ view("sources", "Источники", (host) => {
         el("label", { class: "f" }, "version", f.version),
         el("label", { class: "f" }, "run_success", f.success),
         el("label", { class: "f grow" }, "run_meta (JSON)", f.meta),
-        el("button", { class: "act", onclick: async () => {
+        el("button", { class: "act", onclick: guard(async () => {
           const body = { url: f.url.value.trim(), title: f.title.value.trim(),
                          type: f.type.value, version: f.version.value.trim() || "v1" };
           if (f.success.value !== "—") body.run_success = f.success.value === "успех";
@@ -1563,10 +1898,11 @@ view("sources", "Источники", (host) => {
             load();
             return src;
           });
-        } }, "Записать")),
+        }) }, "Записать")),
       formStatus),
     out);
-  load();
+  // §2.2: same page, no request, unless the offset moved since it was fetched.
+  if (state.page && state.pageOffset === state.offset) renderPage(state.page); else load(state.offset);
 });
 
 /* ---------------------------------------------------------------- 6. ingest */
@@ -1574,11 +1910,10 @@ view("sources", "Источники", (host) => {
 const JOB_KIND = { fetch: "статья", run: "прогон", phase1: "фаза 1", phase2: "фаза 2",
                    reindex: "индекс", "vault-export": "vault", trust: "суд" };
 
-view("ingest", "Ингест и ops", (host) => {
+view("ingest", "Ингест и ops", (host, ctx) => {
   const jobsHost = el("div"), jobStatus = el("div");
   const fetchStatus = el("div"), phaseStatus = el("div"), opsStatus = el("div");
   const stagingHost = el("div"), pendingHost = el("div");
-  let timer = null;
 
   async function loadJobs(quiet) {
     // quiet (auto-refresh) never calls busy() — no spinner is left hanging on a
@@ -1661,9 +1996,15 @@ view("ingest", "Ингест и ops", (host) => {
     });
   };
 
+  // §4.2: the one number confirm() can honestly show before POST /ingest/phase2 —
+  // read once here, off the same response the "Обслуживание" panel already renders,
+  // never a fresh call made just for the dialog.
+  let lastStaging = null;
+
   async function loadStaging() {
     await run(stagingHost, "читаю staging…", async () => {
       const st = await api("/ingest/staging");
+      lastStaging = st;
       stagingHost.replaceChildren(
         el("div", { class: "row" },
           el("span", { class: "badge" }, `строк ${st.lines}`),
@@ -1714,10 +2055,11 @@ view("ingest", "Ингест и ops", (host) => {
       el("p", { class: "help" }, "Оба этапа за один вызов: fetch → тезисы → идеи в графе. Ответ 202 и "
         + "задание в очереди на диске; можно послать десять ссылок подряд, писать в граф всё равно "
         + "будет один поток. Повторная ссылка возвращает ТО ЖЕ задание, а не второе."),
+      ignoredRunNote(ctx),
       el("div", { class: "row" },
         el("label", { class: "f grow" }, "ссылка на arXiv", url),
-        el("button", { class: "act", onclick: () => post(fetchStatus, "ставлю в очередь…", "/fetch",
-          { url: url.value.trim() })() }, "Забрать статью")),
+        el("button", { class: "act", onclick: guard(post(fetchStatus, "ставлю в очередь…", "/fetch",
+          { url: url.value.trim() })) }, "Забрать статью")),
       fetchStatus),
 
     el("div", { class: "panel" },
@@ -1728,12 +2070,27 @@ view("ingest", "Ингест и ops", (host) => {
       el("div", { class: "row" },
         el("label", { class: "f" }, "limit", p1limit),
         el("label", { class: "f" }, "workers", p1workers),
-        el("button", { class: "act", onclick: () => post(phaseStatus, "фаза 1 пошла…", "/ingest/phase1",
+        el("button", { class: "act", onclick: guard(post(phaseStatus, "фаза 1 пошла…", "/ingest/phase1",
           { ...(p1limit.value ? { limit: Number(p1limit.value) } : {}),
-            workers: Number(p1workers.value) || 8 })() }, "Фаза 1 (из sources.yaml)"),
+            workers: Number(p1workers.value) || 8 })) }, "Фаза 1 (из sources.yaml)"),
         el("label", { class: "f" }, "limit фазы 2", p2limit),
-        el("button", { class: "act", onclick: () => post(phaseStatus, "фаза 2 пошла…", "/ingest/phase2",
-          p2limit.value ? { limit: Number(p2limit.value) } : {})() }, "Фаза 2 (staging → граф)")),
+        el("button", { class: "act", onclick: guard(async () => {
+          // §4.2: the only honest number here is what staging last reported — `pending_lines`
+          // from `loadStaging()`'s own response, never a fresh fetch made just for this
+          // dialog. `limit` caps it further when the operator set one; either bound is real,
+          // neither is invented, and "unknown" is said in words when staging hasn't loaded yet
+          // rather than silently standing in a 0.
+          const limit = p2limit.value ? Number(p2limit.value) : null;
+          const pending = lastStaging ? lastStaging.pending_lines : null;
+          const n = pending !== null ? (limit ? Math.min(limit, pending) : pending) : limit;
+          const msg = n !== null
+            ? `Фаза 2 запишет в граф ${fmt(n)} строк(и) из staging`
+              + (pending !== null ? ` (ждёт всего ${fmt(pending)})` : "") + " — необратимо. Продолжить?"
+            : "Фаза 2 запишет в граф ВСЁ, что ждёт в staging — точное число странице неизвестно "
+              + "(обновите блок staging ниже). Продолжить?";
+          if (!(await askConfirm(msg))) return;
+          await post(phaseStatus, "фаза 2 пошла…", "/ingest/phase2", limit ? { limit } : {})();
+        }) }, "Фаза 2 (staging → граф)")),
       phaseStatus),
 
     el("div", { class: "panel" },
@@ -1742,7 +2099,7 @@ view("ingest", "Ингест и ops", (host) => {
         + "вызовов 35B, поэтому заданием, а не в ответе. Выгрузка vault пересоздаёт папку целиком и "
         + "откажется затирать заметки, которых не писала."),
       el("div", { class: "row" },
-        el("button", { class: "ghost", onclick: async () => {
+        el("button", { class: "ghost", onclick: guard(async () => {
           await run(opsStatus, "пересобираю индекс…", async () => {
             const res = await api("/admin/reindex", { method: "POST" });
             // `in_sync` is a boolean the server always sets — undefined (a shape
@@ -1757,13 +2114,35 @@ view("ingest", "Ингест и ops", (host) => {
             refreshStrip();
             return res;
           });
-        } }, "Пересобрать индекс"),
+        }) }, "Пересобрать индекс"),
         el("label", { class: "f grow" }, "судить идеи", trustIds),
-        el("button", { class: "ghost", onclick: () => {
+        el("button", { class: "ghost danger", onclick: guard(async () => {
           const ids = trustIds.value.split(",").map((s) => s.trim()).filter(Boolean);
-          post(opsStatus, "ставлю суд…", "/admin/trust", ids.length ? { idea_ids: ids } : {})();
-        } }, "Судить"),
-        el("button", { class: "ghost", onclick: async () => {
+          // §4.2: the field's own id count is the one real number always in hand — an
+          // empty field means "every dirty idea", and /stats carries no dirty count to
+          // quote (checked: Stats has no such field), so that branch says so in words
+          // instead of guessing at a total or silently printing a 0 that means something
+          // else (0 explicit ids, not 0 dirty ideas).
+          const msg = ids.length
+            ? `Запустить суд (вызовы 35B) над ${ids.length} указанными идеями. Продолжить?`
+            : "Явных id не указано (0) — суд пройдёт по ВСЕМ dirty-идеям сразу, их точное "
+              + "число /stats не отдаёт (странице оно неизвестно). Продолжить?";
+          if (!(await askConfirm(msg))) return;
+          await post(opsStatus, "ставлю суд…", "/admin/trust", ids.length ? { idea_ids: ids } : {})();
+        }) }, "Судить"),
+        el("button", { class: "ghost danger", onclick: guard(async () => {
+          // §4.2: LAST_STATS is the last /stats read (refreshStrip, every 20s) — a real
+          // count of what the lake holds right now, not a number invented for the dialog.
+          // It can be stale by whatever changed since that poll landed, so it is offered as
+          // "по последним /stats", not as a promise equal to the export's own report (which
+          // the status line below already prints once the call actually returns).
+          const msg = LAST_STATS
+            ? `Пересоздать vault ЦЕЛИКОМ (папка сносится и пишется заново) — по последним `
+              + `/stats: идей ${fmt(LAST_STATS.ideas)}, тезисов ${fmt(LAST_STATS.theses)}, `
+              + `источников ${fmt(LAST_STATS.sources)}. Продолжить?`
+            : "Пересоздать vault ЦЕЛИКОМ (папка сносится и пишется заново) — точное число "
+              + "файлов неизвестно, /stats ещё не отвечал. Продолжить?";
+          if (!(await askConfirm(msg))) return;
           await run(opsStatus, "выгружаю vault…", async () => {
             const res = await api("/vault/export", { method: "POST" });
             // `files` is always a number on a real answer. Skipping this check would
@@ -1777,7 +2156,7 @@ view("ingest", "Ингест и ops", (host) => {
               + `источников ${res.sources}, сирот ${res.orphans}`);
             return res;
           });
-        } }, "Выгрузить в Obsidian")),
+        }) }, "Выгрузить в Obsidian")),
       opsStatus),
 
     el("div", { class: "panel" },
@@ -1785,9 +2164,16 @@ view("ingest", "Ингест и ops", (host) => {
       el("div", { class: "row" },
         el("button", { class: "ghost", onclick: () => loadJobs(false) }, "Обновить"),
         el("label", { class: "cb" },
+          // §4.2/§2.2: the id lives on `ctx.state`, not a local closure variable — a
+          // closure is rebuilt fresh on every mount, so an id trapped in the PREVIOUS
+          // one is unreachable the moment the operator leaves this tab, and used to
+          // `setInterval` against the server for the rest of the session. `render()`'s
+          // `stopTabTimers` is what actually clears this on the way out; unchecking the
+          // box by hand is just the same field, cleared early.
           el("input", { type: "checkbox", onchange: (e) => {
-            clearInterval(timer);
-            timer = e.target.checked ? setInterval(() => { loadJobs(true); refreshStrip(); }, 4000) : null;
+            clearInterval(ctx.state.autoTimer);
+            ctx.state.autoTimer = e.target.checked
+              ? setInterval(() => { loadJobs(true); refreshStrip(); }, 4000) : null;
           } }), "автообновление 4 с")),
       jobStatus, jobsHost),
 
@@ -1901,13 +2287,33 @@ function armBadge(candidate) {
     label);
 }
 
-view("graph", "Граф", (host) => {
+view("graph", "Граф", (host, ctx) => {
   const statusHost = el("div"), wrap = el("div", { class: "graphwrap" }), info = el("div");
   const picks = el("div", { class: "legend wrap", style: "margin-top:10px" });
-  const seed = el("input", { class: "grow", placeholder: "запрос словами, или idea_… (пусто = всё озеро)" });
-  const hops = el("select", {}, ...[1, 2, 3].map((n) => el("option", {}, n)));
-  const minW = el("input", { type: "number", min: 0, step: 1, placeholder: "любой" });
-  const cap = el("input", { type: "number", min: 10, max: 400, value: 200 });
+  const p = ctx.params;
+  const seed = el("input", { class: "grow", placeholder: "запрос словами, или idea_… (пусто = всё озеро)", value: p.root || "" });
+  const hops = el("select", {}, ...[1, 2, 3].map((n) => el("option", { selected: String(n) === (p.hops || "1") ? "" : null }, n)));
+  const minW = el("input", { type: "number", min: 0, step: 1, placeholder: "любой", value: p.min_weight || "" });
+  const cap = el("input", { type: "number", min: 10, max: 400, value: Number(p.cap) || 200 });
+  // Idea text for a candidate outside the drawn neighbourhood, filled in by `drawPicks`
+  // (§2.2, kept on `ctx.state` like `GRAPH_CACHE`/`LEAF_TEXT`): a thesis — and the idea
+  // text built from it — never changes, so a label read once stays right, including
+  // across a mount-time redraw that must not repeat the request that found it.
+  ctx.state.labels = ctx.state.labels || new Map();
+
+  // §2.2: the address mirrors the form. `root` takes the literal typed text (a query OR
+  // an id — this view accepts both), not just an id, unlike the dial's `q`.
+  function syncParams(root) {
+    setParams({
+      root: root || undefined,
+      hops: hops.value !== "1" ? hops.value : undefined,
+      min_weight: minW.value || undefined,
+      cap: (Number(cap.value) || 200) !== 200 ? cap.value : undefined,
+    });
+  }
+  for (const [field, evt] of [[hops, "change"], [minW, "input"], [cap, "input"]])
+    field.addEventListener(evt, () => syncParams(seed.value.trim()));
+  seed.addEventListener("input", () => syncParams(seed.value.trim()));
 
   // Two draws can be in flight — a whole-lake sweep takes 261 requests, an ego graph a
   // handful — and without this the slow one lands last and overwrites the picture the
@@ -1918,6 +2324,7 @@ view("graph", "Граф", (host) => {
     const mine = ++generation;
     const stale = () => mine !== generation;
     const typed = (forcedRoot || seed.value).trim();
+    syncParams(typed);   // a click "тоже обновляет адрес" (§2.2), even a candidate button
     const limit = Math.min(200, Math.max(10, Number(cap.value) || 200));
     const params = new URLSearchParams({ hops: hops.value });
     if (minW.value) params.set("min_weight", minW.value);
@@ -1975,6 +2382,17 @@ view("graph", "Граф", (host) => {
                truncated: page.total > bodies.size, code: codeOf(page) };
     });
     if (stale() || !data) return;
+    ctx.state.graph = { data, rootId, found, typed };   // §2.2: cached for mount-time restore
+    paint(data, rootId, found, typed, stale);
+  }
+
+  // Pure(ish) render of an already-fetched neighbourhood: the graph read (`data`) is
+  // already in hand, so everything from here on is layout + SVG + `drawPicks`' own
+  // (cached, see `ctx.state.labels` above) candidate-label lookup — nothing here repeats
+  // the N+1 read that got `data` in the first place. Shared by a live `draw()` and by
+  // the mount-time restore below, which is the entire "switch tabs and back redraws,
+  // no request" fix for this view.
+  function paint(data, rootId, found, typed, stale) {
 
     const nodes = [...data.bodies.values()].map((idea) => ({
       id: idea.id, idea, r: 4 + 1.5 * Math.sqrt(Math.max(0, idea.theses.length - 1)) }));
@@ -2013,11 +2431,16 @@ view("graph", "Граф", (host) => {
       // The ids are hex; what the operator recognises is the text. Bodies of candidates
       // outside the drawn neighbourhood are not on hand, so they are fetched — six
       // requests, through the same pool, and a failure costs that one label, not the row.
-      const missing = shortlist.filter((c) => !data.bodies.has(c.id)).map((c) => c.id);
+      // Checked against `ctx.state.labels` first (§2.2, an idea's text never changes):
+      // a mount-time restore calls this same function, and without the cache it would
+      // re-fire these six requests on every tab switch back to a graph that never moved.
+      const missing = shortlist.filter((c) => !data.bodies.has(c.id) && !ctx.state.labels.has(c.id))
+        .map((c) => c.id);
       const labels = new Map([...data.bodies].map(([id, body]) => [id, body.text]));
+      for (const [id, text] of ctx.state.labels) labels.set(id, text);
       for (const [id, body] of await pool(missing, (id) =>
           api(`/ideas/${encodeURIComponent(id)}`).catch(() => null)))
-        if (body) labels.set(id, body.text);
+        if (body) { labels.set(id, body.text); ctx.state.labels.set(id, body.text); }
       if (stale()) return;
       picks.append(el("span", { class: "dim" }, "другие совпадения индекса:"));
       for (const candidate of shortlist) {
@@ -2107,12 +2530,13 @@ view("graph", "Граф", (host) => {
         + "массового чтения рёбер в API нет. Поэтому «всё озеро» это N+1 запросов (по 6 в полёте): "
         + "при 261 идее терпимо, при полном корпусе понадобится отдельная ручка. Раскладка "
         + "force-directed в браузере, цвет — trust, размер — число листьев."),
+      ignoredRunNote(ctx),
       el("div", { class: "row" },
         el("label", { class: "f grow" }, "корень: запрос или id", seed),
         el("label", { class: "f" }, "хопов", hops),
         el("label", { class: "f" }, "min_weight", minW),
         el("label", { class: "f" }, "идей максимум", cap),
-        el("button", { class: "act", onclick: () => draw() }, "Нарисовать")),
+        el("button", { class: "act", onclick: guard(() => draw()) }, "Нарисовать")),
       statusHost, picks,
       el("div", { class: "legend" },
         el("span", {}, el("span", { class: "ramp" },
@@ -2122,15 +2546,24 @@ view("graph", "Граф", (host) => {
           " размер — число листьев"),
         el("span", { class: "dim" }, "клик по узлу — карточка идеи ниже"))),
     wrap, el("div", { style: "height:14px" }), info);
-  // Nothing is drawn on mount on purpose: the whole-lake view is one request per idea,
-  // and spending 261 of them because a tab was opened is not a default anybody asked for.
-  setStatus(statusHost, "", null, "Введи запрос словами — корень найдётся по смыслу. "
-    + "Пустое поле нарисует всё озеро, и это по одному запросу на идею.");
+  if (ctx.state.graph) {
+    // §2.2: redraw the last neighbourhood from state — no request, and in particular no
+    // repeat of the N+1 read (up to 261 calls for the whole lake) that built it.
+    const g = ctx.state.graph;
+    const mine = ++generation;
+    paint(g.data, g.rootId, g.found, g.typed, () => mine !== generation);
+  } else {
+    // Nothing is drawn on a bare mount on purpose: the whole-lake view is one request per
+    // idea, and spending 261 of them because a tab was opened is not a default anybody
+    // asked for (same rule as everywhere else in §2.2 — no auto-request on open).
+    setStatus(statusHost, "", null, "Введи запрос словами — корень найдётся по смыслу. "
+      + "Пустое поле нарисует всё озеро, и это по одному запросу на идею.");
+  }
 });
 
 /* ------------------------------------------------------------------- 8. raw */
 
-view("raw", "Ручки", (host) => {
+view("raw", "Ручки", (host, ctx) => {
   const out = el("div"), statusHost = el("div");
   const method = el("select", {}, ...["GET", "POST", "PATCH"].map((m) => el("option", {}, m)));
   const path = el("input", { class: "mono grow", value: "/stats" });
@@ -2141,6 +2574,7 @@ view("raw", "Ручки", (host) => {
   host.replaceChildren(
     el("div", { class: "panel" },
       el("h2", {}, "Прямой вызов"),
+      ignoredRunNote(ctx),
       el("p", { class: "help" }, "Тот же ключ, тот же origin, ответ как есть. Полный список ручек — "),
       el("p", { class: "help" }, el("a", { href: "/docs", target: "_blank" }, "/docs"), " · ",
         el("a", { href: "/openapi.json", target: "_blank" }, "/openapi.json"),
@@ -2149,7 +2583,7 @@ view("raw", "Ручки", (host) => {
       el("div", { class: "row" },
         el("label", { class: "f" }, "метод", method),
         el("label", { class: "f grow" }, "путь", path),
-        el("button", { class: "act", onclick: async () => {
+        el("button", { class: "act", onclick: guard(async () => {
           let parsed = null;
           if (method.value !== "GET" && body.value.trim()) {
             try { parsed = JSON.parse(body.value); }
@@ -2167,7 +2601,7 @@ view("raw", "Ручки", (host) => {
           out.replaceChildren(el("pre", { class: "mono", style:
             "background:var(--surface-2);border:1px solid var(--hair);border-radius:10px;padding:14px;overflow:auto;max-height:60vh" },
             JSON.stringify(res, null, 2)));
-        } }, "Позвать")),
+        }) }, "Позвать")),
       el("label", { class: "f", style: "margin-top:10px;width:100%" }, "тело (JSON)", body),
       statusHost),
     out);
@@ -2219,12 +2653,63 @@ let CURRENT_PARAMS = initialRoute.params;
 // exact lie §4.1 names. `probing` is the state until the first probe resolves.
 let AUTH = API_KEY ? "open" : "probing";
 
+// A bare tab switch (the nav strip's own buttons) carries no params of its own — reuse
+// whatever that tab's `VIEW_STATE` last held, so leaving and coming back does not reset an
+// offset/flag/filter to its default (§2.2's "листание в идеях, уход и возврат" check). An
+// explicit `params` argument (a real link — `openIdea`, the "тезисы" button in
+// «Источники») always wins over whatever is remembered.
 function switchTo(tab, arg, params) {
   CURRENT = tab;
   CURRENT_ARG = arg || null;
-  CURRENT_PARAMS = params || {};
+  CURRENT_PARAMS = params || stateFor(tab).params || {};
   history.replaceState(null, "", formatHash(CURRENT, CURRENT_ARG, CURRENT_PARAMS));
   render();
+}
+
+// A control that changes a query param (an input, a checkbox, the pager) calls this
+// instead of touching `location.hash` itself: one call site that (a) updates the address
+// so the view stays a shareable link and (b) never remounts — `history.replaceState`, not
+// `location.hash =`, so no `hashchange` fires and the view's own DOM/listeners survive.
+// A key set to `undefined`/`null`/`""` is DELETED rather than written as the literal
+// string "undefined" — that is what keeps a default value (rewrite=on, offset=0) out of
+// the link instead of baking it in forever.
+function setParams(patch) {
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined || value === null || value === "") delete CURRENT_PARAMS[key];
+    else CURRENT_PARAMS[key] = String(value);
+  }
+  history.replaceState(null, "", formatHash(CURRENT, CURRENT_ARG, CURRENT_PARAMS));
+}
+
+// `run=1` is meaningful on exactly one tab (§2.2, §9.3): `/dial` only reads the index and
+// writes nowhere, every other tab either logs (`/retrieve` → retrieve.jsonl, the A/B
+// measurement) or writes (ingest). A hand-edited or forwarded link that puts `run=1` on
+// any OTHER tab must not silently do nothing — that is the exact class of quiet lie §4.1
+// bans, just moved into the router. Every non-dial view's mount calls this once.
+function ignoredRunNote(ctx) {
+  return ctx.params.run ? el("div", { class: "status warn", style: "margin-bottom:14px" },
+    el("span", { class: "code" }, "—"),
+    "run=1 в адресе работает только у циферблата — здесь этот параметр игнорируется") : null;
+}
+
+// The tab last mounted, so the NEXT render() knows whose timers to stop. Not the same
+// thing as CURRENT: this only changes once a view actually mounts (never inside the auth
+// gate branches below), so a probe that flips AUTH mid-session cannot leave a stale id
+// pointing at a view that never ran in the first place.
+let MOUNTED_TAB = null;
+
+// §4.2: the one place every view-owned timer dies. A view registers an interval/timeout
+// id under a fixed name on its OWN `ctx.state` (`state.leafTimer` on the dial,
+// `state.autoTimer` on ingest's queue auto-refresh) instead of a local closure variable —
+// closures are recreated fresh on every mount (that is the whole point of §2.2), so an id
+// living only in one is unreachable from the next and `render()`'s `main.replaceChildren()`
+// orphans it still running. `clearTimeout`/`clearInterval` are cross-safe on every id in
+// every shipping browser (the HTML spec keeps one shared id space), so both run on both
+// fields rather than trying to remember which call created which.
+function stopTabTimers(state) {
+  if (!state) return;
+  clearTimeout(state.leafTimer); clearInterval(state.leafTimer); state.leafTimer = null;
+  clearTimeout(state.autoTimer); clearInterval(state.autoTimer); state.autoTimer = null;
 }
 
 // The one place that turns AUTH into #main content. Called before the probe even starts
@@ -2240,6 +2725,24 @@ function render() {
   const main = $("#main");
   main.replaceChildren();
   $("#gate").classList.add("hide");
+
+  // Whatever was mounted before this call owns no more DOM as of the line above — its
+  // timers must go with it, on EVERY render (a probe resolving is exactly as much a
+  // "left the view" event as a tab switch, and is the one case a timer used to survive
+  // past: a dead key mid session used to leave ingest's auto-refresh calling a server
+  // that had just started 401'ing on it).
+  if (MOUNTED_TAB) { stopTabTimers(stateFor(MOUNTED_TAB)); MOUNTED_TAB = null; }
+
+  const known = VIEWS.some((v) => v.id === CURRENT);
+  const chosen = VIEWS.find((v) => v.id === CURRENT) || VIEWS[0];
+  // Looked up, never built fresh: this is the one line that has to survive every future
+  // refactor of this function for §2.2 to mean anything, so the self-test below drives it
+  // directly through `switchTo`, not through a copy of this lookup. Computed even when the
+  // auth gate is about to bail below, on purpose — that is what lets the self-test verify
+  // this line without a mounted view or the network (AUTH is still "probing" at that point).
+  const state = stateFor(chosen.id);
+  state.params = CURRENT_PARAMS;
+  const ctx = { arg: CURRENT_ARG, params: CURRENT_PARAMS, state };
 
   if (AUTH === "probing") {
     main.replaceChildren(el("div", { class: "panel" },
@@ -2262,9 +2765,7 @@ function render() {
     openGate();
     return;
   }
-  const known = VIEWS.some((v) => v.id === CURRENT);
-  const chosen = VIEWS.find((v) => v.id === CURRENT) || VIEWS[0];
-  const ctx = { arg: CURRENT_ARG, params: CURRENT_PARAMS, state: {} };
+  MOUNTED_TAB = chosen.id;
   if (known) {
     chosen.mount(main, ctx);
     return;
@@ -2282,7 +2783,22 @@ window.addEventListener("hashchange", () => {
   const route = parseHash(location.hash);
   CURRENT = route.tab;
   CURRENT_ARG = route.arg;
-  CURRENT_PARAMS = route.params;
+  // A bare `location.hash = "#tab"` (no query string at all) carries no params of its
+  // own — same reasoning as `switchTo`'s fallback above: reuse whatever this tab's
+  // `VIEW_STATE` last remembered rather than wiping it, so a round trip through this
+  // event (the operator typing a hash by hand, or a same-tab `location.hash =` that
+  // §2.2's own views use to close a card) does not read as "reset every param". A hash
+  // that DOES carry a query string always wins outright — a real link's params are never
+  // second-guessed.
+  CURRENT_PARAMS = Object.keys(route.params).length ? route.params
+    : (stateFor(route.tab).params || {});
+  // Defect 3: `switchTo` writes this same recovered object back into the address bar
+  // (its own `history.replaceState` call above) — this handler used to stop one line
+  // short of that, so a bare hash (typed by hand, back/forward, a stale bookmark) restored
+  // the view from `VIEW_STATE` on screen while the address stayed the bare tab name. §2.2
+  // says the address IS the state; a reload right after that moment got the empty form the
+  // screen no longer showed. No remount here — `replaceState` alone, same as `setParams`.
+  history.replaceState(null, "", formatHash(CURRENT, CURRENT_ARG, CURRENT_PARAMS));
   render();
 });
 
@@ -2327,7 +2843,7 @@ async function probe() {
    came back. Cheap on purpose — this checks the router and the mark-picking rule, not
    the network. */
 if (new URLSearchParams(location.search).get("selftest") === "1") {
-  (function selftest() {
+  (async function selftest() {
     function assertEq(actual, expected, what) {
       if (actual !== expected) throw new Error(
         `SELFTEST FAIL (${what}): expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
@@ -2375,6 +2891,64 @@ if (new URLSearchParams(location.search).get("selftest") === "1") {
     ];
     const nearest = nearestMark(marks, 10, 10);
     assertEq(nearest.mark && nearest.mark.head, "hit", "nearestMark layer weight (rank, not radius)");
+
+    // §2.2/§0.2: VIEW_STATE must hand a tab the SAME object across a round trip through
+    // the real router, not rebuild one — that rebuild IS the bug (every field on every
+    // tab lost on a switch). Driven through `switchTo`/`render()` themselves, not through
+    // `stateFor` called directly — calling `stateFor` alone would stay green even if
+    // `render()` stopped using it and built `ctx.state` fresh inline, which is the exact
+    // regression this has to catch. A disposable view is spliced into VIEWS only for the
+    // two calls below (popped immediately after) so no real view needs test-only code,
+    // and AUTH is forced "open" for the same two calls so the mount actually runs
+    // regardless of whether boot()'s own probe() has resolved yet (it usually has not,
+    // this early) — both are restored before this block returns, so neither can race the
+    // page's real boot sequence.
+    {
+      let mounts = 0, seenState = null, mismatch = false;
+      VIEWS.push({ id: "__selftest_state__", title: "", mount: (host, ctx) => {
+        mounts++;
+        if (seenState === null) seenState = ctx.state;
+        else if (ctx.state !== seenState) mismatch = true;
+      } });
+      const savedAuth = AUTH, savedTab = CURRENT, savedArg = CURRENT_ARG, savedParams = CURRENT_PARAMS;
+      AUTH = "open";
+      switchTo("__selftest_state__");
+      switchTo("graph");           // graph draws nothing on mount (no network either way)
+      switchTo("__selftest_state__");
+      VIEWS.pop();
+      VIEW_STATE.delete("__selftest_state__");
+      AUTH = savedAuth;
+      CURRENT = savedTab; CURRENT_ARG = savedArg; CURRENT_PARAMS = savedParams;
+      history.replaceState(null, "", formatHash(CURRENT, CURRENT_ARG, CURRENT_PARAMS));
+      render();
+      if (mounts !== 2 || mismatch) throw new Error(
+        `SELFTEST FAIL (VIEW_STATE identity): expected 2 mounts sharing one state object, `
+        + `got mounts=${mounts} mismatch=${mismatch}`);
+    }
+
+    // M7: guard()'s own contract, exercised directly — every real call site routes its
+    // work through run(), which catches everything and never rejects, so a test built on
+    // a real button click (failed_call_returns_the_button in tools/e2e_console.py) only
+    // ever proves run()'s guarantee, never guard()'s own `finally`. A synthetic button and
+    // a `fn` that throws synchronously is the only way to see guard() with nothing else in
+    // the way: disabled must come back off, and the throw must come out the other side —
+    // not be swallowed — because a wrapper that eats exceptions turns every future bug in
+    // an onclick handler into a silently stuck spinner instead of a visible error.
+    {
+      const btn = document.createElement("button");
+      const wrapped = guard(() => { throw new Error("guard selftest boom"); });
+      let rethrown = false;
+      btn.disabled = false;
+      try {
+        await wrapped({ currentTarget: btn });
+      } catch (err) {
+        rethrown = err instanceof Error && err.message === "guard selftest boom";
+      }
+      if (!rethrown) throw new Error(
+        "SELFTEST FAIL (guard): exception from fn was not rethrown — guard() swallowed it");
+      if (btn.disabled) throw new Error(
+        "SELFTEST FAIL (guard): button still disabled after fn threw — finally did not run");
+    }
 
     console.log("SELFTEST OK");
   })();

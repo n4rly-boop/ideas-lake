@@ -246,6 +246,9 @@ class Browser:
     screenshot(path)                  Page.captureScreenshot, full page height.
     console_messages() -> list        Browser-console messages since the last goto() —
                                       [{"type": "log"/"error"/"exception"/..., "text": str}].
+    wait_for_dialog(timeout=10)       Blocks until a confirm()/alert() opens, returns its
+                                      CDP params (has "message"); does not answer it.
+    handle_dialog(accept, prompt_text="")  Answers the most recent open dialog.
     server_log() -> str               Current content of the server's log file.
     count_requests(pattern) -> int    Access-log lines containing `pattern`.
     """
@@ -264,6 +267,12 @@ class Browser:
         # miss whichever failure shape the page actually picked. Cleared on every goto()
         # (see below) so each test reads only its own document's messages.
         self._console = []
+        # window.confirm()/alert() dialogs seen since the last goto(), oldest first — a
+        # dialog PAUSES page JS until `Page.handleJavaScriptDialog` answers it, so this is
+        # populated straight off the CDP event (`Page.javascriptDialogOpening`) rather than
+        # by polling a JS global, which would itself be blocked by the very pause it's
+        # trying to observe. See `wait_for_dialog`/`handle_dialog` below.
+        self._dialogs = []
         self._runner.run(self._connect(devtools_port), timeout=15)
 
     async def _connect(self, devtools_port):
@@ -296,6 +305,11 @@ class Browser:
                     detail = p.get("exceptionDetails", {})
                     desc = (detail.get("exception") or {}).get("description") or detail.get("text") or ""
                     self._console.append({"type": "exception", "text": desc})
+                elif method == "Page.javascriptDialogOpening":
+                    # The page is paused right now — nothing here evaluates JS, only
+                    # records the event so `wait_for_dialog` (a plain Python poll) can see
+                    # it and `handle_dialog` can answer it over CDP.
+                    self._dialogs.append(msg.get("params", {}))
                 continue
             fut = self._pending.pop(msg["id"], None)
             if fut and not fut.done():
@@ -329,6 +343,7 @@ class Browser:
         sep = "&" if "?" in path else "?"
         nav_url = f"{path}{sep}_t={next(self._nav_counter)}" + (f"#{frag}" if frag else "")
         self._console.clear()   # each test's page gets its own, not the previous test's leftovers
+        self._dialogs.clear()   # ditto for any confirm()/alert() left over from a previous test
         self._call("Page.navigate", {"url": nav_url}, timeout=timeout)
         # A hash-only navigation (`#dial` on a page already loaded) never fires
         # another `Page.loadEventFired` — it is the same document. Polling
@@ -466,6 +481,26 @@ class Browser:
         missing" must assert on CONTENT (e.g. a specific "SELFTEST OK" string), never on
         list truthiness alone."""
         return list(self._console)
+
+    def wait_for_dialog(self, timeout=10) -> dict:
+        """Blocks until a `window.confirm()`/`alert()` has opened (`Page.javascriptDialogOpening`
+        already fired) and returns its CDP params (`{"message": ..., "type": "confirm"/"alert"/...,
+        ...}`). The dialog itself keeps blocking page JS until `handle_dialog` answers it — this
+        only observes that it opened, it does not answer it."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._dialogs:
+                return self._dialogs[-1]
+            time.sleep(0.05)
+        raise TimeoutError(f"no confirm()/alert() dialog opened within {timeout}s")
+
+    def handle_dialog(self, accept: bool, prompt_text: str = "") -> None:
+        """Answers the most recently opened dialog — `accept=False` is a real Cancel click,
+        not just letting the promise reject, so a test asserting 'nothing sent' is asserting
+        against the exact same user action an operator would take."""
+        self._call("Page.handleJavaScriptDialog", {"accept": accept, "promptText": prompt_text})
+        if self._dialogs:
+            self._dialogs.pop()
 
     def server_log(self) -> str:
         return self.log_path.read_text() if self.log_path and self.log_path.exists() else ""
@@ -609,6 +644,23 @@ def click_button_with_text(browser: Browser, text: str, root: str = "#main") -> 
     browser.evaluate(js)
 
 
+def click_checkbox_with_label(browser: Browser, label_text: str, root: str = "#main") -> None:
+    """Click the `<input type=checkbox>` inside the `label.cb` whose own text is exactly
+    `label_text` (the dial's "идеи и рёбра" / "точки-листья" toggles) — same exact-text
+    match as `click_button_with_text`, `.cb` labels share no other selector that would
+    tell them apart. A real `.click()` on the INPUT itself (not the label) toggles
+    `.checked` and fires both "click" and "change" synchronously, exactly what a mouse
+    click does and what the view's own `change` listener (`syncParams`) is wired to —
+    no separate dispatchEvent needed, unlike `fill()`'s text inputs."""
+    js = ("(() => { const labels = [...document.querySelectorAll(%s + ' label.cb')]; "
+          "const lab = labels.find((l) => l.textContent.trim() === %s); "
+          "const input = lab && lab.querySelector('input'); "
+          "if (!input) throw new Error('no label.cb in ' + %s + ' with exact text ' + %s); "
+          "input.click(); })()"
+          % (json.dumps(root), json.dumps(label_text), json.dumps(root), json.dumps(label_text)))
+    browser.evaluate(js)
+
+
 _PAGER_RE = re.compile(
     r"показано\s+([\d\s  ]+)–([\d\s  ]+)\s+из\s+([\d\s  ]+)")
 
@@ -678,22 +730,45 @@ def header_nav_overlap(browser: Browser):
     return browser.evaluate(js)
 
 
-def _install_healthz_override(browser: Browser, response_js: str) -> str:
+def wait_for_request_count(browser: Browser, pattern: str, target: int, timeout: float = 10) -> int:
+    """Polls `browser.count_requests(pattern)` until it reaches (or passes) `target`, instead
+    of a fixed `time.sleep` — the access log is written by a separate process (the server),
+    so "the click fired" and "the log line landed" are not the same instant. Returns the last
+    count seen; raises if `target` is never reached."""
+    deadline = time.monotonic() + timeout
+    last = browser.count_requests(pattern)
+    while time.monotonic() < deadline:
+        last = browser.count_requests(pattern)
+        if last >= target:
+            return last
+        time.sleep(0.2)
+    raise TimeoutError(f"'{pattern}' only reached {last} requests (want >= {target}) within {timeout}s")
+
+
+def _install_url_override(browser: Browser, url_substring: str, response_js: str) -> str:
     """Registers an init script (`add_init_script`) that wraps `window.fetch` so any
-    request whose URL contains "/healthz" runs `response_js` instead of hitting the real
-    network — everything else passes through untouched. `response_js` is raw JS that must
-    `return` a Promise (a rejection for a network failure, or `Promise.resolve(new
+    request whose URL contains `url_substring` runs `response_js` instead of hitting the
+    real network — everything else passes through untouched. `response_js` is raw JS that
+    must `return` a Promise (a rejection for a network failure, or `Promise.resolve(new
     Response(...))` for a real status code). Must run before the page's own <script>, which
-    is exactly what `add_init_script` (unlike a post-goto `evaluate`) guarantees."""
+    is exactly what `add_init_script` (unlike a post-goto `evaluate`) guarantees — needed
+    whenever the mock has to be in place for a tab's own MOUNT-time fetch (e.g. the ingest
+    tab's `loadStaging()`), not just a later, deliberately-triggered refetch."""
     script = (
         "(() => { const orig = window.fetch; "
         "window.fetch = function(input, init) { "
         "const url = typeof input === 'string' ? input : (input && input.url) || ''; "
-        "if (url.includes('/healthz')) { %s } "
+        "if (url.includes(%s)) { %s } "
         "return orig.apply(this, arguments); }; })();"
-    ) % response_js
+    ) % (json.dumps(url_substring), response_js)
 
     return browser.add_init_script(script)
+
+
+def _install_healthz_override(browser: Browser, response_js: str) -> str:
+    """`_install_url_override` scoped to "/healthz" — kept as its own name since every call
+    site above reads more clearly naming the route it is faking than the generic helper."""
+    return _install_url_override(browser, "/healthz", response_js)
 
 
 def _reject_js() -> str:
@@ -2049,12 +2124,796 @@ def test_raw_tab_shows_only_its_own_answer(browser: Browser, base_url: str):
         "before the request fires is what is supposed to prevent this")
 
 
-@test("single_request_on_double_click", expected_fail=True)
+# ==================================================== §0.2/§2.2: state survives a switch
+
+@test("state_survives_a_tab_round_trip")
+def test_state_survives_a_tab_round_trip(browser: Browser, base_url: str):
+    """§0.2/§2.2, the main new guarantee: a tab switch away and back must restore a view
+    from `VIEW_STATE` (memory), not from a second round trip to the server. Checked on all
+    three shapes of state the spec names — dial's hypothesis+k+hits+SVG, retrieve's
+    query+answer, and the SAME pager-offset string that sits in all three list tabs
+    («Идеи», «Тезисы», «Источники») — because each lives in its own view closure (§0.2's
+    own list) and a fix (or a regression) proven on one says nothing about the others.
+    §8.3's M13 found exactly that hole: only «Идеи» used to be checked here, so a broken
+    offset on «Тезисы» or «Источники» stayed green. Every case checks BOTH halves the task
+    asks for: the SCREEN (unchanged) and the server's own access log (no repeat request) —
+    restored from memory, not re-fetched.
+
+    `away` (`#raw`) is a neutral tab that fires no request of its own on mount, so a
+    request count taken either side of the round trip attributes any growth to the
+    view being tested, not to whatever tab sits in between."""
+    problems = []
+    away_wait = "document.querySelector('#main input.mono.grow') !== null"   # raw tab's own input
+
+    # --- dial: hypothesis text, k, hit table, SVG ---
+    hypothesis = f"e2e_state_round_trip_dial_{int(time.time() * 1000)}"
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", hypothesis)
+    set_labeled_input(browser, "k", "7")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
+
+    rows_before = browser.evaluate("document.querySelectorAll('#main table.tbl tbody tr').length")
+    status_before = status_text_sans_code(browser)
+    dial_before = browser.count_requests("GET /dial?")
+
+    browser.evaluate("location.hash = '#raw'")
+    browser.wait_for(away_wait, timeout=10)
+    browser.evaluate("location.hash = '#dial'")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+
+    text_now = browser.evaluate("document.querySelector('#main textarea').value")
+    k_now = read_labeled_number(browser, "k")
+    rows_now = browser.evaluate("document.querySelectorAll('#main table.tbl tbody tr').length")
+    svg_now = browser.evaluate("document.querySelector('.graphwrap svg') !== null")
+    status_now = status_text_sans_code(browser)
+    dial_after = browser.count_requests("GET /dial?")
+
+    if text_now != hypothesis:
+        problems.append(f"[dial] hypothesis text lost across a tab round trip: {text_now!r}")
+    if k_now != "7":
+        problems.append(f"[dial] k reverted to {k_now!r} across a tab round trip, expected '7'")
+    if rows_now != rows_before:
+        problems.append(f"[dial] hit table rows changed across a tab round trip: {rows_before} -> {rows_now}")
+    if not svg_now:
+        problems.append("[dial] SVG is gone after a tab round trip")
+    if status_now != status_before:
+        problems.append(f"[dial] status text changed across a tab round trip: {status_before!r} -> {status_now!r}")
+    if dial_after != dial_before:
+        problems.append(f"[dial] GET /dial fired again on return ({dial_before} -> {dial_after}) "
+                         f"— restored by a repeat request, not from memory")
+
+    # Дыра 4: this round trip goes through a BARE hash ('#dial', no query string) on
+    # purpose, which is exactly what proves the SCREEN is restored from VIEW_STATE rather
+    # than a repeat request — but the same bare hash is also where the address itself used
+    # to degenerate (defect 3): the screen came back, the link in the bar did not. Checked
+    # here, not just on screen: a reload right after this round trip must reopen the SAME
+    # hypothesis, which only holds if `location.href` carries `q=...`, not a bare '#dial'.
+    href_now = browser.evaluate("location.href")
+    if "?" not in href_now.split("#", 1)[-1]:
+        problems.append(f"[dial] the address is still a bare hash after the round trip "
+                         f"(no query string at all): {href_now!r} — a reload here would lose "
+                         f"the hypothesis even though the screen still shows it")
+    elif f"q={hypothesis}" not in href_now:
+        problems.append(f"[dial] the address after the round trip does not carry the "
+                         f"hypothesis {hypothesis!r}: {href_now!r}")
+
+    # --- retrieve: query, rendered answer ---
+    query = f"e2e_state_round_trip_retrieve_{int(time.time() * 1000)}"
+    browser.goto(f"{base_url}/ui#retrieve")
+    browser.wait_for("document.querySelector('#main input.grow') !== null", timeout=10)
+    browser.fill("#main input.grow", query)
+    click_button_with_text(browser, "Спросить озеро")
+    browser.wait_for("document.querySelector('#main .status.ok') !== null", timeout=20)
+
+    # `out` (the answer container `host.replaceChildren(panel, out)` builds) is #main's
+    # second top-level child — it carries no class/id of its own to select on directly.
+    out_sel = "document.querySelectorAll('#main > div')[1]"
+    answer_before = browser.evaluate(f"{out_sel}.innerHTML")
+    query_before = browser.evaluate("document.querySelector('#main input.grow').value")
+    retrieve_before = browser.count_requests("POST /retrieve")
+
+    browser.evaluate("location.hash = '#raw'")
+    browser.wait_for(away_wait, timeout=10)
+    browser.evaluate("location.hash = '#retrieve'")
+    browser.wait_for("document.querySelector('#main input.grow') !== null", timeout=10)
+
+    query_now = browser.evaluate("document.querySelector('#main input.grow').value")
+    answer_now = browser.evaluate(f"{out_sel} ? {out_sel}.innerHTML : null")
+    retrieve_after = browser.count_requests("POST /retrieve")
+
+    if query_now != query_before:
+        problems.append(f"[retrieve] query text lost across a tab round trip: {query_now!r}")
+    if answer_now != answer_before:
+        problems.append("[retrieve] the rendered answer changed across a tab round trip")
+    if retrieve_after != retrieve_before:
+        problems.append(f"[retrieve] POST /retrieve fired again on return "
+                         f"({retrieve_before} -> {retrieve_after}) — restored by a repeat "
+                         f"request, not from memory")
+
+    # Дыра 4, same reasoning as the dial section above: the round trip just taken is
+    # through a bare '#retrieve', not '#retrieve?q=...'.
+    href_now = browser.evaluate("location.href")
+    if "?" not in href_now.split("#", 1)[-1]:
+        problems.append(f"[retrieve] the address is still a bare hash after the round trip: "
+                         f"{href_now!r}")
+    elif f"q={query}" not in href_now:
+        problems.append(f"[retrieve] the address after the round trip does not carry the "
+                         f"query {query!r}: {href_now!r}")
+
+    # --- ideas / theses / sources: pager offset, on ALL THREE list tabs (§8.3's M13) ---
+    # The same "показано A–B из C" string and the same pager() component sit in «Идеи»,
+    # «Тезисы» and «Источники» alike, each behind its own view closure with its own
+    # `state.offset` — a fix (or a break) proven on one tab says nothing about the other
+    # two, which is exactly how a broken offset on «Тезисы»/«Источники» stayed green
+    # before this loop existed here.
+    for tab, request_prefix in [("ideas", "GET /ideas?"), ("theses", "GET /theses?"),
+                                 ("sources", "GET /sources?")]:
+        browser.goto(f"{base_url}/ui#{tab}")
+        browser.wait_for("document.querySelector('#main .pager') !== null", timeout=10)
+        before_text = browser.evaluate("document.querySelector('#main .pager').textContent")
+        from0, to0, total0 = parse_pager(before_text)
+        if from0 != 1 or total0 <= to0:
+            problems.append(f"[{tab}] stand has too little data to page forward ({before_text!r}) "
+                             f"— this part of the test needs more than one page")
+            continue
+        page_size = to0 - from0 + 1
+        click_pager_forward(browser, before_text)
+        moved_text = browser.evaluate("document.querySelector('#main .pager').textContent")
+        page_pattern = f"{request_prefix}limit={page_size}&offset={page_size}"
+        before_count = browser.count_requests(page_pattern)
+
+        browser.evaluate("location.hash = '#raw'")
+        browser.wait_for(away_wait, timeout=10)
+        browser.evaluate(f"location.hash = '#{tab}'")
+        browser.wait_for("document.querySelector('#main .pager') !== null", timeout=10)
+
+        after_text = browser.evaluate("document.querySelector('#main .pager').textContent")
+        after_count = browser.count_requests(page_pattern)
+
+        if after_text != moved_text:
+            problems.append(f"[{tab}] pager text changed across a tab round trip: "
+                             f"{moved_text!r} -> {after_text!r}")
+        if after_count != before_count:
+            problems.append(f"[{tab}] {page_pattern} fired again on return "
+                             f"({before_count} -> {after_count}) — offset restored by a "
+                             f"repeat request, not from memory")
+
+        # Дыра 4, same reasoning again: the pager's own offset is a query param
+        # (`setParams({offset: ...})` in `load()`), and the round trip above went through
+        # the same bare hash the dial/retrieve checks above use.
+        href_now = browser.evaluate("location.href")
+        if "?" not in href_now.split("#", 1)[-1] or f"offset={page_size}" not in href_now:
+            problems.append(f"[{tab}] the address after the round trip does not carry its "
+                             f"own offset ({page_size}): {href_now!r}")
+
+    assert not problems, "; ".join(problems)
+
+
+_STALE_AWAY_WAIT = "document.querySelector('#main input.mono.grow') !== null"   # raw tab's own input
+
+
+def _round_trip_via_raw(browser: Browser, tab: str, field_sel: str):
+    """Leave for the neutral '#raw' tab and come back through a BARE hash (no query
+    string) — same pattern `state_survives_a_tab_round_trip` uses, and for the same
+    reason: a bare hash is exactly the path where a mount-time restore has nothing but
+    `ctx.state`/`VIEW_STATE` to go on, which is what both of the tests below exist to
+    exercise."""
+    browser.evaluate("location.hash = '#raw'")
+    browser.wait_for(_STALE_AWAY_WAIT, timeout=10)
+    browser.evaluate(f"location.hash = '#{tab}'")
+    browser.wait_for(f"document.querySelector({json.dumps(field_sel)}) !== null", timeout=10)
+
+
+@test("stale_answer_marked_after_a_tab_round_trip")
+def test_stale_answer_marked_after_a_tab_round_trip(browser: Browser, base_url: str):
+    """Дыра 1 (§4.1's `markAnswerStale`): a mount that restores an answer from `ctx.state`
+    whose OWN params no longer match what the field/address show right now — the operator
+    typed something new, no refetch yet — must say so in words and must never look green.
+    Covers the three views that share this exact restore path (dial, retrieve, search): a
+    guard proven on one says nothing about the other two, the same lesson §8.3's M13
+    already taught about the pager offset (see `state_survives_a_tab_round_trip`'s own
+    docstring).
+
+    For each view: fire a real query A, get a real green answer; type B into the SAME
+    field WITHOUT clicking anything (no refetch — `ctx.state` still holds A's answer,
+    while `CURRENT_PARAMS`/the field now read B, since `fill()`'s own 'input' event runs
+    the view's `syncParams` synchronously); leave the tab and come back through a bare hash.
+    The remount's restore path must not present A's answer as though it were B's."""
+    ts = int(time.time() * 1000)
+    configs = [
+        ("dial", "#main textarea", "Разложить", f"e2e_stale_dial_a_{ts}", f"e2e_stale_dial_b_{ts}"),
+        ("retrieve", "#main input.grow", "Спросить озеро",
+         f"e2e_stale_retrieve_a_{ts}", f"e2e_stale_retrieve_b_{ts}"),
+        # Space-separated words, not an underscore-joined id: "search" is the raw BM25+vector
+        # hybrid, and a random alnum token matches nothing in the corpus' FTS index — every
+        # row would come back with a null bm25_rank, `hits.deadFts` would be true, and the
+        # FIRST call would render '.status.warn', never the green baseline this test needs.
+        # "probe" (confirmed against the real stand) is a real BM25 hit.
+        ("search", "#main input.grow", "Искать",
+         f"e2e stale search probe a {ts}", f"e2e stale search probe b {ts}"),
+    ]
+    problems = []
+    for tab, field_sel, btn_text, text_a, text_b in configs:
+        browser.goto(f"{base_url}/ui#{tab}")
+        browser.wait_for(f"document.querySelector({json.dumps(field_sel)}) !== null", timeout=10)
+        browser.fill(field_sel, text_a)
+        click_button_with_text(browser, btn_text)
+        browser.wait_for("document.querySelector('#main .status.ok') !== null", timeout=20)
+
+        # The field moves on to B — no button click, no request — while ctx.state still
+        # holds the answer to A.
+        browser.fill(field_sel, text_b)
+
+        _round_trip_via_raw(browser, tab, field_sel)
+
+        field_now = browser.evaluate(f"document.querySelector({json.dumps(field_sel)}).value")
+        if field_now != text_b:
+            problems.append(f"[{tab}] the field itself lost its edit across the round trip: "
+                             f"{field_now!r}, expected {text_b!r}")
+            continue
+
+        snapshot = browser.evaluate(
+            "(() => { const boxes = [...document.querySelectorAll('#main .status')]; "
+            "return { anyOk: boxes.some((b) => b.classList.contains('ok')), "
+            "text: boxes.map((b) => b.textContent).join(' | ') }; })()")
+        if snapshot["anyOk"]:
+            problems.append(f"[{tab}] the field now reads {text_b!r} but a restored answer to "
+                             f"the SUPERSEDED query {text_a!r} still shows a green '.status.ok' "
+                             f"box: {snapshot['text']!r}")
+        if text_a not in snapshot["text"]:
+            problems.append(f"[{tab}] the restored status does not name the superseded query "
+                             f"{text_a!r} in words anywhere under #main: {snapshot['text']!r}")
+    assert not problems, "; ".join(problems)
+
+
+@test("failure_in_a_later_mount_outranks_an_earlier_success")
+def test_failure_in_a_later_mount_outranks_an_earlier_success(browser: Browser, base_url: str):
+    """Дыра 2 (§4.1 defect 1 — the seq counter moved onto `ctx.state`): success in mount 1,
+    a tab round trip, THEN a failure of the SAME request inside mount 2, THEN another round
+    trip — mount 3 must show the failure, not the success that predates it. A SINGLE round
+    trip cannot reach this: `state_survives_a_tab_round_trip` and
+    `stale_answer_marked_after_a_tab_round_trip` above both fire and fail within one mount,
+    so a per-mount counter (reset to 0 on every mount — the exact shape of the fixed bug)
+    would still tell success and failure apart there, since both live in the SAME mount's
+    own counter. The bug only surfaces once the failure happens in a mount STRICTLY LATER
+    than the one that produced the success — a per-mount `let generation = 0` starts back at
+    0 in the later mount too, so its own errSeq (namely 1) could tie or lose against the
+    earlier mount's own okSeq (also minted from its own 0-based counter, also 1).
+
+    Three views share this exact `ctx.state.seq` counter — dial, retrieve, AND search (see
+    its own `fire()`: "on `ctx.state`, not a local `let seq = 0` — see the dial view for
+    why"). A guard proven on two of the three says nothing about the third: a mutation that
+    puts search's counter back on a local variable passes a `configs` list that only
+    exercises dial/retrieve. Search's own SUCCESS on this corpus renders `.status.warn`, not
+    `.status.ok` (a random alnum hypothesis matches nothing in the FTS index, so
+    `hits.deadFts` is true — confirmed against the live index, same fact
+    `stale_answer_marked_after_a_tab_round_trip`'s own configs rely on for the opposite
+    reason). Asserting "no `.status.ok` in mount 3" would therefore hold trivially for
+    search whether or not the bug survives — vacuous — so `success_class` below picks the
+    class each view's OWN success actually uses, and the one check that is never vacuous
+    for any of the three, `.status.err` present in mount 3, is asserted unconditionally."""
+    ts = int(time.time() * 1000)
+    configs = [
+        # (tab, field_sel, btn_text, hypothesis, url_substr, success_class)
+        ("dial", "#main textarea", "Разложить", f"e2e_hole2_dial_{ts}", "/dial", "ok"),
+        ("retrieve", "#main input.grow", "Спросить озеро", f"e2e_hole2_retrieve_{ts}", "/retrieve", "ok"),
+        ("search", "#main input.grow", "Искать", f"e2e_hole2_search_{ts}", "/search", "warn"),
+    ]
+    problems = []
+    for tab, field_sel, btn_text, text, url_substr, success_class in configs:
+        browser.goto(f"{base_url}/ui#{tab}")
+        browser.wait_for(f"document.querySelector({json.dumps(field_sel)}) !== null", timeout=10)
+        browser.fill(field_sel, text)
+        click_button_with_text(browser, btn_text)
+        browser.wait_for(f"document.querySelector('#main .status.{success_class}') !== null",
+                          timeout=20)   # mount 1: success
+
+        _round_trip_via_raw(browser, tab, field_sel)   # mount 2
+
+        browser.evaluate("""
+          (() => {
+            window.__e2eOrigFetch = window.fetch;
+            window.fetch = function(input, init) {
+              const url = typeof input === "string" ? input : (input && input.url) || "";
+              if (url.includes(%s)) return Promise.resolve(new Response("{}",
+                {status: 503, headers: {"Content-Type": "application/json"}}));
+              return window.__e2eOrigFetch(input, init);
+            };
+          })()
+        """ % json.dumps(url_substr))
+        try:
+            # Same field value already restored by mount 2 — refiring it is the SAME
+            # request, now answering 503, strictly inside this second mount.
+            click_button_with_text(browser, btn_text)
+            browser.wait_for("document.querySelector('#main .status.err') !== null", timeout=10)
+        finally:
+            browser.evaluate("(() => { if (window.__e2eOrigFetch) { "
+                              "window.fetch = window.__e2eOrigFetch; delete window.__e2eOrigFetch; } })()")
+
+        _round_trip_via_raw(browser, tab, field_sel)   # mount 3
+
+        snapshot = browser.evaluate(
+            "(() => { const boxes = [...document.querySelectorAll('#main .status')]; "
+            "return { anyOk: boxes.some((b) => b.classList.contains('ok')), "
+            "anyErr: boxes.some((b) => b.classList.contains('err')) }; })()")
+        # Only meaningful when the view's OWN success is `.status.ok` (dial, retrieve):
+        # search's success is `.status.warn` here (see the docstring above), so "no
+        # .status.ok" holds regardless of the bug and would be a vacuous check.
+        if success_class == "ok" and snapshot["anyOk"]:
+            problems.append(f"[{tab}] a THIRD mount reads back '.status.ok' even though the "
+                             f"request failed inside the SECOND mount, strictly after the "
+                             f"first mount's own success")
+        if not snapshot["anyErr"]:
+            problems.append(f"[{tab}] a THIRD mount shows no '.status.err' at all, even though "
+                             f"the request failed inside the second mount")
+    assert not problems, "; ".join(problems)
+
+
+@test("dial_idea_layer_matches_its_own_checkbox")
+def test_dial_idea_layer_matches_its_own_checkbox(browser: Browser, base_url: str):
+    """Дыра 2 (§4.1 defect 2 — `drawIdeas` as `drawDial`'s single source of truth): the
+    picture must agree with the LIVE "идеи и рёбра" checkbox at draw time, not with
+    whatever `graph` a past fetch left sitting in `ctx.state`. Neither reading alone is
+    that truth — the checkbox alone lies right after a bare-hash round trip restores an
+    unrelated `params.graph` from a PREVIOUS setting, and `graph` alone lies too (a cached
+    fetch from before the box was unticked) — only `Boolean(withGraph.checked && graph)`,
+    read fresh on every redraw, is. Toggling the checkbox alone never repaints the SVG
+    (`renderAll`/`drawDial` only run from a fetch or a mount-time restore — see `fire()`
+    and the dial's own mount code) — a tab round trip through the neutral `#raw` tab is
+    what forces the redraw in both directions below, same helper `stale_answer_marked_
+    after_a_tab_round_trip` uses for the same reason.
+
+    (1) fetch WITH the box checked (idea nodes really drawn from a real graph), un-check
+        it WITHOUT re-fetching, round-trip: the redraw must show zero `circle.ideanode`
+        and never say "идей на картинке" — the still-cached graph must not leak through
+        a now-unchecked box. The leaf dots must ALSO read the "layer off" style
+        (`leafAlpha`/`leafR` in `drawDial`) even though a real graph sits in `ctx.state`
+        — the other half of the same fix, and observable straight off the SVG's own `r`/
+        `fill-opacity` attributes, no `getComputedStyle` needed (`drawDial` sets both as
+        plain SVG attributes, not CSS).
+    (2) fetch WITH the box UNCHECKED (`graph` never fetched, stays null), check it
+        WITHOUT re-fetching, round-trip: zero idea nodes again (nothing to draw them
+        from) and a REQUIRED non-green line naming that the shown answer was read
+        without the graph — the box now reads on, the picture cannot honour that yet,
+        and staying silent about it is the exact lie `renderAll`'s `else if (!graph)`
+        branch exists to head off."""
+    ts = int(time.time() * 1000)
+    field_sel = "#main textarea"
+    problems = []
+
+    # --- (1) fetched WITH the graph, unchecked afterwards, no refetch -------------
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for(f"document.querySelector({json.dumps(field_sel)}) !== null", timeout=10)
+    browser.fill(field_sel, f"e2e_hole2_layer_a_{ts}")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0",
+                      timeout=20)
+
+    click_checkbox_with_label(browser, "идеи и рёбра")   # un-check — no refetch
+    _round_trip_via_raw(browser, "dial", field_sel)
+
+    snap1 = browser.evaluate(
+        "(() => { const svg = document.querySelector('.graphwrap svg'); "
+        "const leaf = svg && svg.querySelector('g:nth-child(2) circle'); "  # gPts: leaf dots
+        "const legend = document.querySelector('.legend.wrap'); "
+        "return { ideaCount: document.querySelectorAll('.graphwrap svg circle.ideanode').length, "
+        "mainText: document.querySelector('#main').textContent, "
+        "leafR: leaf && leaf.getAttribute('r'), "
+        "leafAlpha: leaf && leaf.getAttribute('fill-opacity'), "
+        "legendText: legend ? legend.textContent : '' }; })()")
+    if snap1["ideaCount"] != 0:
+        problems.append(f"[uncheck-after-fetch] {snap1['ideaCount']} circle.ideanode still drawn "
+                         f"with the box unchecked and no refetch — the stale cached graph leaked through")
+    if "идей на картинке" in snap1["mainText"]:
+        problems.append("[uncheck-after-fetch] the status still claims idea coverage "
+                         "('идей на картинке') with the box unchecked")
+    if snap1["leafR"] != "1.9" or snap1["leafAlpha"] != "0.72":
+        problems.append(f"[uncheck-after-fetch] leaf dots still read the idea-layer-ON style "
+                         f"(r={snap1['leafR']!r}, fill-opacity={snap1['leafAlpha']!r}) even though "
+                         f"the box is unchecked and zero ideas are drawn (expected r=1.9, fill-opacity=0.72)")
+    if "угол ничего не значит" not in snap1["legendText"]:
+        problems.append(f"[uncheck-after-fetch] legend does not read '· угол ничего не значит' "
+                         f"even though zero ideas are drawn: {snap1['legendText']!r}")
+    if "крупные узлы — идеи" in snap1["legendText"]:
+        problems.append(f"[uncheck-after-fetch] legend still claims 'крупные узлы — идеи' "
+                         f"(the idea/edge layer caption) with the box unchecked and zero ideas drawn: "
+                         f"{snap1['legendText']!r}")
+
+    # --- (2) fetched WITHOUT the graph, checked afterwards, no refetch ------------
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for(f"document.querySelector({json.dumps(field_sel)}) !== null", timeout=10)
+    click_checkbox_with_label(browser, "идеи и рёбра")   # un-check BEFORE firing
+    browser.fill(field_sel, f"e2e_hole2_layer_b_{ts}")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelector('#main .status.ok') !== null", timeout=20)
+
+    click_checkbox_with_label(browser, "идеи и рёбра")   # re-check — no refetch
+    _round_trip_via_raw(browser, "dial", field_sel)
+
+    snap2 = browser.evaluate(
+        "(() => { const boxes = [...document.querySelectorAll('#main .status')]; "
+        "return { ideaCount: document.querySelectorAll('.graphwrap svg circle.ideanode').length, "
+        "anyNonGreen: boxes.some((b) => !b.classList.contains('ok')), "
+        "text: boxes.map((b) => b.textContent).join(' | ') }; })()")
+    if snap2["ideaCount"] != 0:
+        problems.append(f"[check-after-fetch] {snap2['ideaCount']} circle.ideanode drawn even "
+                         f"though the graph was never fetched for this answer")
+    if "прочитан без графа" not in snap2["text"]:
+        problems.append(f"[check-after-fetch] the box now reads checked but nothing under #main "
+                         f"says the shown answer was read without the graph: {snap2['text']!r}")
+    if not snap2["anyNonGreen"]:
+        problems.append("[check-after-fetch] every status box under #main reads '.status.ok' — "
+                         "that reads as though the checked box's graph WAS honoured, silently")
+
+    assert not problems, "; ".join(problems)
+
+
+@test("url_reproduces_the_view")
+def test_url_reproduces_the_view(browser: Browser, base_url: str):
+    """§2.2/§9.3: a link carrying dial params must fill the fields WITHOUT firing a
+    request — the one exception is an explicit `&run=1`, which must fire the request and
+    land on the SAME numbers a direct API call gives (proving the URL, not just some
+    request, drove the answer). On `retrieve`, `run=1` must NOT auto-fire anything at all
+    (that route writes a line to `retrieve.jsonl` — an unsolicited write from just opening
+    a link) and the tab must say so in words, not just stay silently blank.
+
+    Hypotheses here are alnum+underscore only (no spaces/punctuation) on purpose: that
+    keeps Python's `urllib.parse.quote` and the page's own `encodeURIComponent` identical
+    byte for byte, so a plain substring search of the access log can tell "no request
+    carried this q" apart from "a request carried it, differently encoded" without having
+    to reimplement the page's own encoding to compare against it."""
+    # (a) params alone: fields filled, no request fired.
+    hypothesis = f"e2e_url_reproduces_dial_{int(time.time() * 1000)}"
+    q = urllib.parse.quote(hypothesis)
+    browser.goto(f"{base_url}/ui#dial?q={q}&k=9")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    text_now = browser.evaluate("document.querySelector('#main textarea').value")
+    k_now = read_labeled_number(browser, "k")
+    assert text_now == hypothesis, f"opening a dial link did not fill the hypothesis field: {text_now!r}"
+    assert k_now == "9", f"opening a dial link did not fill k: {k_now!r}"
+    time.sleep(1.0)   # give a wrongly-firing request time to land in the access log
+    assert browser.count_requests(f"q={hypothesis}") == 0, (
+        f"opening #dial?q={hypothesis}&k=9 (no run=1) fired a request carrying that q anyway")
+
+    # (b) same link + run=1: request fires, lands on the SAME numbers a direct call gives.
+    with urllib.request.urlopen(f"{base_url}/dial?q={q}&k=9", timeout=15) as r:
+        direct = json.loads(r.read())
+    browser.goto(f"{base_url}/ui#dial?q={q}&k=9&run=1")
+    browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
+    status_text = status_text_sans_code(browser)
+    shown_total = extract_count_before(status_text, "листьев")
+    assert shown_total == direct["total"], (
+        f"#dial?...&run=1 shows total={shown_total}, a direct GET /dial with the same "
+        f"params says total={direct['total']}")
+    rows = browser.evaluate("document.querySelectorAll('#main table.tbl tbody tr').length")
+    assert rows == len(direct["hits"]), (
+        f"#dial?...&run=1 hit table has {rows} rows, a direct call returned {len(direct['hits'])}")
+
+    # (c) run=1 on retrieve: must NOT auto-fire (that route writes retrieve.jsonl), and the
+    # tab must say so in its own text.
+    query2 = f"e2e_url_reproduces_retrieve_{int(time.time() * 1000)}"
+    q2 = urllib.parse.quote(query2)
+    before = browser.count_requests("POST /retrieve")
+    browser.goto(f"{base_url}/ui#retrieve?q={q2}&run=1")
+    browser.wait_for("document.querySelector('#main input.grow') !== null", timeout=10)
+    time.sleep(1.5)   # give a wrongly-firing POST time to land in the access log
+    after = browser.count_requests("POST /retrieve")
+    assert after == before, (
+        f"#retrieve?q=...&run=1 fired a POST /retrieve ({before} -> {after}) — run=1 must "
+        f"only ever be honoured on the dial; retrieve writes to retrieve.jsonl")
+    main_text = browser.evaluate("document.querySelector('#main').textContent")
+    assert "run=1" in main_text, (
+        f"opening #retrieve?...&run=1 filled the field but said nothing in words about "
+        f"why the request was NOT sent — expected 'run=1' to be named somewhere in #main, "
+        f"got: {main_text[:400]!r}")
+
+
+@test("typing_updates_the_address")
+def test_typing_updates_the_address(browser: Browser, base_url: str):
+    """§8.3's M3: `url_reproduces_the_view` (above) only ever drives the URL -> fields
+    direction — it opens an ALREADY-formed link, which is `parseHash`'s job, not
+    `setParams`'s. Deleting the `history.replaceState` call out of `setParams` entirely
+    passes every one of the other 36 checks in this file: `url_reproduces_the_view` never
+    types into a field, and `state_survives_a_tab_round_trip` holds the view in
+    `VIEW_STATE` memory across a switch, never touching `location.hash` at all. This is the
+    missing other half: type into the field, read the address back out, then open THAT
+    address as a brand new document (a real `goto`, not a same-page re-read) and check the
+    fields return byte for byte.
+
+    The typed string carries a space, an `&`, a `#` and Cyrillic together on purpose — the
+    exact combination `formatHash`'s own comment says is not a byte-for-byte round trip in
+    general (`URLSearchParams` re-encodes a space as `+`), so a test that only ever used
+    `urllib.parse.quote`-safe alnum text (as `url_reproduces_the_view` does, deliberately,
+    for a different reason) would never exercise the encoding at all."""
+    hypothesis = ("typing test with a space & a hash #tag и немного кириллицы "
+                  + str(int(time.time() * 1000)))
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", hypothesis)
+    set_labeled_input(browser, "k", "37")
+
+    href = browser.evaluate("location.href")
+    assert "#" in href, f"typing into the dial fields left no hash route at all: {href!r}"
+    frag = href.split("#", 1)[1]
+    tab_and_arg, _, query = frag.partition("?")
+    assert tab_and_arg == "dial", f"typing into the dial's own fields changed the route: {frag!r}"
+    parsed = urllib.parse.parse_qs(query)
+    assert parsed.get("q") == [hypothesis], (
+        f"the address does not carry the typed hypothesis byte for byte: "
+        f"q={parsed.get('q')!r}, typed {hypothesis!r} (full hash: {frag!r})")
+    assert parsed.get("k") == ["37"], f"the address does not carry the typed k: {frag!r}"
+
+    # Open the EXACT address just read back, as a brand new document — this is `goto()`,
+    # which forces a real navigation (see its own docstring), so a pass here can only be
+    # `parseHash` restoring the fields on load, never `VIEW_STATE` still holding them.
+    browser.goto(href)
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    text_now = browser.evaluate("document.querySelector('#main textarea').value")
+    k_now = read_labeled_number(browser, "k")
+    assert text_now == hypothesis, (
+        f"reopening the address the page itself just produced lost the hypothesis: "
+        f"{text_now!r}, typed {hypothesis!r}")
+    assert k_now == "37", f"reopening the address the page itself just produced lost k: {k_now!r}"
+
+
+@test("timers_die_with_the_tab")
+def test_timers_die_with_the_tab(browser: Browser, base_url: str):
+    """§2.2/§4.2: the ingest queue's autorefresh `setInterval` must die when its tab is
+    left, or it is a background timer hitting the server from a tab nobody is looking at —
+    and once `VIEW_STATE` keeps the ingest view mounted-in-memory across a switch, a timer
+    that does not unregister itself leaks one MORE interval every time the operator
+    revisits the tab. Turns autorefresh on, waits for two real ticks off the server's OWN
+    access log (a background timer is not something Chrome's readyState can wait on), then
+    leaves for another tab and waits comfortably longer than one period for a THIRD tick
+    that must never come."""
+    PERIOD_S = 4.0   # console.html's own "автообновление 4 с" (setInterval(..., 4000))
+    browser.goto(f"{base_url}/ui#ingest")
+    browser.wait_for("document.querySelector('#main input[type=checkbox]') !== null", timeout=10)
+
+    before = browser.count_requests("GET /ingest/jobs")
+    browser.click("#main input[type=checkbox]")   # the tab's only checkbox: "автообновление 4 с"
+    after_two_ticks = wait_for_request_count(browser, "GET /ingest/jobs", before + 2,
+                                              timeout=PERIOD_S * 3 + 5)
+
+    browser.evaluate("location.hash = '#dial'")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    time.sleep(PERIOD_S * 2.5)   # comfortably longer than one period, spent on another tab
+    after_leaving = browser.count_requests("GET /ingest/jobs")
+
+    assert after_leaving == after_two_ticks, (
+        f"GET /ingest/jobs kept firing after leaving the 'ингест' tab: {after_two_ticks} "
+        f"requests when leaving it, {after_leaving} now, {PERIOD_S * 2.5:.0f}s later — the "
+        f"autorefresh timer outlived its tab")
+
+
+@test("failed_call_returns_the_button")
+def test_failed_call_returns_the_button(browser: Browser, base_url: str):
+    """§4.2/§8.4: a rejected `/dial` or `/retrieve` fetch must not leave its button stuck
+    grey forever — nothing on screen would invite a retry. This does NOT exercise `guard`'s
+    own `finally` on its throw path, and its docstring used to claim it did: console.html's
+    `run()` catches every error itself (an `ApiError`, a plain network reject, even a
+    render throw past a successful fetch) and never rethrows, so the `fn(event)` `guard`
+    awaits here never actually throws either — `guard`'s `finally` runs on the exact same
+    non-exceptional path it takes on success. What this proves is `run()`'s own guarantee
+    (a failed call still leaves the button clickable again), not a direct test of `guard`'s
+    `finally` catching an exception — that lives in the page's own `?selftest=1` block,
+    which can synchronously make a wrapped `fn` throw past `run()` and assert the button
+    comes back anyway. Checked on both action buttons this guarantee covers; proven on one
+    says nothing about the other, same reasoning as every other per-view test above."""
+    configs = [
+        ("dial", "#main textarea", f"e2e_failed_call_dial_{int(time.time() * 1000)}",
+         "Разложить", "/dial"),
+        ("retrieve", "#main input.grow", f"e2e_failed_call_retrieve_{int(time.time() * 1000)}",
+         "Спросить озеро", "/retrieve"),
+    ]
+    problems = []
+    for tab, field_sel, text, btn_text, url_substr in configs:
+        browser.goto(f"{base_url}/ui#{tab}")
+        browser.wait_for(f"document.querySelector({json.dumps(field_sel)}) !== null", timeout=10)
+        browser.fill(field_sel, text)
+
+        browser.evaluate("""
+          (() => {
+            window.__e2eOrigFetch = window.fetch;
+            window.fetch = function(input, init) {
+              const url = typeof input === "string" ? input : (input && input.url) || "";
+              if (url.includes(%s)) return Promise.reject(new TypeError("e2e-injected: offline"));
+              return window.__e2eOrigFetch(input, init);
+            };
+          })()
+        """ % json.dumps(url_substr))
+        try:
+            click_button_with_text(browser, btn_text)
+            browser.wait_for("document.querySelector('#main .status.err') !== null", timeout=10)
+        finally:
+            browser.evaluate("(() => { if (window.__e2eOrigFetch) { "
+                              "window.fetch = window.__e2eOrigFetch; delete window.__e2eOrigFetch; } })()")
+
+        disabled = browser.evaluate(
+            "(() => { const btns = [...document.querySelectorAll('#main button')]; "
+            "const b = btns.find((x) => x.textContent.trim() === " + json.dumps(btn_text) + "); "
+            "return b ? b.disabled : null; })()")
+        if disabled is None:
+            problems.append(f"[{tab}] no button with text {btn_text!r} found after the failed call")
+        elif disabled:
+            problems.append(f"[{tab}] '{btn_text}' is still disabled after its call failed — "
+                             f"stuck grey forever, a new silent failure of its own")
+    assert not problems, "; ".join(problems)
+
+
+@test("confirm_is_asked_before_expensive")
+def test_confirm_is_asked_before_expensive(browser: Browser, base_url: str):
+    """§4.2/§8.3's M10: three costly/destructive actions ('Судить', 'Выгрузить в
+    Obsidian', 'Фаза 2') must ask `confirm()` before calling their route, and Cancel must
+    send NOTHING, checked against the server's OWN access log rather than trusting the
+    page's claim. `re.search(r"\\d", message)` alone (the old check) passes on a FABRICATED
+    zero — "идей 0, тезисов 0, источников 0" contains a digit whether or not it is real,
+    exactly the class of lie §4.1 bans — so this reads the reference numbers straight off
+    `GET /stats` and asserts the dialog names THOSE, not just some digit:
+
+      - 'Выгрузить в Obsidian' must quote the real идей/тезисов/источников counts /stats
+        answers with right now (normalised for the page's own thousands separator — it
+        prints via `toLocaleString("ru-RU")`, a non-breaking space, not a plain one).
+      - 'Судить' with the id field EMPTY must say the real (zero) count of explicit ids in
+        those exact words — not just a stray digit that happens to be a literal 0.
+      - 'Судить' with the id field FILLED must name the REAL count of ids just typed, so a
+        mutation that hardcodes some other number in that branch cannot hide behind "some
+        digit is present, still".
+
+    Only ever cancels: this suite must not actually run a 35B judge pass, export the
+    vault, or write phase 2 into the shared graph as a side effect of testing that the
+    GUARD exists — the guard's whole job is to make that an operator's deliberate choice,
+    and accepting here to "prove" it fires would defeat the reason this test exists.
+
+    Dialog interception is CDP's `Page.javascriptDialogOpening` / `handleJavaScriptDialog`
+    (see `Browser.wait_for_dialog`/`handle_dialog`) — a bare Python `assert` here cannot
+    see a real `window.confirm()` at all, since it blocks the page's own JS thread until
+    answered.
+
+    Дыра 3: 'Фаза 2's own dialog quotes `pending_lines` straight off `GET /ingest/staging`
+    (console.html's own comment at the call site says so) — checked here against a MOCKED,
+    fabricated, nonzero `pending_lines`, never against the real stand's, which happens to be
+    0 right now: a mutation that simply zeroed the dialog's own number (or hardcoded any
+    other single literal) would be indistinguishable from correct against a real 0, and
+    prove nothing about whether the page is actually reading staging's own field."""
+    with urllib.request.urlopen(f"{base_url}/stats", timeout=15) as r:
+        stats = json.loads(r.read())
+
+    FAKE_PENDING = 12345
+    staging_ident = _install_url_override(browser, "/ingest/staging", _response_js(200, {
+        "lines": FAKE_PENDING, "cursor": "e2e-fake-cursor",
+        "pending_lines": FAKE_PENDING, "sources": [],
+    }))
+
+    def number_after(text, label):
+        """The integer immediately after a literal label word (e.g. `"идей 12 345,"`),
+        the mirror image of `extract_count_before` — this dialog's own template puts the
+        label BEFORE its number, not after."""
+        m = re.search(re.escape(label) + r"\s+([\d" + _THOUSANDS_SEP[1:-1] + r"]+)", text)
+        assert m, f"no number right after {label!r} in: {text!r}"
+        return int(re.sub(_THOUSANDS_SEP, "", m.group(1)))
+
+    problems = []
+    try:
+        browser.goto(f"{base_url}/ui#ingest")
+        browser.wait_for("document.querySelector('#main .panel') !== null", timeout=10)
+        # LAST_STATS (the number 'Выгрузить в Obsidian' actually quotes) is filled by the
+        # page's own boot-time refreshStrip() — give that its own request time to land
+        # instead of racing it, independently of however long the steps below happen to take.
+        browser.wait_for("typeof LAST_STATS !== 'undefined' && LAST_STATS !== null", timeout=15)
+        # The mocked /ingest/staging (installed above, before this goto) must actually have
+        # landed and rendered before 'Фаза 2' is clicked below — this badge is the tab's own,
+        # real confirmation that it did, not an assumption.
+        browser.wait_for(
+            "[...document.querySelectorAll('#main .badge')].some((b) => "
+            "b.textContent.includes(" + json.dumps(f"ждёт фазы 2: {FAKE_PENDING}") + "))",
+            timeout=10)
+
+        _confirm_is_asked_before_expensive_steps(browser, base_url, stats, FAKE_PENDING,
+                                                  number_after, problems)
+    finally:
+        browser.remove_init_script(staging_ident)
+    assert not problems, "; ".join(problems)
+
+
+def _confirm_is_asked_before_expensive_steps(browser, base_url, stats, FAKE_PENDING,
+                                              number_after, problems):
+    """The three dialogs themselves — split out of `test_confirm_is_asked_before_expensive`
+    only so that function's own `try/finally` (removing the '/ingest/staging' mock) reads as
+    one screenful, not because this needs to be reusable."""
+
+    def judge_and_cancel(note):
+        before = browser.count_requests("POST /admin/trust")
+        click_button_with_text(browser, "Судить")
+        try:
+            dialog = browser.wait_for_dialog(timeout=5)
+        except TimeoutError:
+            problems.append(f"[Судить{note}] no confirm() dialog opened before POST /admin/trust")
+            return None
+        message = dialog.get("message", "")
+        browser.handle_dialog(accept=False)   # Cancel — never accept, see docstring
+        time.sleep(0.5)   # give a wrongly-firing request time to land in the access log
+        after = browser.count_requests("POST /admin/trust")
+        if after != before:
+            problems.append(f"[Судить{note}] cancelling still sent POST /admin/trust "
+                             f"({before} -> {after})")
+        return message
+
+    # (a) empty field: the real count of explicit ids is 0 — the dialog must say so in
+    # these exact words, not merely contain SOME digit (a hardcoded "0" would too).
+    msg_empty = judge_and_cancel(" (id field empty)")
+    if msg_empty is not None and "не указано (0)" not in msg_empty:
+        problems.append(f"[Судить (id field empty)] expected the literal explicit-id count "
+                         f"'не указано (0)' in the dialog text, got: {msg_empty!r}")
+
+    # (b) filled field: the dialog must name the REAL count of ids just typed — a mutation
+    # that swaps `ids.length` for a different number would survive (a) above (still 0
+    # there) and would survive the old bare-digit check, but not this.
+    ids_typed = ["e2e_a", "e2e_b", "e2e_c"]
+    set_labeled_input(browser, "судить идеи", ", ".join(ids_typed))
+    msg_filled = judge_and_cancel(" (id field filled)")
+    if msg_filled is not None:
+        m = re.search(r"над\s+(\d+)\s+указанными", msg_filled)
+        if not m or int(m.group(1)) != len(ids_typed):
+            problems.append(f"[Судить (id field filled)] expected 'над {len(ids_typed)} "
+                             f"указанными' in the dialog text, got: {msg_filled!r}")
+    set_labeled_input(browser, "судить идеи", "")   # leave the field clean for what follows
+
+    # --- 'Выгрузить в Obsidian': dialog must quote the REAL /stats numbers ---
+    before = browser.count_requests("POST /vault/export")
+    click_button_with_text(browser, "Выгрузить в Obsidian")
+    try:
+        dialog = browser.wait_for_dialog(timeout=5)
+        message = dialog.get("message", "")
+        for label, real in [("идей", stats["ideas"]), ("тезисов", stats["theses"]),
+                             ("источников", stats["sources"])]:
+            shown = number_after(message, label)
+            if shown != real:
+                problems.append(f"[Выгрузить в Obsidian] dialog says {label} {shown}, "
+                                 f"GET /stats says {real} — {message!r}")
+        browser.handle_dialog(accept=False)   # Cancel — never accept, see docstring
+        time.sleep(0.5)   # give a wrongly-firing request time to land in the access log
+        after = browser.count_requests("POST /vault/export")
+        if after != before:
+            problems.append(f"[Выгрузить в Obsidian] cancelling still sent POST /vault/export "
+                             f"({before} -> {after})")
+    except TimeoutError:
+        problems.append("[Выгрузить в Obsidian] no confirm() dialog opened before POST /vault/export")
+
+    # --- 'Фаза 2': the dialog's own number must be the SAME one GET /ingest/staging just
+    # reported — checked against the mocked, fabricated FAKE_PENDING installed by the
+    # caller, never against the real stand's own pending_lines (0 right now), which a
+    # mutation that simply zeroed or hardcoded the dialog's number would pass by accident.
+    before = browser.count_requests("POST /ingest/phase2")
+    click_button_with_text(browser, "Фаза 2 (staging → граф)")
+    try:
+        dialog = browser.wait_for_dialog(timeout=5)
+        message = dialog.get("message", "")
+        shown = extract_count_before(message, "строк")
+        if shown != FAKE_PENDING:
+            problems.append(f"[Фаза 2] dialog says {shown} строк(и), mocked GET "
+                             f"/ingest/staging reported pending_lines={FAKE_PENDING} — {message!r}")
+        browser.handle_dialog(accept=False)   # Cancel — never accept, see docstring
+        time.sleep(0.5)   # give a wrongly-firing request time to land in the access log
+        after = browser.count_requests("POST /ingest/phase2")
+        if after != before:
+            problems.append(f"[Фаза 2] cancelling still sent POST /ingest/phase2 "
+                             f"({before} -> {after})")
+    except TimeoutError:
+        problems.append("[Фаза 2] no confirm() dialog opened before POST /ingest/phase2")
+
+
+# ============================================================ §4.2: double-click guard
+
+@test("single_request_on_double_click")
 def test_single_request_on_double_click(browser: Browser, base_url: str):
-    """No debounce/disable on the dial's 'Разложить' button yet — a second click before
-    the first answer lands fires a second GET /dial. Left registered and expected to
-    fail so the guard, once it ships, has to make this test start passing rather than
-    quietly existing unverified (see `test()` docstring for the XFAIL/XPASS contract)."""
+    """§4.2: `guard(fn)` must stop a second click on 'Разложить' before the first answer
+    lands from firing a second `GET /dial` — was `expected_fail=True` (no debounce/disable
+    shipped yet); now the guard exists, this must PASS (see `test()`'s XFAIL/XPASS
+    contract: an XFAIL that starts passing without dropping the flag fails the run on
+    purpose, so this line is the proof the flag was actually dropped, not forgotten)."""
     hypothesis = "guard the second click before the first answer lands"
     browser.goto(f"{base_url}/ui#dial")
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
@@ -2070,6 +2929,29 @@ def test_single_request_on_double_click(browser: Browser, base_url: str):
     assert made == 1, (
         f"double-clicking 'Разложить' fired {made} GET /dial requests, want 1 — no guard "
         f"against a second click before the first answer lands yet")
+
+
+@test("single_request_on_double_click_retrieve")
+def test_single_request_on_double_click_retrieve(browser: Browser, base_url: str):
+    """Same guard, the retrieve tab's own 'Спросить озеро' — §4.2 says the guard wraps
+    every `button.act`, not just the dial's, and a double POST here is worse than a double
+    GET on the dial: it is a second, real line in `retrieve.jsonl` polluting the A/B log
+    the project measures against, not just a wasted read."""
+    query = "guard the second click before the first retrieve answer lands"
+    browser.goto(f"{base_url}/ui#retrieve")
+    browser.wait_for("document.querySelector('#main input.grow') !== null", timeout=10)
+    browser.fill("#main input.grow", query)
+
+    before = browser.count_requests("POST /retrieve")
+    click_button_with_text(browser, "Спросить озеро")
+    click_button_with_text(browser, "Спросить озеро")
+    browser.wait_for("document.querySelector('#main .status.ok') !== null", timeout=20)
+    time.sleep(0.5)   # let a second in-flight request, if the page fired one, finish and log
+    made = browser.count_requests("POST /retrieve") - before
+
+    assert made == 1, (
+        f"double-clicking 'Спросить озеро' fired {made} POST /retrieve requests, want 1 — "
+        f"no guard against a second click before the first answer lands")
 
 
 @test("phone_no_horizontal_scroll", expected_fail=True)
