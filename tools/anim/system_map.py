@@ -1,199 +1,217 @@
-"""System map — knowledge/12-decisions-meetings.md:118-124, 06-proposal-design.md:452-456
+"""System map, полоса 850×280: вся система одним кадром.
 
-Круг целиком, от эволюции: GigaEvo → логи → агент эволюции формулирует
-вопрос → агент озера ходит в озеро и в веб → ответ идеями обратно в прогон.
-Статьи входят в озеро, веб — через агента озера.
+Схема не собирается на глазах, а стоит готовой с первого кадра: под неё
+рассказывают про систему целиком, и зритель должен видеть её всю, а не
+ждать, пока дорисуется. Движение показывает только путь — фишка едет по
+стрелке, узел на её конце подсвечивается.
+
+Порядок обхода — от эволюции: прогон даёт логи → агент эволюции формирует
+вопросы → агент озера идёт в озеро и в веб → ответ возвращается в прогон.
+Статьи в озеро льются отдельным каналом, поэтому показаны последними.
+
+Пропорция 3:1: вертикали почти нет, поэтому имена узлов стоят сверху,
+отношения — снизу, а возврат логов идёт дугой под полосой.
 """
 
 from manim import *
 
 from theme import *
 
-LAKE_C = LEFT * 4.4 + DOWN * 0.4
-LAKE_R = 1.85
-INNER = [
-    UP * 0.85,
-    RIGHT * 1.0 + UP * 0.05,
-    LEFT * 0.8 + DOWN * 0.55,
-    RIGHT * 0.2 + DOWN * 1.05,
-]
-INNER_EDGES = [(0, 1), (0, 2), (2, 3), (1, 3)]
-PAPER_C = LEFT * 6.3 + UP * 2.6
-WEB_C = LEFT * 1.9 + UP * 3.05
-AGENT_C = RIGHT * 0.2 + UP * 1.4
-EVO_C = RIGHT * 4.3 + UP * 1.4
-GIGA_C = RIGHT * 4.2 + DOWN * 2.1
-DOWN_X = 3.6  # полоса «идеи в прогон»
-UP_X = 4.8  # полоса «логи из прогона»
-ASK_Y = 1.75  # вопрос идёт вправо-налево над полосой ответа
-ANS_Y = 1.05
+# Кадр задаётся здесь, а не флагом -r: присваивание идёт после разбора
+# командной строки, поэтому переживает -qh. Вчетверо крупнее цели: 850
+# получается ужатием, и на меньшей кратности контур в полосе рвётся.
+config.pixel_width = 3400
+config.pixel_height = 1120
+config.frame_height = 4.68
+config.frame_width = 14.22
+
+# Контур толще базового: на 850 px по ширине штрих в 2.2 даёт около
+# полутора пикселей и читается серой размазнёй.
+WIDE_STROKE = 3.0
+
+PAPER_C = LEFT * 6.6
+LAKE_C = LEFT * 4.75
+LAKE_R = 1.15
+INNER = [UP * 0.48, RIGHT * 0.6 + DOWN * 0.12, LEFT * 0.48 + DOWN * 0.44]
+INNER_EDGES = [(0, 1), (0, 2)]
+AGENT_C = LEFT * 1.55
+WEB_C = LEFT * 3.05 + UP * 1.5
+EVO_C = RIGHT * 1.55
+GIGA_C = RIGHT * 4.6
 
 
 class SystemMap(PipelineScene):
     def construct(self):
-        # --- прогон: с него всё начинается -------------------------------------
-        giga = box(2.6, 2.0).move_to(GIGA_C)
-        wheel = rotor(0.6).move_to(GIGA_C)
-        self.note("GigaEvo", giga, DOWN, buff=0.26, color=INK, size=21)
-        self.play(Create(giga), Create(wheel), run_time=1.0)
-        self.play(
-            Rotate(wheel, TAU, about_point=GIGA_C, rate_func=linear), run_time=1.2
-        )
+        # --- вся схема разом ------------------------------------------------
+        paper = doc(0.55, 0.75, 4).move_to(PAPER_C)
 
-        # --- логи поднимаются к агенту эволюции ----------------------------------
-        evo = robot(1.5).move_to(EVO_C)
-        up = Arrow(
-            RIGHT * UP_X + DOWN * 1.05,
-            RIGHT * UP_X + UP * 0.6,
-            buff=0.05,
-            stroke_width=2.4,
-        ).set_color(LOG)
-        self.note("run logs", up, RIGHT, buff=0.2, color=LOG)
-        self.play(GrowArrow(up), run_time=0.7)
-        logs = VGroup(*[runlog(0.3).move_to(up.get_start()) for _ in range(3)])
-        self.play(
-            LaggedStart(
-                *[l.animate.move_to(up.get_end()).set_opacity(0) for l in logs],
-                lag_ratio=0.25,
-            ),
-            run_time=1.4,
-        )
-        self.remove(logs)
-        self.note("evolution agent", evo, UP, buff=0.26, color=INK, size=21)
-        self.play(Create(evo), run_time=1.0)
-        self.wait(0.3)
-
-        # --- вопрос агенту озера -------------------------------------------------
-        agent = robot(1.5).move_to(AGENT_C)
-        ask = Arrow(
-            RIGHT * 3.7 + UP * ASK_Y,
-            RIGHT * 0.85 + UP * ASK_Y,
-            buff=0.05,
-            stroke_width=2.4,
-        ).set_color(DIM)
-        self.note("questions", ask, UP, buff=0.2, color=DIM)
-        self.play(GrowArrow(ask), run_time=0.8)
-        self.note("lake agent", agent, UP, buff=0.26, color=INK, size=21)
-        self.play(Create(agent), run_time=1.0)
-        self.wait(0.3)
-
-        # --- озеро и статьи ------------------------------------------------------
-        rim = dot_ring(LAKE_C, LAKE_R, 44, IDEA, 0.035)
-        nodes = VGroup(*[idea(0.32).move_to(LAKE_C + p) for p in INNER])
+        rim = dot_ring(LAKE_C, LAKE_R, 40, IDEA, 0.035)
+        nodes = VGroup(*[idea(0.24).move_to(LAKE_C + p) for p in INNER])
         edges = VGroup(
             *[
-                span(nodes[a], nodes[b], 0.36).set_stroke(FAINT, width=2)
+                span(nodes[a], nodes[b], 0.28).set_stroke(FAINT, width=2.4)
                 for a, b in INNER_EDGES
             ]
         )
-        leaves = VGroup(*[thesis(0.16).move_to(n.get_center()) for n in nodes[:3]])
+        leaves = VGroup(*[thesis(0.13).move_to(n.get_center()) for n in nodes[:2]])
         edges.set_z_index(-2)
         leaves.set_z_index(1)
-        self.note("idea lake", rim, DOWN, buff=0.26, color=IDEA, size=22)
+
+        agent = robot(1.25).move_to(AGENT_C)
+        evo = robot(1.25).move_to(EVO_C)
+        web = globe(0.32).move_to(WEB_C)
+        giga = box(1.9, 1.5).move_to(GIGA_C)
+        wheel = rotor(0.42).move_to(GIGA_C)
+
+        shapes = VGroup(paper, nodes, leaves, agent, evo, web, giga, wheel)
+        shapes.set_stroke(width=WIDE_STROKE)
+
+        # Все стрелки серые: цвет здесь означает «идёт прямо сейчас», а не
+        # тип связи — тип держат подписи и сами фишки. Стрелка красится
+        # только на время проезда, см. send().
+        feed = self.link(paper.get_right(), LAKE_C + LEFT * LAKE_R)
+        talk = self.link(LAKE_C + RIGHT * LAKE_R, agent.get_left(), both=True)
+        # От края глобуса, а не от его центра: из центра стрелка идёт поверх
+        # меридианов, и веб читается перечёркнутым.
+        # В плечо, а не в угол рамки робота: в угол стрелка приходит полого
+        # и проезжает по его имени.
+        surf = self.link(
+            WEB_C + rotate_vector(RIGHT * 0.32, -PI / 4),
+            agent.get_left() + UP * 0.22,
+            both=True,
+        )
+        pass_ = self.link(agent.get_right(), evo.get_left(), both=True)
+        into = self.link(evo.get_right(), giga.get_left(), both=True)
+        # От нижнего левого угла, а не от середины низа: из середины дуга
+        # уходит вправо и пересекает борт коробки. Знак угла отрицательный —
+        # при положительном дуга выгибается вверх и идёт по ногам роботов.
+        home = ArcBetweenPoints(
+            giga.get_corner(DL) + DOWN * 0.08,
+            LAKE_C + rotate_vector(RIGHT * LAKE_R, -PI / 3),
+            angle=-PI / 10,
+        ).set_stroke(DIM, width=2.6)
+        home.add_tip(tip_length=0.2, tip_width=0.16)
+
+        # Имена узлов — сверху, отношения — снизу: нижняя треть полосы
+        # оставлена дуге возврата, иначе она идёт по подписям.
+        names = VGroup(
+            self.tag("papers", paper, UP, 0.16, INK, 19),
+            self.tag("idea lake", rim, UP, 0.14, IDEA, 21),
+            self.tag("lake agent", agent, UP, 0.16, INK, 21),
+            self.tag("evolution agent", evo, UP, 0.16, INK, 21),
+            self.tag("GigaEvo", giga, UP, 0.16, INK, 21),
+        )
+        rels = VGroup(
+            # Под страницей, а не под стрелкой: стрелка от страницы до озера
+            # короче своей подписи, и подпись ложится на саму страницу.
+            self.tag("ingest", paper, DOWN, 0.16, DIM, 18),
+            self.tag("retrieve", talk, DOWN, 0.12, IDEA, 18),
+            self.tag("questions", pass_, DOWN, 0.12, DIM, 18),
+            self.tag("ideas · logs", into, DOWN, 0.12, DIM, 18),
+            self.tag("run logs", home, DOWN, 0.12, LOG, 18),
+            # Сбоку от глобуса и вместо имени узла: над ним борт кадра, под
+            # ним стрелка, а два ярлыка на одну мелкую иконку — уже каша.
+            self.tag("web search", web, RIGHT, 0.16, DIM, 18),
+        )
+
+        self.add(edges, shapes, rim, feed, talk, surf, pass_, into, home, names, rels)
+        self.wait(0.7)
+
+        # --- один обход, от прогона ------------------------------------------
         self.play(
-            LaggedStart(*[FadeIn(d, scale=0.6) for d in rim], lag_ratio=0.02),
+            Rotate(wheel, TAU, about_point=GIGA_C, rate_func=linear),
+            self.pulse(giga),
+            run_time=1.2,
+        )
+        self.send([runlog(0.2) for _ in range(3)], into, LOG, back=True)
+        self.play(self.pulse(evo), run_time=0.6)
+
+        self.send([label("?", 26, INK) for _ in range(2)], pass_, INK, back=True)
+        self.play(self.pulse(agent), run_time=0.6)
+
+        # Озеро и веб — одним движением: агент спрашивает оба сразу.
+        self.send([idea(0.16) for _ in range(2)], talk, IDEA, back=True, extra=surf)
+        self.send([idea(0.16), thesis(0.2)], talk, IDEA)
+
+        self.send([idea(0.18) for _ in range(2)], pass_, IDEA)
+        self.send([idea(0.18) for _ in range(2)], into, IDEA)
+        self.play(
+            Rotate(wheel, TAU, about_point=GIGA_C, rate_func=linear),
+            self.pulse(giga),
             run_time=1.0,
         )
+
+        self.send([runlog(0.2) for _ in range(3)], home, LOG, run_time=1.5)
+
+        # Круг замкнулся — озеро крутится: пунктир идёт по кольцу, и на
+        # последних секундах видно, что система работает дальше.
         self.play(
-            LaggedStart(*[Create(n) for n in nodes], lag_ratio=0.12),
-            LaggedStart(*[Create(e) for e in edges], lag_ratio=0.12),
-            FadeIn(leaves),
-            run_time=1.1,
+            Rotate(rim, TAU / 4, about_point=LAKE_C, rate_func=linear), run_time=2.4
         )
+        self.wait(0.8)
 
-        paper = doc(0.85, 1.15, 5).move_to(PAPER_C)
-        feed = Arrow(
-            paper.get_bottom(),
-            LAKE_C + normalize(PAPER_C - LAKE_C) * LAKE_R,
-            buff=0.16,
-            stroke_width=2.2,
-        ).set_color(DIM)
-        self.note("papers", paper, RIGHT, buff=0.22, color=INK)
-        self.play(FadeIn(paper), GrowArrow(feed), run_time=0.9)
+    def pulse(self, m, factor=1.07):
+        """Внимание к узлу — размером, а не цветом.
 
-        # Разговор с озером двусторонний: запрос вниз, идеи наверх.
-        talk = DoubleArrow(
-            LAKE_C + rotate_vector(RIGHT * LAKE_R, PI / 4.4),
-            agent.get_left(),
-            buff=0.16,
-            stroke_width=2.4,
-            tip_length=0.2,
-        ).set_color(IDEA)
-        self.note("retrieve", talk, DOWN, buff=0.2, color=IDEA)
-        self.play(GrowFromCenter(talk), run_time=0.9)
-        self.wait(0.3)
+        Indicate красит фигуру в свой цвет и возвращает обратно; на схеме,
+        где всё стоит неподвижно, это читается чёрной вспышкой.
+        """
+        return m.animate(rate_func=there_and_back).scale(factor)
 
-        # --- веб висит на агенте озера, а не на озере -----------------------------
-        web = globe(0.45).move_to(WEB_C)
-        surf = DoubleArrow(
-            web.get_right(),
-            agent.get_corner(UL) + UP * 0.1,
+    def link(self, a, b, both=False):
+        """Стрелка схемы. Один вес и один размер наконечника на всю полосу."""
+        kind = DoubleArrow if both else Arrow
+        return kind(
+            a,
+            b,
             buff=0.14,
-            stroke_width=2.4,
-            tip_length=0.2,
+            stroke_width=2.6,
+            tip_length=0.18,
+            max_tip_length_to_length_ratio=1.0,
         ).set_color(DIM)
-        self.note("web search", web, LEFT, buff=0.24, color=INK)
-        self.play(Create(web), GrowFromCenter(surf), run_time=1.0)
-        self.wait(0.4)
 
-        # --- ответ идеями обратно в прогон -----------------------------------------
-        back = Arrow(
-            RIGHT * 0.85 + UP * ANS_Y,
-            RIGHT * 3.7 + UP * ANS_Y,
-            buff=0.05,
-            stroke_width=2.4,
-        ).set_color(IDEA)
-        self.note("ideas", back, DOWN, buff=0.2, color=IDEA)
-        self.play(GrowArrow(back), run_time=0.8)
+    def tag(self, text, target, direction, buff, color, size):
+        """Подпись схемы. Все висят с первого кадра до последнего."""
+        return label(text, size, color).next_to(target, direction, buff=buff)
 
-        cargo = VGroup(*[idea(0.19).move_to(back.get_start()) for _ in range(2)])
+    def thicken(self, path, color, width=4.6):
+        """Стрелка на время проезда толстеет и берёт цвет того, что по ней едет.
+
+        set_color, а не set_stroke: наконечник — заливка, и от одного
+        контурного цвета он остался бы серым.
+        """
+        return path.animate(rate_func=there_and_back).set_color(color).set_stroke(
+            width=width
+        )
+
+    def send(self, tokens, path, color, back=False, run_time=1.1, extra=None):
+        """Фишки едут по стрелке; сама стрелка на это время подсвечивается.
+
+        back — против нарисованного направления: двусторонняя стрелка одна,
+        а ездят по ней в обе стороны.
+        """
+        rate = (lambda t: 1 - t) if back else linear
+        group = VGroup(*tokens)
+        paths = [path] * len(group)
+        if extra is not None:
+            side = [t.copy() for t in tokens]
+            group.add(*side)
+            paths += [extra] * len(side)
+        # Только контурным фишкам: у текста ширина штриха ноль, и общий
+        # set_stroke обвёл бы «?» жирным контуром.
+        for t in group:
+            if t.get_stroke_width():
+                t.set_stroke(width=WIDE_STROKE)
+        for t, p in zip(group, paths):
+            t.move_to(p.get_end() if back else p.get_start())
+        self.add(group)
         self.play(
             LaggedStart(
-                *[c.animate.move_to(EVO_C) for c in cargo], lag_ratio=0.3
+                *[MoveAlongPath(t, p, rate_func=rate) for t, p in zip(group, paths)],
+                lag_ratio=0.3,
             ),
-            run_time=1.1,
+            self.thicken(path, color),
+            *([self.thicken(extra, color)] if extra else []),
+            run_time=run_time,
         )
-        down = Arrow(
-            RIGHT * DOWN_X + UP * 0.6,
-            RIGHT * DOWN_X + DOWN * 1.05,
-            buff=0.05,
-            stroke_width=2.4,
-        ).set_color(IDEA)
-        self.play(GrowArrow(down), run_time=0.6)
-        self.play(
-            cargo.animate.move_to(GIGA_C).set_opacity(0),
-            Rotate(wheel, TAU, about_point=GIGA_C, rate_func=linear),
-            run_time=1.3,
-        )
-        self.remove(cargo)
-
-        # --- круг замкнулся ---------------------------------------------------------
-        # Indicate, а не set_stroke: он сам возвращает цвет, иначе рёбра
-        # остались бы чернильными и потеряли смысл.
-        loop = [up, ask, talk, surf, back, down]
-        self.play(
-            LaggedStart(
-                *[Indicate(a, color=INK, scale_factor=1.0) for a in loop],
-                lag_ratio=0.45,
-            ),
-            run_time=2.6,
-        )
-
-        # --- и последнее: логи прогона ложатся в озеро ----------------------------
-        # Круг замыкается не на агенте, а на источнике: то, что нашла эволюция,
-        # становится тезисами и остаётся в озере.
-        home = ArcBetweenPoints(
-            giga.get_left() + LEFT * 0.12,
-            LAKE_C + rotate_vector(RIGHT * LAKE_R, -PI / 4),
-            angle=PI / 7,
-        ).set_stroke(LOG, width=2.4)
-        home.add_tip(tip_length=0.22, tip_width=0.18)
-        self.note("logs into the lake", home, DOWN, buff=0.24, color=LOG)
-        self.play(Create(home), run_time=0.9)
-        back = VGroup(*[runlog(0.3).move_to(home.get_start()) for _ in range(3)])
-        self.play(
-            LaggedStart(*[MoveAlongPath(l, home) for l in back], lag_ratio=0.25),
-            run_time=1.8,
-        )
-        self.play(FadeOut(back), run_time=0.4)
-        self.wait(1.2)
+        self.play(FadeOut(group), run_time=0.25)
