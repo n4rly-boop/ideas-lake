@@ -584,21 +584,28 @@ view("retrieve", "Retrieve", (host) => {
     if (runId.value.trim()) base.run_id = runId.value.trim();
     const arms = both ? [true, false] : [rewrite.checked];
     out.replaceChildren();
-    const answers = await run(statusHost, both ? "гоню оба плеча…" : "запрос в озеро…", async () => {
+    await run(statusHost, both ? "гоню оба плеча…" : "запрос в озеро…", async () => {
       const res = [];
       for (const rw of arms) res.push([rw, await api("/retrieve", { method: "POST", body: { ...base, rewrite: rw } })]);
+      // A 200 body of the wrong shape (captive portal, transparent proxy) must throw
+      // here, not surface as a spinner stuck forever after the caller already moved on.
+      for (const [, a] of res) {
+        if (!a || typeof a !== "object" || !Array.isArray(a.ideas) || !a.cost
+            || typeof a.cost.wall_ms !== "number" || typeof a.cost.tokens_in !== "number"
+            || typeof a.cost.tokens_out !== "number")
+          throw new Error("ответ /retrieve — не {ideas, cost}: " + JSON.stringify(a).slice(0, 200));
+      }
+      const totalMs = res.reduce((s, [, a]) => s + a.cost.wall_ms, 0);
+      // Each arm's own code, checked rather than assumed: nothing in the protocol says two
+      // POSTs to the same route must answer with the same status. Print one only if they
+      // in fact agree; otherwise show both, so a mixed result cannot read as a clean one.
+      const codes = new Set(res.map(([, a]) => codeOf(a)));
+      setStatus(statusHost, "ok", [...codes].join("/"),
+        `${res.length} вызов(а) · ${totalMs.toFixed(0)} мс суммарно`);
+      out.replaceChildren(el("div", { class: res.length > 1 ? "ab" : "" },
+        ...res.map(([rw, a]) => answerBlock(a, rw ? "rewrite on" : "rewrite off", rw))));
       return res;
     });
-    if (!answers) return;
-    const totalMs = answers.reduce((s, [, a]) => s + a.cost.wall_ms, 0);
-    // Each arm's own code, checked rather than assumed: nothing in the protocol says two
-    // POSTs to the same route must answer with the same status. Print one only if they
-    // in fact agree; otherwise show both, so a mixed result cannot read as a clean one.
-    const codes = new Set(answers.map(([, a]) => codeOf(a)));
-    setStatus(statusHost, "ok", [...codes].join("/"),
-      `${answers.length} вызов(а) · ${totalMs.toFixed(0)} мс суммарно`);
-    out.replaceChildren(el("div", { class: answers.length > 1 ? "ab" : "" },
-      ...answers.map(([rw, a]) => answerBlock(a, rw ? "rewrite on" : "rewrite off", rw))));
   }
 
   host.replaceChildren(
@@ -699,6 +706,20 @@ function ringLayout(nodes, links, iters = 400, gapPx = 19) {
       }
     }
   }
+}
+
+/* Nearest-mark search, pulled out of the mousemove handler below so the self-test can
+   exercise the layer-weight rule (a hit must win over a co-located leaf) without a mouse,
+   and so the touch handler a later commit adds can reuse it with its own search radius.
+   `rank` is the layer priority (0 leaf, 1 idea, 2 hit, 3 hypothesis centre) — subtracted
+   harder than plain distance so a hit buried under a cloud of leaves still wins. */
+function nearestMark(marks, x, y) {
+  let mark = null, score = Infinity;
+  for (const m of marks) {
+    const s = Math.hypot(m.x - x, m.y - y) - m.r - m.rank * 3;
+    if (s < score) { score = s; mark = m; }
+  }
+  return { mark, score };
 }
 
 view("dial", "Гипотеза", (host) => {
@@ -987,13 +1008,7 @@ view("dial", "Гипотеза", (host) => {
     };
     svg.addEventListener("mousemove", (event) => {
       const [vx, vy, box, scale] = toView(event);
-      let best = null, bestScore = Infinity;
-      for (const m of marks) {
-        // Distance to the edge of the mark, minus a bump for the layers a pointer is
-        // more likely to be aiming at: a hit under a cloud of leaves must still win.
-        const score = Math.hypot(m.x - vx, m.y - vy) - m.r - m.rank * 3;
-        if (score < bestScore) { bestScore = score; best = m; }
-      }
+      const { mark: best, score: bestScore } = nearestMark(marks, vx, vy);
       if (!best || bestScore > 9) {
         card.classList.add("hide");
         ring.classList.add("hide");
@@ -1102,9 +1117,26 @@ view("dial", "Гипотеза", (host) => {
         el("label", { class: "cb" }, withLeaves, "точки-листья"),
         el("button", { class: "ghost sm", onclick: async () => {
           // The graph is cached per page load; ingest running underneath is exactly when
-          // an operator needs to say "re-read it" without reloading the tab.
-          await run(statusHost, "перечитываю идеи и рёбра…", () => loadGraph(true));
-          fire();
+          // an operator needs to say "re-read it" without reloading the tab. loadGraph(true)
+          // only overwrites GRAPH_CACHE after BOTH paged reads finish clean, so a failure
+          // here never touched the cache — the redraw just has to not run to say so.
+          const fresh = await run(statusHost, "перечитываю идеи и рёбра…", async () => {
+            try { await loadGraph(true); }
+            catch (err) {
+              // GRAPH_CACHE is assigned exactly once, at the very end of loadGraph — so
+              // ANY failure here leaves it physically untouched, whether it's an ApiError
+              // (a real 4xx/5xx) or a plain throw from the paging loop itself (a malformed
+              // 200 for /edges makes `edges.push(...page.items)` throw a TypeError, not an
+              // ApiError). The reassurance holds regardless of what threw, so it is not
+              // conditioned on err's type.
+              const note = "граф остался прежним";
+              const message = err.message ? `${err.message} — ${note}` : note;
+              if (err instanceof ApiError) throw new ApiError(err.status, message, err.body);
+              throw new Error(message);
+            }
+            return true;
+          });
+          if (fresh) fire();
         } }, "Перечитать граф")),
       statusHost),
     el("div", { class: "panel" }, wrap, legendHost, listHost),
@@ -1181,9 +1213,7 @@ function pager(state, total, reload) {
     el("span", {}, `показано ${from}–${to} из ${fmt(total)} (total от сервера, не длина списка)`));
 }
 
-let openIdea = () => {};
-
-view("ideas", "Идеи", (host) => {
+view("ideas", "Идеи", (host, ctx) => {
   const out = el("div"), statusHost = el("div"), detail = el("div");
   // Outside `detail` on purpose: `show()` wipes `detail` on every re-read, and a write
   // confirmation living inside it would vanish the instant the page re-fetches the idea
@@ -1197,6 +1227,12 @@ view("ideas", "Идеи", (host) => {
   const state = { offset: 0, limit: PAGE };
   const jump = el("input", { class: "mono", placeholder: "idea_…" });
   let shownIdeaId = null;
+  // Same guard as the dial/graph views: two `show()` calls can be in flight at once (a
+  // second "Записать изменения" click before the first's own re-read lands — the PATCH
+  // button does not disable itself), and without this the later `await` to resolve wins
+  // the DOM regardless of which one the operator actually meant, which is how two idea
+  // ids ended up with two live PATCH forms on screen at once.
+  let generation = 0;
 
   async function load(offset = state.offset) {
     await run(statusHost, "читаю идеи…", async () => {
@@ -1220,13 +1256,15 @@ view("ideas", "Идеи", (host) => {
             el("td", { class: "num" }, idea.theses.length),
             el("td", {}, idea.origin),
             el("td", { class: "mono dim" }, idea.updated_at || "«»"),
-            el("td", {}, el("button", { class: "ghost sm", onclick: () => show(idea.id) }, "открыть"))))))),
+            el("td", {}, el("button", { class: "ghost sm", onclick: () => openIdea(idea.id) }, "открыть"))))))),
         pager(state, page.total, load));
       return page;
     });
   }
 
   async function show(ideaId) {
+    const mine = ++generation;
+    const stale = () => mine !== generation;
     // A stale "Записано" belongs to whatever idea was actually written, not to the next
     // one someone happens to open — clear it only when the id actually changes, so the
     // re-read that follows a successful PATCH (same id) leaves it standing.
@@ -1240,6 +1278,22 @@ view("ideas", "Идеи", (host) => {
       api(`/ideas/${encodeURIComponent(ideaId)}`),
       api(`/ideas/${encodeURIComponent(ideaId)}/neighbors?hops=1`),
     ]);
+    // A newer show() started (another id, or this same PATCH form's own post-write
+    // re-read) while this one was in flight — `detail` belongs to that newer call now,
+    // and this response has nowhere honest left to land. This is what used to leave two
+    // idea ids each with a live PATCH form on screen at once.
+    //
+    // Defense in depth, not dead code: today every tab switch goes through `hashchange`,
+    // and render() fully replaces #main's children on each one, which orphans this whole
+    // closure (generation included) before a stale response can ever land here — so right
+    // now there is no reachable failure for this line to catch, and no mutation of this
+    // guard can be caught either (proven live: deleting it leaves the whole e2e suite
+    // green). It stays because that orphaning is about to stop being the only guard: once
+    // the tab survives a hashchange without remounting (§2.2, VIEW_STATE keeps `ideas`'
+    // state across a switch instead of remounting it), two show() calls can share this
+    // same closure again, and this check becomes the one thing standing between that and
+    // the two-card defect described above.
+    if (stale()) return idea;
     setStatus(statusBox, "ok", codeOf(idea), `${idea.theses.length} листьев, ${edges.length} рёбер (1 хоп)`);
 
     /* PATCH form: only the fields the API allows. `trust_score`, `dirty` and `origin`
@@ -1274,8 +1328,19 @@ view("ideas", "Идеи", (host) => {
           // A fresh attempt starts with no stale confirmation: a failing second PATCH
           // must not leave a first PATCH's green "записано" standing.
           writeStatus.replaceChildren();
-          const updated = await run(patchStatus, "пишу…", () =>
-            api(`/ideas/${encodeURIComponent(ideaId)}`, { method: "PATCH", body }));
+          const updated = await run(patchStatus, "пишу…", async () => {
+            const res = await api(`/ideas/${encodeURIComponent(ideaId)}`, { method: "PATCH", body });
+            // `updated_at` is a required string on every real IdeaOut (§ schemas.py) — "",
+            // never absent. A body that isn't an idea at all (a captive portal's
+            // `{surprise: ...}`) has no such key, so `res.updated_at` comes back
+            // `undefined` — and undefined prints exactly like the honest "«»" a real
+            // response uses for "server didn't stamp a time", which is what let this
+            // slip through as a green "записано" before. Checking the key is present
+            // (not just truthy — "" must pass) tells the two apart.
+            if (!res || typeof res !== "object" || typeof res.updated_at !== "string")
+              throw new Error(`ответ PATCH /ideas/${ideaId} — не идея: ` + JSON.stringify(res).slice(0, 200));
+            return res;
+          });
           if (!updated) return;
           // Lives in `writeStatus`, not `patchStatus`: `show()` below rebuilds `detail`
           // (and `patchStatus` is inside it) to re-read the idea, and this line must
@@ -1306,7 +1371,7 @@ view("ideas", "Идеи", (host) => {
           el("tbody", {}, ...edges.map((edge) => el("tr", {},
             el("td", {}, el("span", { class: "badge" }, edge.type)),
             el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
-              e.preventDefault(); show(edge.target_id); } }, edge.target_id)),
+              e.preventDefault(); openIdea(edge.target_id); } }, edge.target_id)),
             el("td", { class: "num" }, edge.weight ?? "—"),
             el("td", { class: "num" }, edge.hop),
             el("td", { class: "num" }, (edge.evidence || []).length || "—"),
@@ -1318,6 +1383,16 @@ view("ideas", "Идеи", (host) => {
           // Closing clears the confirmation too: a "записано" that outlives its card
           // reads as fresh on the next open, of this idea or another.
           detail.replaceChildren(); writeStatus.replaceChildren();
+          // openIdea() is the one way in (§1.2: the address IS the state) — closing has
+          // to be the way out, or F5/a forwarded link reopens what the operator just
+          // closed, and clicking the SAME idea again is a dead click (an unchanged hash
+          // never fires `hashchange`). history.replaceState, not location.hash=: this
+          // must not fire a real navigation and remount the whole tab out from under the
+          // list the operator is still looking at.
+          if (CURRENT_ARG) {
+            CURRENT_ARG = null;
+            history.replaceState(null, "", formatHash(CURRENT, null, CURRENT_PARAMS));
+          }
         } }, "Закрыть карточку")));
     // Scroll to whichever the operator needs to see: a just-written confirmation sits
     // ABOVE `detail`, and `block:"start"` on `detail` alone would run it off the top.
@@ -1326,7 +1401,6 @@ view("ideas", "Идеи", (host) => {
     return idea;
     });
   }
-  openIdea = (id) => { switchTo("ideas"); setTimeout(() => show(id), 0); };
 
   host.replaceChildren(
     el("div", { class: "panel" },
@@ -1334,11 +1408,15 @@ view("ideas", "Идеи", (host) => {
       el("p", { class: "help" }, "Ноды графа с листьями. Открытая карточка даёт рёбра и правку полей."),
       el("div", { class: "row" },
         el("label", { class: "f grow" }, "открыть по id", jump),
-        el("button", { class: "act", onclick: () => jump.value.trim() && show(jump.value.trim()) }, "Открыть"),
+        el("button", { class: "act", onclick: () => jump.value.trim() && openIdea(jump.value.trim()) }, "Открыть"),
         el("button", { class: "ghost", onclick: () => load() }, "Обновить список")),
       statusHost),
     writeStatus, detail, out);
   load();
+  // The one place `openIdea` actually lands: a route arrives here as `ctx.arg`, already
+  // mounted (not `setTimeout`-raced against mounting), so the idea opens on the FIRST
+  // click, from any tab, on a page that has never shown this tab before.
+  if (ctx.arg) show(ctx.arg);
 });
 
 /* ----------------------------------------------------------------- 4. theses */
@@ -1425,6 +1503,9 @@ view("sources", "Источники", (host) => {
               : el("span", { class: "badge " + (src.run_success ? "b-ok" : "b-failed") },
                   src.run_success ? "успех" : "провал")),
             el("td", {}, el("button", { class: "ghost sm", onclick: () => {
+              // ponytail: still the setTimeout race §2.1 removed from openIdea, plus a
+              // placeholder-text lookup and "first .act under #main" guess — left as is,
+              // waiting on §2.2 (tabs reading ctx.params), the right place for this one.
               switchTo("theses");
               setTimeout(() => { $("main input.mono[placeholder='источник']").value = src.id;
                                  $("main button.act").click(); }, 0);
@@ -1471,11 +1552,17 @@ view("sources", "Источники", (host) => {
             try { body.run_meta = JSON.parse(f.meta.value); }
             catch (err) { setStatus(formStatus, "err", null, "run_meta не JSON: " + err.message); return; }
           }
-          const src = await run(formStatus, "пишу источник…", () =>
-            api("/sources", { method: "POST", body }));
-          if (!src) return;
-          setStatus(formStatus, "ok", codeOf(src), `записан ${src.id}`);
-          load();
+          await run(formStatus, "пишу источник…", async () => {
+            const src = await api("/sources", { method: "POST", body });
+            // `src.id` interpolates straight into the string — undefined stringifies to
+            // "undefined" rather than throwing, so a shape mismatch would otherwise print
+            // a calm green "записан undefined" instead of surfacing as an error.
+            if (typeof src.id !== "string")
+              throw new Error("ответ /sources без id: " + JSON.stringify(src).slice(0, 200));
+            setStatus(formStatus, "ok", codeOf(src), `записан ${src.id}`);
+            load();
+            return src;
+          });
         } }, "Записать")),
       formStatus),
     out);
@@ -1495,10 +1582,20 @@ view("ingest", "Ингест и ops", (host) => {
 
   async function loadJobs(quiet) {
     // quiet (auto-refresh) never calls busy() — no spinner is left hanging on a
-    // render throw here, so it keeps its own .catch and stays outside run().
+    // render throw here, so it keeps its own try/catch and stays outside run(). Both the
+    // fetch AND the shape check live in this one try: setInterval calls loadJobs(true)
+    // bare, with nothing above it to catch a stray throw, so `jobs.filter` on a
+    // non-array body must not escape as an unhandled rejection while the checkbox
+    // still reads "автообновление" and the screen still shows the last good row.
     if (quiet) {
-      const jobs = await api("/ingest/jobs?limit=30").catch((err) => { failed(jobStatus, err); return undefined; });
-      if (!jobs) return;
+      let jobs;
+      try {
+        jobs = await api("/ingest/jobs?limit=30");
+        if (!Array.isArray(jobs)) throw new Error("ответ /ingest/jobs — не массив: " + JSON.stringify(jobs).slice(0, 200));
+      } catch (err) {
+        failed(jobStatus, err instanceof ApiError ? err : new ApiError(null, err.message, null));
+        return;
+      }
       const live = jobs.filter((j) => ["queued", "running", "staged"].includes(j.status)).length;
       setStatus(jobStatus, live ? "warn" : "ok", codeOf(jobs),
         `${jobs.length} заданий в списке (limit 30 — список обрезан сервером, если их больше), в работе ${live}`);
@@ -1521,6 +1618,7 @@ view("ingest", "Ингест и ops", (host) => {
     }
     await run(jobStatus, "читаю очередь…", async () => {
       const jobs = await api("/ingest/jobs?limit=30");
+      if (!Array.isArray(jobs)) throw new Error("ответ /ingest/jobs — не массив: " + JSON.stringify(jobs).slice(0, 200));
       const live = jobs.filter((j) => ["queued", "running", "staged"].includes(j.status)).length;
       setStatus(jobStatus, live ? "warn" : "ok", codeOf(jobs),
         `${jobs.length} заданий в списке (limit 30 — список обрезан сервером, если их больше), в работе ${live}`);
@@ -2077,16 +2175,55 @@ view("raw", "Ручки", (host) => {
 
 /* =================================================================== router */
 
-let CURRENT = location.hash.slice(1) || "retrieve";
+// Route shape: #<tab>[/<arg>][?<query>]. `arg` is an idea id and nothing longer — a
+// hypothesis or a filter text belongs in the query part, not the path. Query values come
+// back DECODED (URLSearchParams does that); `formatHash` is the exact inverse, so a route
+// survives one parse/format round trip — NOT byte for byte (checked by the self-test
+// below with real characters, not just an id): URLSearchParams re-encodes a space as `+`
+// rather than `%20`, and a trailing slash on `path` is dropped. What round-trips is the
+// percent-encoding, normalised.
+function parseHash(hash) {
+  const raw = (hash || "").replace(/^#/, "");
+  const qIdx = raw.indexOf("?");
+  const path = qIdx === -1 ? raw : raw.slice(0, qIdx);
+  const query = qIdx === -1 ? "" : raw.slice(qIdx + 1);
+  const slashIdx = path.indexOf("/");
+  const tab = (slashIdx === -1 ? path : path.slice(0, slashIdx)) || VIEWS[0].id;
+  const arg = slashIdx === -1 ? null : (path.slice(slashIdx + 1) || null);
+  const params = {};
+  // Repeated keys (?a=1&a=2) collapse to the last value — last value wins. Harmless
+  // today (nothing reads params yet); §2.2 puts filters here, still one value each.
+  for (const [k, v] of new URLSearchParams(query)) params[k] = v;
+  return { tab, arg, params };
+}
+
+function formatHash(tab, arg, params = {}) {
+  const h = "#" + tab + (arg ? "/" + arg : "");
+  const qs = new URLSearchParams(params).toString();
+  return qs ? h + "?" + qs : h;
+}
+
+// The one call site every idea link goes through. A single hash assignment fires
+// `hashchange` below, which mounts "Идеи" WITH the argument already in hand — no
+// `setTimeout` race against the tab's own mount, which is what made this dead on a fresh
+// load until "Идеи" happened to have been opened by hand first (§0.1).
+function openIdea(id) { location.hash = formatHash("ideas", id); }
+
+const initialRoute = parseHash(location.hash);
+let CURRENT = initialRoute.tab;
+let CURRENT_ARG = initialRoute.arg;
+let CURRENT_PARAMS = initialRoute.params;
 
 // What the boot probe found, not just "have a key or not": a dead upstream (503, or no
 // answer at all) is neither "open" nor "needs a key", and showing it as either is the
 // exact lie §4.1 names. `probing` is the state until the first probe resolves.
 let AUTH = API_KEY ? "open" : "probing";
 
-function switchTo(id) {
-  CURRENT = id;
-  history.replaceState(null, "", "#" + id);
+function switchTo(tab, arg, params) {
+  CURRENT = tab;
+  CURRENT_ARG = arg || null;
+  CURRENT_PARAMS = params || {};
+  history.replaceState(null, "", formatHash(CURRENT, CURRENT_ARG, CURRENT_PARAMS));
   render();
 }
 
@@ -2125,13 +2262,28 @@ function render() {
     openGate();
     return;
   }
+  const known = VIEWS.some((v) => v.id === CURRENT);
   const chosen = VIEWS.find((v) => v.id === CURRENT) || VIEWS[0];
-  chosen.mount(main);
+  const ctx = { arg: CURRENT_ARG, params: CURRENT_PARAMS, state: {} };
+  if (known) {
+    chosen.mount(main, ctx);
+    return;
+  }
+  // An unknown tab in the hash is not a blank page: say so, then show the first tab
+  // anyway — a stale or hand-edited link should never be indistinguishable from a crash.
+  main.append(el("div", { class: "panel status warn" }, el("span", { class: "code" }, "—"),
+    `вкладки «${CURRENT}» нет — показана «${chosen.title}»`));
+  const viewHost = el("div");
+  main.append(viewHost);
+  chosen.mount(viewHost, ctx);
 }
 
 window.addEventListener("hashchange", () => {
-  const id = location.hash.slice(1);
-  if (id && id !== CURRENT) { CURRENT = id; render(); }
+  const route = parseHash(location.hash);
+  CURRENT = route.tab;
+  CURRENT_ARG = route.arg;
+  CURRENT_PARAMS = route.params;
+  render();
 });
 
 // One probe, shared by boot and the "Повторить" button. A 200 means this server runs
@@ -2167,6 +2319,66 @@ async function probe() {
   if (API_KEY) { startStrip(); return; }
   await probe();
 })();
+
+/* =================================================================== selftest
+   Query-string gated (`?selftest=1` on the DOCUMENT, never the hash — the hash is the
+   route under test): a plain page load must never pay for this. Prints exactly one line,
+   `SELFTEST OK`, or throws on the first failed assertion with what was expected and what
+   came back. Cheap on purpose — this checks the router and the mark-picking rule, not
+   the network. */
+if (new URLSearchParams(location.search).get("selftest") === "1") {
+  (function selftest() {
+    function assertEq(actual, expected, what) {
+      if (actual !== expected) throw new Error(
+        `SELFTEST FAIL (${what}): expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    }
+
+    // parseHash/formatHash round-trip on a tab + idea argument.
+    const r1 = parseHash("#ideas/idea_ab12");
+    assertEq(r1.tab, "ideas", "parseHash tab");
+    assertEq(r1.arg, "idea_ab12", "parseHash arg");
+    assertEq(formatHash(r1.tab, r1.arg, r1.params), "#ideas/idea_ab12", "formatHash round-trip");
+
+    // Query params inside the hash come back decoded.
+    const r2 = parseHash("#dial?q=a%20b&k=3");
+    assertEq(r2.tab, "dial", "parseHash tab (query)");
+    assertEq(r2.params.q, "a b", "parseHash query q decoded");
+    assertEq(r2.params.k, "3", "parseHash query k decoded");
+
+    // Empty hash falls back to the default tab, with no argument.
+    const r3 = parseHash("");
+    assertEq(r3.tab, VIEWS[0].id, "parseHash default tab");
+    assertEq(r3.arg, null, "parseHash default arg");
+
+    // formatHash's ENCODING half — r1/r2 above only ever fed it empty params, so a naive
+    // `"&"`-join of the query (the regression this guards against) sailed through green.
+    // A value with a space, "&", "#" and Cyrillic together: space must survive as `+`
+    // (not literally, not vanish), and "&"/"#" must not fall out unescaped and truncate
+    // or split the query. Checked by feeding formatHash's own output back through
+    // parseHash — not string equality — because URLSearchParams's encoding is not
+    // byte-for-byte either (`%20` becomes `+`, see the router's own comment above).
+    const trickyParams = { q: "гипотеза с пробелом & амперсандом # решёткой" };
+    const r4 = parseHash(formatHash("dial", null, trickyParams));
+    assertEq(r4.tab, "dial", "formatHash/parseHash round-trip tab");
+    assertEq(r4.params.q, trickyParams.q, "formatHash/parseHash round-trip encodes & and #");
+
+    // nearestMark must prefer a hit over a leaf that merely sits CLOSER — the real dial
+    // case is a leaf 1.5 px wide lying exactly under the cursor while the popadanie it is
+    // covering sits a few px off to the side. Distance alone picks the leaf every time
+    // (dist 0 - r 1.5 = -1.5 beats dist 10 - r 8 = 2); only the rank term (hit rank 2,
+    // leaf rank 0) pulls the hit's score below the leaf's (10 - 8 - 2*3 = -4). A test
+    // that instead co-locates both marks (as this one used to) lets radius alone decide
+    // and passes even with the rank term deleted — this one does not.
+    const marks = [
+      { x: 10, y: 10, r: 1.5, rank: 0, head: "leaf" },
+      { x: 20, y: 10, r: 8, rank: 2, head: "hit" },
+    ];
+    const nearest = nearestMark(marks, 10, 10);
+    assertEq(nearest.mark && nearest.mark.head, "hit", "nearestMark layer weight (rank, not radius)");
+
+    console.log("SELFTEST OK");
+  })();
+}
 </script>
 </body>
 </html>

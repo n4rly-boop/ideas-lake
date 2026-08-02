@@ -66,6 +66,28 @@ def _vec(text: str) -> np.ndarray:
     return vec / np.linalg.norm(vec)
 
 
+_JS_STRING_OR_COMMENT = re.compile(
+    r'"(?:\\.|[^"\\])*"'      # double-quoted string, kept
+    r"|'(?:\\.|[^'\\])*'"     # single-quoted string, kept
+    r'|`(?:\\.|[^`\\])*`'     # template literal, kept (no ${} nesting in this file)
+    r'|//[^\n]*'              # line comment, dropped
+    r'|/\*.*?\*/',            # block comment, dropped
+    re.S)
+
+
+def _strip_js_comments(src: str) -> str:
+    """`src` with every `//`/`/* */` comment blanked out, string/template literals
+    left untouched. Used only to keep a doc-comment that happens to quote a piece
+    of real code (e.g. `` `function parseHash(hash) { ... }` `` in prose) from
+    satisfying a check that is supposed to require the code, not the quote of it —
+    see the D2026-08-02 note by `main`. Not a JS parser: the one regex literal this
+    file has (`/^#/` in `parseHash`) does not start with `//` or contain `/*`, so it
+    survives untouched, but a hand-rolled tokenizer like this one is not proof
+    against every string a future edit could add — a real edge before a plausible one.
+    """
+    return _JS_STRING_OR_COMMENT.sub(lambda m: m.group(0) if m.group(0)[0] in "\"'`" else "", src)
+
+
 def _fixture(tmp: Path) -> dict:
     """1 source, 2 ideas, 3 leaves — enough for paging, filters and a search hit."""
     url = "https://arxiv.org/abs/2405.00001"
@@ -1585,14 +1607,67 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
         assert guarded.post(app_mod.UI_PATH).status_code == 401, "only GET is open"
     assert app_mod.UI_FILE.is_file(), app_mod.UI_FILE
 
+    # ---------------------------------------------------------------- console: §3
+    # Static text checks — selfcheck never runs a browser, so these cannot see
+    # whether the router WORKS, only whether the four things §3 depends on are
+    # still IN the file. §8 puts the router after the quiet-lies pass, so this is
+    # exactly the set that can be required today, no more.
+    #
+    # D2026-08-02 review (caught independently by two reviewers): every check below
+    # used to run against the raw page text (`body`), including its HTML/JS comments
+    # — and this file documents itself heavily (per CLAUDE.md), so its own doc
+    # comments routinely quote the exact code they describe. `"selftest=1" in body
+    # and "SELFTEST OK" in body` passed on a page with the whole 1591-byte selftest
+    # IIFE cut out, because the paragraph ABOVE it still spelled `` `?selftest=1` ``
+    # and `` `SELFTEST OK` `` in prose — six green checks over a page with no
+    # self-test left in it. `function\s+parseHash\s*\(` and the viewport substring
+    # have the same shape of hole: a comment that quotes real code (or a `<!--`'d
+    # out tag) satisfies them too. Fixed by scoping every match below to the JS with
+    # its comments blanked (`_strip_js_comments`, HTML comments stripped the same
+    # way for the one HTML-level check) — a comment can still say anything it wants
+    # about `parseHash`, it just cannot BE the match anymore.
+    script = re.search(r"<script>(.*)</script>", body, re.S)
+    assert script, "console.html has no <script> block"
+    js = _strip_js_comments(script.group(1))
+    no_html_comments = re.sub(r"<!--.*?-->", "", body, flags=re.S)
+
+    # The selftest block is what actually exercises parseHash/formatHash/VIEW_STATE
+    # from inside the page (§3). If it is deleted, nothing below would notice on its
+    # own — so it is checked by name, first, not folded into the others. Matched as
+    # the two executable call sites: the `location.search` read that gates the
+    # block, and the `console.log` call that is its only successful exit.
+    assert re.search(
+        r'URLSearchParams\(location\.search\)\.get\(\s*[\'"]selftest[\'"]\s*\)', js), \
+        "console.html: nothing reads ?selftest=1 from location.search — §3's own " \
+        "browser self-check is gone"
+    assert re.search(r'console\.log\(\s*[\'"]SELFTEST OK[\'"]\s*\)', js), \
+        "console.html: no console.log(\"SELFTEST OK\") call — the selftest block " \
+        "no longer reports success"
+    # The stub that made every click before the first "Ideas"-tab visit a no-op —
+    # the bug this whole spec exists for (§0.1). Matched as the exact dead
+    # assignment, not the bare identifier `openIdea`, which is a live function used
+    # in five other places and must stay.
+    assert "let openIdea = () => {}" not in js, \
+        "console.html: openIdea is the do-nothing stub again"
+    assert '<meta name="viewport"' in no_html_comments, \
+        "console.html: no viewport meta — the page is unusable on a phone"
+    # The router §2.1 promises. Without it `openIdea` has nothing to read the hash
+    # with, and the next person to touch this file has no route to wire it to but a
+    # stub — which is how §0.1 happened the first time. Matched as function
+    # declarations in live code, not the bare name (which also appears in comments).
+    assert re.search(r"function\s+parseHash\s*\(", js), \
+        "console.html: no parseHash — the router is gone, openIdea will stub out again"
+    assert re.search(r"function\s+formatHash\s*\(", js), \
+        "console.html: no formatHash — parseHash without its inverse is half a router"
+    print("ok: the console — selftest block present, no openIdea stub, viewport "
+          "meta, parseHash/formatHash router in place, none of it satisfied by a "
+          "comment that only quotes the code")
+
     # The page is one file of hand-written JS, and a missing bracket in it does not
     # fail loudly: the browser parses nothing, runs nothing, and shows a header over an
     # empty page — served with a 200 by a server that is perfectly healthy. That is the
     # exact shape of a silent failure this project refuses elsewhere, so it gets a
     # check. (Caught precisely this, four times, the first time it ran.)
-    script = re.search(r"<script>(.*)</script>", app_mod.UI_FILE.read_text(encoding="utf-8"),
-                       re.S)
-    assert script, "console.html has no <script> block"
     node = shutil.which("node")
     if node:
         scratch = tmp / "console.js"

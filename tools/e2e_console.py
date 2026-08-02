@@ -244,6 +244,8 @@ class Browser:
     press(selector, key)              Real keyboard: dispatchKeyEvent (e.g. "Enter").
     fill(selector, text)              Sets .value, dispatches input+change.
     screenshot(path)                  Page.captureScreenshot, full page height.
+    console_messages() -> list        Browser-console messages since the last goto() —
+                                      [{"type": "log"/"error"/"exception"/..., "text": str}].
     server_log() -> str               Current content of the server's log file.
     count_requests(pattern) -> int    Access-log lines containing `pattern`.
     """
@@ -255,6 +257,13 @@ class Browser:
         self._pending = {}   # id -> Future, touched only on the loop thread
         self._nav_counter = itertools.count(1)
         self.log_path = log_path
+        # Browser-console messages, oldest first: {"type": "log"/"error"/..., "text": str}.
+        # Populated from Runtime.consoleAPICalled (console.log/warn/error/assert/...) AND
+        # Runtime.exceptionThrown (an uncaught throw, which selftest's own `assert` helper
+        # may use instead of console.error) — a test that only watched one of the two would
+        # miss whichever failure shape the page actually picked. Cleared on every goto()
+        # (see below) so each test reads only its own document's messages.
+        self._console = []
         self._runner.run(self._connect(devtools_port), timeout=15)
 
     async def _connect(self, devtools_port):
@@ -270,13 +279,23 @@ class Browser:
         await self._send("Runtime.enable")
 
     async def _read_loop(self):
-        # Only command responses ({"id": ...}) are handled — no test here needs a raw
-        # CDP event, and `goto()` below polls `document.readyState` instead of
-        # `Page.loadEventFired` (which never fires again for a same-document,
-        # hash-only navigation — found running this file against `#dial`).
+        # Command responses ({"id": ...}) resolve a pending Future; the two console-facing
+        # events (no "id") are appended to self._console for console_messages() to read —
+        # everything else (Page.* events, etc.) is still ignored, no test here needs it.
         async for raw in self._ws:
             msg = json.loads(raw)
             if "id" not in msg:
+                method = msg.get("method")
+                if method == "Runtime.consoleAPICalled":
+                    p = msg.get("params", {})
+                    args = p.get("args", [])
+                    text = " ".join(str(a.get("value", a.get("description", ""))) for a in args)
+                    self._console.append({"type": p.get("type", "log"), "text": text})
+                elif method == "Runtime.exceptionThrown":
+                    p = msg.get("params", {})
+                    detail = p.get("exceptionDetails", {})
+                    desc = (detail.get("exception") or {}).get("description") or detail.get("text") or ""
+                    self._console.append({"type": "exception", "text": desc})
                 continue
             fut = self._pending.pop(msg["id"], None)
             if fut and not fut.done():
@@ -309,6 +328,7 @@ class Browser:
         path, _, frag = url.partition("#")
         sep = "&" if "?" in path else "?"
         nav_url = f"{path}{sep}_t={next(self._nav_counter)}" + (f"#{frag}" if frag else "")
+        self._console.clear()   # each test's page gets its own, not the previous test's leftovers
         self._call("Page.navigate", {"url": nav_url}, timeout=timeout)
         # A hash-only navigation (`#dial` on a page already loaded) never fires
         # another `Page.loadEventFired` — it is the same document. Polling
@@ -393,13 +413,19 @@ class Browser:
               % (json.dumps(selector), json.dumps(selector)))
         return self.evaluate(js)
 
+    def click_point(self, x, y):
+        """The real-mouse half of `click()`, split out so a caller that already knows WHERE
+        to click (e.g. `find_hittable_point` below, working around an SVG element occluded
+        at its own geometric centre) does not have to re-resolve a selector to a point."""
+        self._call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+        self._call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y,
+                                                  "button": "left", "clickCount": 1})
+        self._call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y,
+                                                  "button": "left", "clickCount": 1})
+
     def click(self, selector):
         pt = self._center_of(selector)
-        self._call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": pt["x"], "y": pt["y"]})
-        self._call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": pt["x"], "y": pt["y"],
-                                                  "button": "left", "clickCount": 1})
-        self._call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": pt["x"], "y": pt["y"],
-                                                  "button": "left", "clickCount": 1})
+        self.click_point(pt["x"], pt["y"])
 
     _KEYS = {
         "Enter": {"key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13,
@@ -431,6 +457,15 @@ class Browser:
             "clip": {"x": 0, "y": 0, "width": size["width"], "height": size["height"], "scale": 1},
         }, timeout=30)
         Path(path).write_bytes(base64.b64decode(shot["data"]))
+
+    def console_messages(self) -> list:
+        """Browser-console messages seen since the last goto(), oldest first — see
+        `_read_loop`'s docstring for what feeds this. A page that never opens DevTools and
+        never calls console.log still gets an empty list here, same as one that crashed
+        silently; callers that need to tell "nothing happened" apart from "the guard is
+        missing" must assert on CONTENT (e.g. a specific "SELFTEST OK" string), never on
+        list truthiness alone."""
+        return list(self._console)
 
     def server_log(self) -> str:
         return self.log_path.read_text() if self.log_path and self.log_path.exists() else ""
@@ -530,6 +565,34 @@ def set_labeled_input(browser: Browser, label_text: str, value: str, root: str =
           % (json.dumps(root), json.dumps(label_text), json.dumps(root), json.dumps(label_text),
              json.dumps(value)))
     browser.evaluate(js)
+
+
+def find_hittable_point(browser: Browser, selector: str):
+    """The centre point of the FIRST element matching `selector` that a real mouse click
+    would actually land on — i.e. `document.elementFromPoint` at that centre resolves back
+    to the element itself, not to something drawn on top of it. Needed because the dial's
+    SVG (`drawDial`) paints several purely-decorative circles with `fill="none"` (the
+    cosine-gap ring, the hover ring, ring labels — the whole `gLab` group) AFTER `gIdeas` in
+    z-order, and Chrome hit-tests their full interior despite the empty fill: an idea node
+    that happens to land near the dial's centre gets its own bounding-box centre stolen by
+    one of those overlays (confirmed directly: `elementsFromPoint` at such a node's centre
+    returned two unclassed `gLab` circles ABOVE `circle.ideanode` in the hit stack). Plain
+    `Browser.click(selector)` — coordinate math only, no `elementFromPoint` check — would
+    silently click the WRONG thing there and this project bans exactly that kind of quiet
+    lie. Returns `{x, y}` in viewport coordinates, or `None` if nothing in the set is
+    reachable by a real click at all."""
+    return browser.evaluate("""
+      (() => {
+        const nodes = [...document.querySelectorAll(%s)];
+        for (const n of nodes) {
+          n.scrollIntoView({block: 'center', inline: 'center'});
+          const r = n.getBoundingClientRect();
+          const x = r.x + r.width / 2, y = r.y + r.height / 2;
+          if (document.elementFromPoint(x, y) === n) return { x, y };
+        }
+        return null;
+      })()
+    """ % json.dumps(selector))
 
 
 def click_button_with_text(browser: Browser, text: str, root: str = "#main") -> None:
@@ -1206,6 +1269,623 @@ def test_write_confirmation_survives_the_reread(browser: Browser, base_url: str)
     assert not still_there_2, "write confirmation is still showing after 'Закрыть карточку'"
 
 
+@test("two_clicks_leave_one_card")
+def test_two_clicks_leave_one_card(browser: Browser, base_url: str):
+    """Two clicks on DIFFERENT ideas, back to back — the second fired before the first's
+    own card has finished rendering — must leave exactly one 'идея …' heading, one
+    'Закрыть карточку' button, and one PATCH form, and that surviving form must belong to
+    whichever idea the heading (and the address bar) name.
+
+    Measured live on the code before `openIdea()` routed every open through the hash
+    (console.html's own `show(idea.id)`/`show(jump.value.trim())`, the exact bypasses
+    `address_bar_matches_the_open_idea` targets above): two headings never appeared, but
+    two 'Закрыть карточку' buttons and two PATCH forms did, the first still holding idea
+    A's own field values under idea B's heading. Reproduced here with `idea_a`'s own GET
+    (both `/ideas/{id}` and its `/neighbors`) slowed via a mocked `fetch`, so the second
+    click — a real, un-mocked, un-delayed request for `idea_b` — is guaranteed to land
+    and render well before `idea_a`'s delayed response arrives.
+
+    Confirmed by mutation: reverting the jump field's 'Открыть' button to call `show(...)`
+    directly (its exact pre-fix shape) resurrects the two-card defect this asserts
+    against — both closures then share the same `detail` element with no hash-driven
+    remount between them. Reverting ONLY the generation guard inside `show()`
+    (`if (stale()) return idea;`) while leaving the hash routing intact does NOT: every
+    click on a DIFFERENT idea now goes through `openIdea()`, and `render()` fully
+    replaces `#main`'s children on each `hashchange`, which orphans idea A's whole closure
+    (including its own, un-decremented `generation`) before its delayed response ever
+    lands — the two are now independent defenses, not one, and this test's oracle checks
+    the SCREEN, not which of the two caught it."""
+    with urllib.request.urlopen(f"{base_url}/ideas?limit=2&offset=0", timeout=10) as r:
+        ideas = json.load(r)["items"]
+    assert len(ideas) >= 2, "stand needs at least two ideas for this test"
+    idea_a, idea_b = ideas[0]["id"], ideas[1]["id"]
+
+    browser.goto(f"{base_url}/ui#ideas")
+    browser.wait_for("document.querySelector(\"#main input.mono[placeholder='idea_…']\") !== null",
+                      timeout=10)
+    # Only idea_a's own GET (idea + neighbors, both share this URL prefix) is slowed —
+    # idea_b's request, and every other tab's, passes straight through.
+    browser.evaluate("""
+      (() => {
+        window.__e2eOrigFetch = window.fetch;
+        window.fetch = function(input, init) {
+          const url = typeof input === "string" ? input : (input && input.url) || "";
+          if (url.includes(%s)) {
+            return new Promise((resolve) =>
+              setTimeout(() => resolve(window.__e2eOrigFetch(input, init)), 800));
+          }
+          return window.__e2eOrigFetch(input, init);
+        };
+      })()
+    """ % json.dumps(f"/ideas/{idea_a}"))
+    try:
+        browser.fill("#main input.mono[placeholder='idea_…']", idea_a)
+        click_button_with_text(browser, "Открыть")   # show(idea_a) — its GET now takes 800ms
+        browser.fill("#main input.mono[placeholder='idea_…']", idea_b)
+        click_button_with_text(browser, "Открыть")   # fired well before idea_a's card lands
+        # idea_b's own request is un-delayed — its card (PATCH form included) finishes
+        # comfortably inside idea_a's 800ms.
+        browser.wait_for(
+            "[...document.querySelectorAll('#main h2')].some((h) => h.textContent === "
+            + json.dumps("идея " + idea_b) + ")", timeout=10)
+        browser.wait_for(
+            "[...document.querySelectorAll('#main h2')].some((h) => "
+            "h.textContent.trim() === 'PATCH /ideas/{id}')", timeout=10)
+        time.sleep(1.0)   # let idea_a's delayed response land and run its own continuation
+    finally:
+        browser.evaluate("(() => { if (window.__e2eOrigFetch) { "
+                          "window.fetch = window.__e2eOrigFetch; delete window.__e2eOrigFetch; } })()")
+
+    headings = browser.evaluate(
+        "[...document.querySelectorAll('#main h2')].filter((h) => "
+        "/^идея idea_/.test(h.textContent.trim())).map((h) => h.textContent.trim())")
+    close_buttons = browser.evaluate(
+        "[...document.querySelectorAll('#main button')].filter((b) => "
+        "b.textContent.trim() === " + json.dumps("Закрыть карточку") + ").length")
+    patch_forms = browser.evaluate(
+        "[...document.querySelectorAll('#main h2')].filter((h) => "
+        "h.textContent.trim() === 'PATCH /ideas/{id}').length")
+
+    problems = []
+    if len(headings) != 1:
+        problems.append(f"expected exactly one 'идея …' heading, found {headings!r}")
+    if close_buttons != 1:
+        problems.append(f"expected exactly one 'Закрыть карточку' button, found {close_buttons}")
+    if patch_forms != 1:
+        problems.append(f"expected exactly one PATCH form, found {patch_forms}")
+    assert not problems, "; ".join(problems)
+
+    # The one surviving form must belong to whichever idea the heading (and the address
+    # bar) actually name — not to the stale first click, which is exactly what "the first
+    # form holds idea A's own fields" looked like on the unfixed code.
+    shown_id = headings[0].split(" ", 1)[1]
+    assert shown_id == idea_b, (
+        f"the surviving heading names {shown_id!r}, expected the SECOND click's idea "
+        f"{idea_b!r}")
+    hash_now = browser.evaluate("location.hash")
+    assert hash_now == f"#ideas/{idea_b}", (
+        f"heading names {idea_b!r} but location.hash is {hash_now!r}")
+    shown_text = read_labeled_number(browser, "text")
+    with urllib.request.urlopen(f"{base_url}/ideas/{idea_b}", timeout=10) as r:
+        real_b = json.load(r)
+    assert shown_text == real_b["text"], (
+        f"the one surviving PATCH form's 'text' field is {shown_text!r}, expected idea "
+        f"B's own text {real_b['text']!r} — the surviving form belongs to a different idea")
+
+
+# ==================================================== router: opening an idea (§0.1)
+
+def _assert_idea_link_worked(browser: Browser, label: str, problems: list) -> None:
+    """The three things `openIdea()` promises per §2.1, checked against the router's own
+    contract (`#<tab>/<arg>`) rather than against some other side effect that could pass by
+    accident: the hash becomes `#ideas/idea_…`, the 'Идеи' tab is the one marked active
+    (`aria-selected="true"`, console.html:52's own selector), and that exact idea's card is
+    actually on screen. Appends a labelled problem to `problems` instead of asserting
+    directly — callers drive this from five different call sites and want ALL of their
+    failures, not just the first."""
+    try:
+        browser.wait_for("location.hash.startsWith('#ideas/idea_')", timeout=10)
+    except TimeoutError:
+        problems.append(f"[{label}] location.hash never became '#ideas/idea_…', stayed "
+                         f"{browser.evaluate('location.hash')!r}")
+        return
+    tab_active = browser.evaluate(
+        "[...document.querySelectorAll('nav.tabs button')].some((b) => "
+        "b.textContent.trim() === 'Идеи' && b.getAttribute('aria-selected') === 'true')")
+    if not tab_active:
+        problems.append(f"[{label}] hash is {browser.evaluate('location.hash')!r} but the "
+                         f"'Идеи' tab is not the one marked aria-selected=\"true\"")
+    idea_id = browser.evaluate("location.hash.slice(1).split('/')[1].split('?')[0]")
+    heading = "идея " + (idea_id or "")
+    try:
+        browser.wait_for("[...document.querySelectorAll('#main h2')].some((h) => h.textContent === "
+                          + json.dumps(heading) + ")", timeout=10)
+    except TimeoutError:
+        problems.append(f"[{label}] hash points at {idea_id!r} but no <h2>{heading!r}</h2> "
+                         f"ever rendered under #main")
+
+
+@test("click_idea_node_opens_it_on_first_load")
+def test_click_idea_node_opens_it_on_first_load(browser: Browser, base_url: str):
+    """§0.1, the headline defect: a fresh /ui load that has NEVER opened 'Идеи' must still
+    open an idea on the FIRST click of a dial node. Before the fix, `openIdea` was declared
+    a stub (`let openIdea = () => {}`, console.html:1129 as of 90cdbe3) and only assigned a
+    real body from INSIDE the 'Идеи' view's own mount — every one of the five call sites
+    was dead until an operator happened to visit 'Идеи' by hand first, which is exactly
+    what this test refuses to do before clicking. Confirmed by mutation (see this task's
+    write-up): patching `window.openIdea` back to that literal stub at runtime, right
+    before the click, leaves `location.hash` at '#dial' and this test's own
+    `wait_for(location.hash.startsWith(...))` times out — it does not pass quietly."""
+    hypothesis = "e2e first-load idea click probe"
+    browser.goto(f"{base_url}/ui#dial")   # never visited "Идеи" in this document
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", hypothesis)
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
+
+    pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    assert pt, "no dial idea node is reachable by a real click — every one is occluded"
+    browser.click_point(pt["x"], pt["y"])
+    problems = []
+    _assert_idea_link_worked(browser, "dial node, first load", problems)
+    assert not problems, "; ".join(problems)
+
+
+@test("every_idea_link_opens_the_idea")
+def test_every_idea_link_opens_the_idea(browser: Browser, base_url: str):
+    """§0.1's full list of five: the dial's own node (already isolated above), the dial's
+    OWN hit table, the 'Индекс' tab's hit table, the 'Тезисы' tab's idea column, and the
+    'Граф' tab's «Открыть в „Идеях“» button — all five go through the same `openIdea()`.
+    Every case starts from its own fresh `goto()` (the `_t=` param in `Browser.goto` forces
+    a real document load every single time, per its own docstring) that never visits
+    'Идеи' first — the original bug's whole shape was "works the second tab you try, once
+    someone else warmed up 'Идеи' in this same document", so warming it up here would hide
+    exactly what this test exists to catch. Collects every failing site instead of stopping
+    at the first, same reasoning as `wrong_shape_200_is_an_error_not_a_spinner` above."""
+    with urllib.request.urlopen(f"{base_url}/ideas?limit=1&offset=0", timeout=10) as r:
+        seed_idea_id = json.load(r)["items"][0]["id"]
+
+    problems = []
+
+    # (a) dial node
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", "e2e link probe: dial node")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
+    pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    if pt:
+        browser.click_point(pt["x"], pt["y"])
+        _assert_idea_link_worked(browser, "dial node", problems)
+    else:
+        problems.append("[dial node] no idea node was reachable by a real click at all")
+
+    # (b) dial hit table (console.html's renderHits — separate from the circle above)
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", "e2e link probe: dial hit table")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelector('#main table.tbl tbody tr td.mono a') !== null", timeout=20)
+    browser.click("#main table.tbl tbody tr:first-child td.mono a")
+    _assert_idea_link_worked(browser, "dial hit table", problems)
+
+    # (c) "Индекс" tab hit table
+    browser.goto(f"{base_url}/ui#search")
+    browser.wait_for("document.querySelector('#main input.grow') !== null", timeout=10)
+    browser.fill("#main input.grow", "e2e link probe: index hit table")
+    click_button_with_text(browser, "Искать")
+    browser.wait_for("document.querySelector('#main table.tbl tbody tr td.mono a') !== null", timeout=15)
+    browser.click("#main table.tbl tbody tr:first-child td.mono a")
+    _assert_idea_link_worked(browser, "Индекс hit table", problems)
+
+    # (d) "Тезисы" tab idea column (auto-loads on mount, no button click needed to see rows)
+    browser.goto(f"{base_url}/ui#theses")
+    browser.wait_for("document.querySelector('#main table.tbl tbody tr td.mono a') !== null", timeout=15)
+    browser.click("#main table.tbl tbody tr:first-child td.mono a")
+    _assert_idea_link_worked(browser, "Тезисы idea column", problems)
+
+    # (e) "Граф" tab "Открыть в «Идеях»" — seeded with a real id so this draws an ego graph
+    # (2 requests) instead of the whole-lake sweep an empty seed would cost (N+1 requests).
+    browser.goto(f"{base_url}/ui#graph")
+    browser.wait_for("document.querySelector('#main input.grow') !== null", timeout=10)
+    browser.fill("#main input.grow", seed_idea_id)
+    click_button_with_text(browser, "Нарисовать")
+    browser.wait_for("document.querySelector('.graphwrap svg circle.node') !== null", timeout=20)
+    node_pt = find_hittable_point(browser, ".graphwrap svg circle.node")
+    assert node_pt, "no graph node is reachable by a real click at all"
+    browser.click_point(node_pt["x"], node_pt["y"])
+    browser.wait_for(
+        "[...document.querySelectorAll('#main button')].some((b) => b.textContent.trim() === "
+        + json.dumps("Открыть в «Идеях»") + ")", timeout=10)
+    click_button_with_text(browser, "Открыть в «Идеях»")
+    _assert_idea_link_worked(browser, "Граф «Открыть в „Идеях“»", problems)
+
+    assert not problems, "idea links that did not open the idea: " + "; ".join(problems)
+
+
+@test("idea_link_is_a_shareable_url")
+def test_idea_link_is_a_shareable_url(browser: Browser, base_url: str):
+    """§2.1's own payoff, stated in the spec directly: a link built by `openIdea()` must
+    work pasted into a brand new document, no clicks. Opens `/ui#ideas/<real id>` as a
+    fresh `goto()` (never having been an in-page hashchange from anywhere) and checks the
+    idea is on screen immediately — no click, no prior visit to any other tab."""
+    with urllib.request.urlopen(f"{base_url}/ideas?limit=1&offset=0", timeout=10) as r:
+        idea_id = json.load(r)["items"][0]["id"]
+
+    browser.goto(f"{base_url}/ui#ideas/{idea_id}")
+    heading = "идея " + idea_id
+    browser.wait_for("[...document.querySelectorAll('#main h2')].some((h) => h.textContent === "
+                      + json.dumps(heading) + ")", timeout=10)
+    tab_active = browser.evaluate(
+        "[...document.querySelectorAll('nav.tabs button')].some((b) => "
+        "b.textContent.trim() === 'Идеи' && b.getAttribute('aria-selected') === 'true')")
+    assert tab_active, "opening #ideas/<id> directly did not land on the 'Идеи' tab"
+
+
+def _find_idea_with_neighbor(base_url: str, scan_limit: int = 50):
+    """First idea (scanning `/ideas`) with at least one real edge — needed to click a
+    live edge-neighbor link rather than assume one exists."""
+    with urllib.request.urlopen(f"{base_url}/ideas?limit={scan_limit}&offset=0", timeout=10) as r:
+        ideas = json.load(r)["items"]
+    for idea in ideas:
+        with urllib.request.urlopen(
+                f"{base_url}/ideas/{idea['id']}/neighbors?hops=1", timeout=10) as r:
+            edges = json.load(r)
+        if edges:
+            return idea["id"]
+    raise AssertionError(f"no idea in the first {scan_limit} has any neighbor — "
+                          f"address_bar_matches_the_open_idea needs one")
+
+
+@test("address_bar_matches_the_open_idea")
+def test_address_bar_matches_the_open_idea(browser: Browser, base_url: str):
+    """§1.2: 'ссылка на состояние — это URL', checked against every real way an operator
+    opens or closes a card inside the 'Идеи' tab itself — not just the five call sites
+    `every_idea_link_opens_the_idea` already covers, which all go through `openIdea()`
+    from OUTSIDE this tab. Three entry points that live INSIDE 'Идеи' used to call
+    `show(id)` directly (the table row's own 'открыть' button, the 'открыть по id'
+    field, and the edge-neighbor link rendered in an open card) — bypassing the router
+    entirely, so the card on screen and the address bar could each name a different
+    idea. 'Закрыть карточку' has the opposite fault: clearing the DOM without clearing
+    the hash means an F5 right after closing reopens exactly what was just closed, and
+    a second click on that same idea's own link goes nowhere (setting `location.hash`
+    to the value it already holds fires no `hashchange`). Collects every broken path
+    instead of stopping at the first, same reasoning as `every_idea_link_opens_the_idea`."""
+    idea_a = _find_idea_with_neighbor(base_url)
+    problems = []
+
+    # (a) the table row's own "открыть" button.
+    browser.goto(f"{base_url}/ui#ideas")
+    browser.wait_for("document.querySelector('#main table.tbl tbody tr') !== null", timeout=10)
+    row_id = browser.evaluate(
+        "document.querySelector('#main table.tbl tbody tr td.mono').textContent.trim()")
+    click_button_with_text(browser, "открыть")
+    browser.wait_for("[...document.querySelectorAll('#main h2')].some((h) => h.textContent === "
+                      + json.dumps("идея " + row_id) + ")", timeout=10)
+    hash_now = browser.evaluate("location.hash")
+    if hash_now != f"#ideas/{row_id}":
+        problems.append(f"[table row 'открыть'] card shows {row_id!r} but location.hash "
+                         f"is {hash_now!r}, expected '#ideas/{row_id}'")
+
+    # (b) the "открыть по id" field.
+    browser.goto(f"{base_url}/ui#ideas")
+    browser.wait_for("document.querySelector(\"#main input.mono[placeholder='idea_…']\") !== null",
+                      timeout=10)
+    browser.fill("#main input.mono[placeholder='idea_…']", idea_a)
+    click_button_with_text(browser, "Открыть")
+    browser.wait_for("[...document.querySelectorAll('#main h2')].some((h) => h.textContent === "
+                      + json.dumps("идея " + idea_a) + ")", timeout=10)
+    hash_now = browser.evaluate("location.hash")
+    if hash_now != f"#ideas/{idea_a}":
+        problems.append(f"['открыть по id'] card shows {idea_a!r} but location.hash "
+                         f"is {hash_now!r}, expected '#ideas/{idea_a}'")
+
+    # (c) the edge-neighbor link rendered inside an open card. Opens idea_a via the one
+    # already-proven-good path (a direct #ideas/<id> goto, `idea_link_is_a_shareable_url`)
+    # so this case isolates the neighbor link's own onclick alone.
+    browser.goto(f"{base_url}/ui#ideas/{idea_a}")
+    browser.wait_for("[...document.querySelectorAll('#main h2')].some((h) => h.textContent === "
+                      + json.dumps("идея " + idea_a) + ")", timeout=10)
+    browser.wait_for("document.querySelector('#main table.tbl tbody tr td.mono a') !== null",
+                      timeout=10)
+    neighbor_id = browser.evaluate(
+        "document.querySelector('#main table.tbl tbody tr td.mono a').textContent.trim()")
+    # A real DOM `.click()`, not `Browser.click()`'s CDP mouse-coordinate dispatch — this
+    # single-line anchor sits right at a `scrollIntoView` boundary, and coordinate clicks
+    # on it landed on the right element (verified: `elementFromPoint` at the computed
+    # centre returned this exact `<a>` every time) yet still missed the handler on a
+    # majority of runs. `.click()` fires the same real "click" event the page's own
+    # `addEventListener` wiring reacts to (see `click_button_with_text`'s docstring above),
+    # without CDP's synthetic-mouse hit-testing in the way.
+    browser.evaluate("document.querySelector('#main table.tbl tbody tr td.mono a').click()")
+    try:
+        browser.wait_for("[...document.querySelectorAll('#main h2')].some((h) => h.textContent === "
+                          + json.dumps("идея " + neighbor_id) + ")", timeout=10)
+    except TimeoutError:
+        problems.append(f"[edge-neighbor link] clicking the link to {neighbor_id!r} never "
+                         f"opened its card — heading stayed on {idea_a!r}, "
+                         f"location.hash is {browser.evaluate('location.hash')!r}")
+    else:
+        hash_now = browser.evaluate("location.hash")
+        if hash_now != f"#ideas/{neighbor_id}":
+            problems.append(f"[edge-neighbor link] card shows {neighbor_id!r} but "
+                             f"location.hash is {hash_now!r}, expected '#ideas/{neighbor_id}'")
+
+    # (d) "Закрыть карточку" must take the id back OUT of the hash — an F5 right after
+    # closing must not reopen the idea that was just closed.
+    browser.goto(f"{base_url}/ui#ideas/{idea_a}")
+    browser.wait_for("[...document.querySelectorAll('#main button')].some((b) => "
+                      "b.textContent.trim() === " + json.dumps("Закрыть карточку") + ")", timeout=10)
+    click_button_with_text(browser, "Закрыть карточку")
+    hash_after_close = browser.evaluate("location.hash")
+    if re.search(r"/idea_", hash_after_close):
+        problems.append(f"['Закрыть карточку'] location.hash is still {hash_after_close!r} "
+                         f"after closing — an F5 now would reopen the just-closed idea")
+
+    # (e) reopening the SAME idea after closing must not be a dead click. If (d) left the
+    # id in the hash, `openIdea(idea_a)` sets `location.hash` to the value it already
+    # holds — no `hashchange` fires, and every one of the five real click sites
+    # `every_idea_link_opens_the_idea` covers does exactly this call, so calling it
+    # directly is a faithful stand-in that does not depend on which of the five a
+    # fragile dial/search result happens to surface.
+    browser.evaluate(f"openIdea({json.dumps(idea_a)})")
+    try:
+        browser.wait_for("[...document.querySelectorAll('#main h2')].some((h) => h.textContent === "
+                          + json.dumps("идея " + idea_a) + ")", timeout=3)
+    except TimeoutError:
+        problems.append(f"[reopen after close] clicking idea {idea_a}'s own link again "
+                         f"after closing it did nothing — location.hash is "
+                         f"{browser.evaluate('location.hash')!r}, the card never came back")
+
+    assert not problems, "; ".join(problems)
+
+
+@test("unknown_tab_is_not_a_white_screen")
+def test_unknown_tab_is_not_a_white_screen(browser: Browser, base_url: str):
+    """render()'s fallback for a hand-edited or stale hash (console.html ~2222-2228): an
+    unknown tab id must not read as a blank page indistinguishable from a crash. Checks
+    both halves — the FIRST tab's own content still renders under #main, AND a
+    '.status.warn' names the actual unknown tab in words, not just a silent fallback that
+    looks identical to having typed a real one."""
+    browser.goto(f"{base_url}/ui#nosuchtab")
+    # render() draws a plain ".panel" spinner while AUTH === "probing" (console.html
+    # ~2233-2237), which also satisfies "#main .panel" — so that alone can't be the gate,
+    # it reads the DOM before the unknown-tab warning has ever been drawn. Wait out the
+    # probe first (same condition the four boot_probe_* tests above use), then wait for
+    # the warning itself, as a real wait and not a one-shot query — a warning that never
+    # shows up must time out here, not read as "not yet rendered".
+    browser.wait_for("typeof AUTH !== 'undefined' && AUTH !== 'probing'", timeout=10)
+    browser.wait_for("document.querySelector('#main .status.warn') !== null", timeout=10)
+
+    warning = browser.evaluate(
+        "(() => { const b = document.querySelector('#main .status.warn'); "
+        "return b ? b.textContent : null; })()")
+    assert warning is not None, "no '.status.warn' explanation shown for an unknown tab in the hash"
+    assert "nosuchtab" in warning, f"the warning does not name the unknown tab by its actual text: {warning!r}"
+
+    # Not just a warning banner over an empty #main: the fallback tab's OWN content (its
+    # real controls, not a second copy of the warning) must actually be usable.
+    has_controls = browser.evaluate(
+        "document.querySelectorAll('#main input, #main textarea, #main button').length > 0")
+    assert has_controls, "the fallback tab shows the warning but no usable controls under #main"
+
+
+@test("selftest_block_passes")
+def test_selftest_block_passes(browser: Browser, base_url: str):
+    """§3's page-level self-check: `?selftest=1` (on the DOCUMENT, never the hash — checked
+    against a `#dial` hash on purpose, to prove the gate reads `location.search`, not the
+    route under test) must print exactly 'SELFTEST OK' to the browser console and raise no
+    error. Read from the REAL browser console (`Browser.console_messages`, backed by CDP's
+    `Runtime.consoleAPICalled` / `Runtime.exceptionThrown`), not by re-running the
+    assertions in Python — that would only prove Python's copy of the logic is right, not
+    that the page's own selftest block exists and passed. Must fail loudly if the block is
+    missing entirely: an empty console log satisfies neither the error-count check (0 is
+    fine) nor the 'SELFTEST OK' check (never found) — there is no way for "no selftest
+    shipped" to read as green here, unlike a bare `assert not errors` would."""
+    browser.goto(f"{base_url}/ui?selftest=1#dial")
+    # The selftest IIFE runs synchronously near the end of the page's own inline <script>,
+    # well before `readyState=="complete"` (which `goto()` already waited for) — but the
+    # CDP event carrying it across the websocket is still one more async hop behind that,
+    # so this polls Python-side instead of assuming it has already landed.
+    deadline = time.monotonic() + 5
+    messages = []
+    while time.monotonic() < deadline:
+        messages = browser.console_messages()
+        if any("SELFTEST" in m["text"] for m in messages):
+            break
+        time.sleep(0.1)
+
+    errors = [m for m in messages if m["type"] in ("error", "exception")]
+    assert not errors, f"selftest run logged {len(errors)} error(s)/exception(s): {errors}"
+    ok = any(m["text"].strip() == "SELFTEST OK" for m in messages)
+    assert ok, (
+        f"'SELFTEST OK' never appeared in the browser console — either the selftest block "
+        f"is missing, or it threw before reaching its last line. Console messages seen: "
+        f"{messages}")
+
+
+# ============================================================ five defects, #15-#19
+#
+# Each test below feeds a 200 response with an UNRELATED body ({"surprise": ...}) through
+# a mocked `window.fetch`, method-scoped so the mock only ever catches the ONE write or
+# read this test cares about — never the tab's own unrelated baseline load. Same
+# "captive portal" fault as `wrong_shape_200_is_an_error_not_a_spinner` above, applied to
+# five call sites that test does not reach: the Retrieve tab's own POST, the dial's
+# "Перечитать граф" (which must also leave the last-good graph undisturbed, not just
+# show an error), POST /sources, the ingest queue's quiet auto-refresh (fired bare from
+# setInterval, nothing above it to catch a stray throw), and PATCH /ideas/{id} (which
+# must not read a malformed response as a small, honest write).
+
+@test("retrieve_wrong_shape_200_is_an_error")
+def test_retrieve_wrong_shape_200_is_an_error(browser: Browser, base_url: str):
+    """#15: POST /retrieve now shape-checks its own response ({ideas, cost}) before handing
+    it to answerBlock() — a 200 with an unrelated body must land on '.status.err', not a
+    spinner stuck forever after run() already thinks the call succeeded. The Retrieve tab
+    is NOT one of `wrong_shape_200_is_an_error_not_a_spinner`'s `configs` above (that list
+    only drives ideas/theses/sources/search), so this is the only place it gets covered."""
+    browser.goto(f"{base_url}/ui#retrieve")
+    browser.wait_for("document.querySelector('#main input.grow') !== null", timeout=10)
+    browser.fill("#main input.grow", "e2e retrieve shape probe")
+
+    _install_method_shape_override(browser, "/retrieve", "POST")
+    click_button_with_text(browser, "Спросить озеро")
+    browser.wait_for("document.querySelector('#main .status.err') !== null", timeout=10)
+
+    text = status_text_sans_code(browser)
+    assert "cost" in text.lower(), (
+        f"expected the /retrieve shape-check's own message ('не {{ideas, cost}}') in the "
+        f"error status, got {text!r}")
+    spinner = browser.evaluate("document.querySelector('#main .spinner') !== null")
+    assert not spinner, "a spinner is still in the DOM after the wrong-shape 200 settled into an error"
+
+
+@test("graph_reread_failure_keeps_prior_graph")
+def test_graph_reread_failure_keeps_prior_graph(browser: Browser, base_url: str):
+    """#16: 'Перечитать граф' (dial tab) must not redraw over a FAILED reread — before the
+    fix, `fire()` ran unconditionally right after `loadGraph(true)`, so a captive-portal 200
+    for /edges left the usual run()-catch error on screen for an instant and then plunged
+    into fire() anyway, drawing over it. Proven directly: draw the dial for real once,
+    count its circles, force the NEXT /edges call to answer 200 with an unrelated body,
+    click 'Перечитать граф', and check both that the error names the graph as unchanged
+    ('граф остался прежним') and that the SVG genuinely did not move — same circle count
+    as before the click, not zero and not redrawn from a half-read graph."""
+    hypothesis = "e2e graph reread probe"
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", hypothesis)
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelector('.graphwrap svg') !== null", timeout=20)
+    nodes_before = browser.evaluate("document.querySelectorAll('.graphwrap svg circle').length")
+    assert nodes_before > 0, (
+        "dial drew no circles at all — this test needs a real drawing to compare against")
+
+    _install_method_shape_override(browser, "/edges", "GET")
+    click_button_with_text(browser, "Перечитать граф")
+    browser.wait_for("document.querySelector('#main .status.err') !== null", timeout=10)
+
+    # Hard invariant FIRST: whatever the error says, fire() must not have run at all — a
+    # message this test would otherwise never get to check if the harder, silent-corruption
+    # failure fired first and obscured it.
+    nodes_after = browser.evaluate("document.querySelectorAll('.graphwrap svg circle').length")
+    assert nodes_after == nodes_before, (
+        f"the dial redrew after a FAILED reread: {nodes_before} circles before the click, "
+        f"{nodes_after} after — fire() must not run when the reread's own run() caught "
+        f"an error")
+
+    # Softer UX requirement second: the code's own catch only appends " — граф остался
+    # прежним" when `err instanceof ApiError` (console.html ~1118) — a malformed 200 for
+    # /edges throws a plain TypeError from `edges.push(...page.items)` instead (page.items
+    # is undefined), which is NOT an ApiError, so it skips that branch and reaches the
+    # operator as a bare "ответ не той формы · page.items is not iterable" with no
+    # reassurance that the graph itself is untouched. The state IS safe (checked above) —
+    # this is a real, narrower gap: the "остался прежним" guarantee the fix's own comment
+    # promises does not yet cover this fault shape, only the ApiError one.
+    text = status_text_sans_code(browser)
+    assert "граф остался прежним" in text, (
+        f"expected 'граф остался прежним' in the reread's error status, got {text!r} — "
+        f"the state IS safe (circle count unchanged, checked above), but the catch in "
+        f"console.html's 'Перечитать граф' handler only adds this reassurance for "
+        f"`err instanceof ApiError`, not for a plain render-time TypeError from a "
+        f"malformed 200 (this test's fault)")
+
+
+@test("sources_post_wrong_shape_200_is_an_error")
+def test_sources_post_wrong_shape_200_is_an_error(browser: Browser, base_url: str):
+    """#17: POST /sources now shape-checks the row it gets back (needs a string `.id`)
+    before interpolating it into the confirmation line — a 200 of the wrong shape used to
+    print a calm green "записан undefined" instead of surfacing as an error. Method-scoped
+    to POST: /sources is ALSO the tab's own GET on mount, and mocking that too would break
+    the unrelated listing read this test does not care about."""
+    browser.goto(f"{base_url}/ui#sources")
+    browser.wait_for("document.querySelector('#main .pager') !== null", timeout=10)   # real GET landed first
+
+    browser.fill("#main details.panel input.grow[placeholder='https://…']",
+                 "https://example.com/e2e-post-sources-shape-probe")
+    browser.evaluate(
+        "(() => { const t = [...document.querySelectorAll('#main details.panel input.grow')][1]; "
+        "t.value = 'e2e post sources shape probe'; "
+        "t.dispatchEvent(new Event('input', {bubbles: true})); "
+        "t.dispatchEvent(new Event('change', {bubbles: true})); })()")
+
+    _install_method_shape_override(browser, "/sources", "POST")
+    click_button_with_text(browser, "Записать")
+    browser.wait_for("document.querySelector('#main details.panel .status.err') !== null", timeout=10)
+
+    text = browser.evaluate(
+        "(() => { const box = document.querySelector('#main details.panel .status'); "
+        "const clone = box.cloneNode(true); const code = clone.querySelector('.code'); "
+        "if (code) code.remove(); return clone.textContent; })()")
+    assert "без id" in text, f"expected 'ответ /sources без id' in the error status, got {text!r}"
+    assert "undefined" not in text, f"the old calm lie ('записан undefined') is still showing: {text!r}"
+
+
+@test("ingest_queue_autorefresh_wrong_shape_shows_error")
+def test_ingest_queue_autorefresh_wrong_shape_shows_error(browser: Browser, base_url: str):
+    """#18: the quiet auto-refresh path (`loadJobs(true)`, fired bare from `setInterval`
+    with nothing above it to catch a stray throw) now shape-checks /ingest/jobs itself
+    instead of letting `jobs.filter` throw as an unhandled rejection — which used to leave
+    the 'автообновление' checkbox checked and the LAST GOOD row on screen forever while
+    every tick silently failed underneath it. That is a STALE status that never changes,
+    not a stuck spinner, and just as much a lie — so this waits for the status to actually
+    flip to err rather than reading it once right after the click."""
+    panel = panel_js("GET /ingest/jobs")
+    browser.goto(f"{base_url}/ui#ingest")
+    browser.wait_for(f"(() => {{ const p = {panel}; const b = p && p.querySelector('.status'); "
+                      "return b && !b.querySelector('.spinner'); })()", timeout=10)
+    before_text = browser.evaluate(f"(() => {{ const p = {panel}; return p.querySelector('.status').textContent; }})()")
+
+    _install_method_shape_override(browser, "/ingest/jobs", "GET")
+    browser.click("#main input[type=checkbox]")   # the tab's only checkbox: "автообновление 4 с"
+
+    browser.wait_for(f"(() => {{ const p = {panel}; const b = p.querySelector('.status'); "
+                      "return b && b.className.split(' ').includes('err'); })()", timeout=10)
+
+    text = browser.evaluate(
+        f"(() => {{ const p = {panel}; const clone = p.querySelector('.status').cloneNode(true); "
+        "const code = clone.querySelector('.code'); if (code) code.remove(); "
+        "return clone.textContent; })()")
+    assert "не массив" in text, (
+        f"expected 'ответ /ingest/jobs — не массив' in the auto-refresh error status, got {text!r}")
+    assert text != before_text, "status text did not actually change from the pre-refresh reading"
+
+
+@test("patch_idea_wrong_shape_response_is_an_error_not_a_false_write")
+def test_patch_idea_wrong_shape_response_is_an_error(browser: Browser, base_url: str):
+    """#19: PATCH /ideas/{id} now checks that its own response actually IS the patched
+    idea (`res.id === ideaId`, `text` a string, `theses` an array) before it ever prints
+    "записано" — a 200 of the wrong shape used to read `updated.updated_at` as undefined,
+    fall back to the page's own honest '«»' marker for "server didn't stamp a time", and
+    confirm a write that never actually landed as that idea. Checks both halves: the error
+    status appears in the PATCH form's OWN status host (`patchStatus`, scoped via
+    '.status.err' since the idea-read status above it is a second, unrelated '.status' in
+    the same DOM), and the "записано" confirmation (`writeStatus`, a THIRD host — see
+    `write_confirmation_survives_the_reread` above) never gets set at all."""
+    with urllib.request.urlopen(f"{base_url}/ideas?limit=1&offset=0", timeout=10) as r:
+        idea_id = json.load(r)["items"][0]["id"]
+
+    browser.goto(f"{base_url}/ui#ideas")
+    browser.wait_for("document.querySelector(\"#main input.mono[placeholder='idea_…']\") !== null",
+                      timeout=10)
+    browser.fill("#main input.mono[placeholder='idea_…']", idea_id)
+    click_button_with_text(browser, "Открыть")
+    browser.wait_for(
+        "[...document.querySelectorAll('#main h2')].some((h) => h.textContent.includes('PATCH /ideas'))",
+        timeout=10)
+
+    set_labeled_input(browser, "text", "e2e mutated text " + idea_id)
+    _install_method_shape_override(browser, "/ideas/", "PATCH")
+    click_button_with_text(browser, "Записать изменения")
+    browser.wait_for("document.querySelector('#main .status.err') !== null", timeout=10)
+
+    text = status_text_sans_code(browser, "#main .status.err")
+    assert "не идея" in text, (
+        f"expected 'ответ PATCH /ideas/{{id}} — не идея' in the error status, got {text!r}")
+
+    wrote = browser.evaluate(
+        "[...document.querySelectorAll('#main .status')].some((b) => b.textContent.includes('записано:'))")
+    assert not wrote, "a write confirmation ('записано:') is showing after a wrong-shape PATCH response"
+
+
 def _install_shape_override(browser: Browser, url_substring: str) -> None:
     """Patches `window.fetch` on the CURRENT document so any request whose URL contains
     `url_substring` answers 200 with a body of the wrong shape (`{"surprise": ...}`,
@@ -1228,6 +1908,43 @@ def _install_shape_override(browser: Browser, url_substring: str) -> None:
         };
       })()
     """ % json.dumps(url_substring))
+
+
+def _install_method_shape_override(browser: Browser, url_substring: str, method: str) -> None:
+    """Like `_install_shape_override`, but only intercepts requests of the given HTTP
+    `method` — several routes below are read AND written through the same path
+    (`GET /sources` on tab load vs. `POST /sources` on submit, `GET /ideas/{id}` on open
+    vs. `PATCH /ideas/{id}` on save), and mocking the write half must not also break the
+    unrelated read half's own, separately-tested shape check. Same non-restoration
+    reasoning as `_install_shape_override`."""
+    browser.evaluate("""
+      (() => {
+        const orig = window.fetch;
+        window.fetch = function(input, init) {
+          const url = typeof input === "string" ? input : (input && input.url) || "";
+          const m = ((init && init.method) || "GET").toUpperCase();
+          if (m === %s && url.includes(%s)) {
+            return Promise.resolve(new Response(JSON.stringify({surprise: "not a page"}),
+              {status: 200, headers: {"Content-Type": "application/json"}}));
+          }
+          return orig(input, init);
+        };
+      })()
+    """ % (json.dumps(method.upper()), json.dumps(url_substring)))
+
+
+def panel_js(heading: str, root: str = "#main") -> str:
+    """JS expression (a string to splice into a larger `evaluate`/`wait_for` call) that
+    finds whichever `.panel` under `root` has an `<h2>` matching `heading` exactly, or
+    `null`. The ingest tab keeps six panels each with their own status host (POST /fetch,
+    Фазы, Обслуживание, GET /ingest/jobs, staging, pending-link) — a bare `#main .status`
+    query silently reads the wrong one the moment more than one has ever fired, which on
+    this tab is the normal case (every panel below the first fires its own request on
+    mount)."""
+    return ("(() => { const panels = [...document.querySelectorAll(%s + ' .panel')]; "
+            "return panels.find((p) => { const h = p.querySelector('h2'); "
+            "return h && h.textContent.trim() === %s; }) || null; })()"
+            % (json.dumps(root), json.dumps(heading)))
 
 
 @test("wrong_shape_200_is_an_error_not_a_spinner")
@@ -1480,3 +2197,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
