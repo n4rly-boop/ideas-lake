@@ -1513,6 +1513,33 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
             answer = getattr(guarded, method)(path)
             assert answer.status_code != 401, ("open route asked for a key", path,
                                                answer.status_code, answer.text)
+        # The open half is rate limited, and WHO it counts against is the whole point.
+        # The public entry is a Cloudflare tunnel, so the socket address is the tunnel
+        # for every visitor alike — counted that way, one bucket serves the entire room
+        # and the second person to touch the dial is refused for the first person's
+        # clicks. `CF-Connecting-IP` is where the real caller survives.
+        rpm, app_mod.OPEN_RPM = app_mod.OPEN_RPM, 3
+        app_mod._BUCKETS.clear()
+        try:
+            one = {"CF-Connecting-IP": "203.0.113.7"}
+            two = {"CF-Connecting-IP": "203.0.113.8"}
+            codes = [guarded.get("/dial?q=x", headers=one).status_code for _ in range(4)]
+            assert codes == [200, 200, 200, 429], codes
+            assert guarded.get("/dial?q=x", headers=one).headers.get("Retry-After")
+            # A second visitor behind the same tunnel is a second bucket, not a victim.
+            assert guarded.get("/dial?q=x", headers=two).status_code == 200, "one bucket for all"
+            # And a key buys past it: this limiter is about strangers and CPU, not access.
+            for _ in range(5):
+                assert guarded.get("/dial?q=x", headers={**one, "Authorization": f"Bearer {key}"}
+                                   ).status_code == 200, "a key holder got throttled"
+            # Only the two routes that walk every thesis. A page out of the store is not
+            # rationed, or the console's own reads would die on the fourth click.
+            for _ in range(6):
+                assert guarded.get("/ideas", headers=one).status_code == 200, "/ideas throttled"
+        finally:
+            app_mod.OPEN_RPM = rpm
+            app_mod._BUCKETS.clear()
+
         # ...and the closed half. One route per kind, because "the middleware covers
         # everything" is exactly the claim that rots: the ingest machine room (a GET,
         # and still shut), a write, the ops view, and a path that does not exist. The

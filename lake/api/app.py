@@ -120,7 +120,12 @@ COSTLY_OPEN = ("/dial", "/search")
 # Per client, per minute. Generous for a room of people poking a dial by hand
 # (a person manages a handful a minute), useless for a loop. `LAKE_OPEN_RPM=0`
 # turns it off for a loopback-only port where it buys nothing.
-OPEN_RPM = int(os.environ.get("LAKE_OPEN_RPM", "30"))
+#
+# 30 was measured wrong and shipped: the public entry is a Cloudflare tunnel, so
+# `request.client.host` is the tunnel for EVERY visitor — one bucket for the whole
+# hall, and the 31st dial of the day 429s somebody who has clicked once. 120 with
+# a per-visitor key (below) is the same budget per person it always meant to be.
+OPEN_RPM = int(os.environ.get("LAKE_OPEN_RPM", "120"))
 _BUCKETS: dict[str, list[float]] = {}
 
 
@@ -132,6 +137,23 @@ def _key_ok(request: Request, expected: str) -> bool:
     # TypeError out of the middleware and become a 500.
     return scheme.lower() == "bearer" and hmac.compare_digest(
         token.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _client_key(request: Request) -> str:
+    """Who to count this call against.
+
+    The socket address is the tunnel, not the caller, so it collapses the whole
+    audience into one bucket. `CF-Connecting-IP` is set by Cloudflare on every
+    request it forwards and is the only place the real address survives.
+
+    Spoofable, and that is fine here: this limiter defends CPU, not a secret, and
+    a caller who forges the header to get their own bucket has done exactly what
+    an honest second visitor does. Nothing behind the border is decided by it.
+    """
+    forwarded = request.headers.get("cf-connecting-ip", "").strip()
+    if forwarded:
+        return forwarded[:64]
+    return request.client.host if request.client else "?"
 
 
 def _throttle(request: Request) -> JSONResponse | None:
@@ -146,7 +168,7 @@ def _throttle(request: Request) -> JSONResponse | None:
     if OPEN_RPM <= 0 or not request.url.path.startswith(COSTLY_OPEN):
         return None
     now = time.monotonic()
-    who = request.client.host if request.client else "?"
+    who = _client_key(request)
     seen = [t for t in _BUCKETS.get(who, ()) if now - t < 60.0]
     if len(seen) >= OPEN_RPM:
         _BUCKETS[who] = seen

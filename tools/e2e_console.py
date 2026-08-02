@@ -870,12 +870,18 @@ def test_loads(browser: Browser, base_url: str):
     browser.goto(f"{base_url}/ui")
     browser.wait_for("document.querySelectorAll('nav.tabs button').length > 0", timeout=10)
     count = browser.evaluate("document.querySelectorAll('nav.tabs button').length")
-    # Measured directly against this commit (view() is called 9 times in
-    # console.html: retrieve, dial, search, ideas, theses, sources, ingest, graph,
-    # raw) — 9 tab buttons render, not 8. Asserting the real, measured number rather
-    # than the brief's guess, per the same rule the API itself is held to: a count
-    # is either right or it says nothing.
-    assert count == 9, f"expected 9 tab buttons (nav.tabs button), found {count}"
+    # view() is still called 9 times in console.html, but only PUBLIC_TABS render as
+    # tabs: dial, graph, retrieve, in that order. The rest stay mounted and reachable by
+    # address (openIdea sends every point click to #ideas/...) and are simply not offered.
+    # Both the count AND the order are asserted — the order is what makes the dial the
+    # landing view, and a silent re-sort would move the room's first screen.
+    assert count == 3, f"expected 3 tab buttons (nav.tabs button), found {count}"
+    labels = browser.evaluate(
+        "JSON.stringify([...document.querySelectorAll('nav.tabs button')]"
+        ".map(b => b.textContent))")
+    assert json.loads(labels) == ["\u0413\u0438\u043f\u043e\u0442\u0435\u0437\u0430",
+                                  "\u0413\u0440\u0430\u0444", "Retrieve"], \
+        f"tab order changed: {labels}"
 
 
 @test("navigation_reloads_the_document")
@@ -1554,7 +1560,7 @@ def test_click_idea_node_opens_it_on_first_load(browser: Browser, base_url: str)
     browser.goto(f"{base_url}/ui#dial")   # never visited "Идеи" in this document
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
     browser.fill("#main textarea", hypothesis)
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
 
     pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
@@ -1585,7 +1591,7 @@ def test_every_idea_link_opens_the_idea(browser: Browser, base_url: str):
     browser.goto(f"{base_url}/ui#dial")
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
     browser.fill("#main textarea", "e2e link probe: dial node")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
     pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
     if pt:
@@ -1598,7 +1604,7 @@ def test_every_idea_link_opens_the_idea(browser: Browser, base_url: str):
     browser.goto(f"{base_url}/ui#dial")
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
     browser.fill("#main textarea", "e2e link probe: dial hit table")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelector('#main table.tbl tbody tr td.mono a') !== null", timeout=20)
     browser.click("#main table.tbl tbody tr:first-child td.mono a")
     _assert_idea_link_worked(browser, "dial hit table", problems)
@@ -1862,7 +1868,7 @@ def test_retrieve_wrong_shape_200_is_an_error(browser: Browser, base_url: str):
     browser.fill("#main input.grow", "e2e retrieve shape probe")
 
     _install_method_shape_override(browser, "/retrieve", "POST")
-    click_button_with_text(browser, "Спросить озеро")
+    click_button_with_text(browser, "Спросить")
     browser.wait_for("document.querySelector('#main .status.err') !== null", timeout=10)
 
     text = status_text_sans_code(browser)
@@ -1887,7 +1893,7 @@ def test_graph_reread_failure_keeps_prior_graph(browser: Browser, base_url: str)
     browser.goto(f"{base_url}/ui#dial")
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
     browser.fill("#main textarea", hypothesis)
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelector('.graphwrap svg') !== null", timeout=20)
     nodes_before = browser.evaluate("document.querySelectorAll('.graphwrap svg circle').length")
     assert nodes_before > 0, (
@@ -2210,7 +2216,7 @@ def test_state_survives_a_tab_round_trip(browser: Browser, base_url: str):
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
     browser.fill("#main textarea", hypothesis)
     set_labeled_input(browser, "k", "7")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
 
     rows_before = browser.evaluate("document.querySelectorAll('#main table.tbl tbody tr').length")
@@ -2263,7 +2269,7 @@ def test_state_survives_a_tab_round_trip(browser: Browser, base_url: str):
     browser.goto(f"{base_url}/ui#retrieve")
     browser.wait_for("document.querySelector('#main input.grow') !== null", timeout=10)
     browser.fill("#main input.grow", query)
-    click_button_with_text(browser, "Спросить озеро")
+    click_button_with_text(browser, "Спросить")
     browser.wait_for("document.querySelector('#main .status.ok') !== null", timeout=20)
 
     # `out` (the answer container `host.replaceChildren(panel, out)` builds) is #main's
@@ -2382,8 +2388,8 @@ def test_stale_answer_marked_after_a_tab_round_trip(browser: Browser, base_url: 
     The remount's restore path must not present A's answer as though it were B's."""
     ts = int(time.time() * 1000)
     configs = [
-        ("dial", "#main textarea", "Разложить", f"e2e_stale_dial_a_{ts}", f"e2e_stale_dial_b_{ts}"),
-        ("retrieve", "#main input.grow", "Спросить озеро",
+        ("dial", "#main textarea", "Показать", f"e2e_stale_dial_a_{ts}", f"e2e_stale_dial_b_{ts}"),
+        ("retrieve", "#main input.grow", "Спросить",
          f"e2e_stale_retrieve_a_{ts}", f"e2e_stale_retrieve_b_{ts}"),
         # Space-separated words, not an underscore-joined id: "search" is the raw BM25+vector
         # hybrid, and a random alnum token matches nothing in the corpus' FTS index — every
@@ -2456,8 +2462,8 @@ def test_failure_in_a_later_mount_outranks_an_earlier_success(browser: Browser, 
     ts = int(time.time() * 1000)
     configs = [
         # (tab, field_sel, btn_text, hypothesis, url_substr, success_class)
-        ("dial", "#main textarea", "Разложить", f"e2e_hole2_dial_{ts}", "/dial", "ok"),
-        ("retrieve", "#main input.grow", "Спросить озеро", f"e2e_hole2_retrieve_{ts}", "/retrieve", "ok"),
+        ("dial", "#main textarea", "Показать", f"e2e_hole2_dial_{ts}", "/dial", "ok"),
+        ("retrieve", "#main input.grow", "Спросить", f"e2e_hole2_retrieve_{ts}", "/retrieve", "ok"),
         ("search", "#main input.grow", "Искать", f"e2e_hole2_search_{ts}", "/search", "warn"),
     ]
     problems = []
@@ -2546,7 +2552,7 @@ def test_dial_idea_layer_matches_its_own_checkbox(browser: Browser, base_url: st
     browser.goto(f"{base_url}/ui#dial")
     browser.wait_for(f"document.querySelector({json.dumps(field_sel)}) !== null", timeout=10)
     browser.fill(field_sel, f"e2e_hole2_layer_a_{ts}")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0",
                       timeout=20)
 
@@ -2585,7 +2591,7 @@ def test_dial_idea_layer_matches_its_own_checkbox(browser: Browser, base_url: st
     browser.wait_for(f"document.querySelector({json.dumps(field_sel)}) !== null", timeout=10)
     click_checkbox_with_label(browser, "идеи и рёбра")   # un-check BEFORE firing
     browser.fill(field_sel, f"e2e_hole2_layer_b_{ts}")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelector('#main .status.ok') !== null", timeout=20)
 
     click_checkbox_with_label(browser, "идеи и рёбра")   # re-check — no refetch
@@ -2812,9 +2818,9 @@ def test_failed_call_returns_the_button(browser: Browser, base_url: str):
     says nothing about the other, same reasoning as every other per-view test above."""
     configs = [
         ("dial", "#main textarea", f"e2e_failed_call_dial_{int(time.time() * 1000)}",
-         "Разложить", "/dial"),
+         "Показать", "/dial"),
         ("retrieve", "#main input.grow", f"e2e_failed_call_retrieve_{int(time.time() * 1000)}",
-         "Спросить озеро", "/retrieve"),
+         "Спросить", "/retrieve"),
     ]
     problems = []
     for tab, field_sel, text, btn_text, url_substr in configs:
@@ -3017,7 +3023,7 @@ def _confirm_is_asked_before_expensive_steps(browser, base_url, stats, FAKE_PEND
 
 @test("single_request_on_double_click")
 def test_single_request_on_double_click(browser: Browser, base_url: str):
-    """§4.2: `guard(fn)` must stop a second click on 'Разложить' before the first answer
+    """§4.2: `guard(fn)` must stop a second click on 'Показать' before the first answer
     lands from firing a second `GET /dial` — was `expected_fail=True` (no debounce/disable
     shipped yet); now the guard exists, this must PASS (see `test()`'s XFAIL/XPASS
     contract: an XFAIL that starts passing without dropping the flag fails the run on
@@ -3035,13 +3041,13 @@ def test_single_request_on_double_click(browser: Browser, base_url: str):
     made = browser.count_requests("GET /dial?") - before
 
     assert made == 1, (
-        f"double-clicking 'Разложить' fired {made} GET /dial requests, want 1 — no guard "
+        f"double-clicking 'Показать' fired {made} GET /dial requests, want 1 — no guard "
         f"against a second click before the first answer lands yet")
 
 
 @test("single_request_on_double_click_retrieve")
 def test_single_request_on_double_click_retrieve(browser: Browser, base_url: str):
-    """Same guard, the retrieve tab's own 'Спросить озеро' — §4.2 says the guard wraps
+    """Same guard, the retrieve tab's own 'Спросить' — §4.2 says the guard wraps
     every `button.act`, not just the dial's, and a double POST here is worse than a double
     GET on the dial: it is a second, real line in `retrieve.jsonl` polluting the A/B log
     the project measures against, not just a wasted read."""
@@ -3051,14 +3057,14 @@ def test_single_request_on_double_click_retrieve(browser: Browser, base_url: str
     browser.fill("#main input.grow", query)
 
     before = browser.count_requests("POST /retrieve")
-    click_button_with_text(browser, "Спросить озеро")
-    click_button_with_text(browser, "Спросить озеро")
+    click_button_with_text(browser, "Спросить")
+    click_button_with_text(browser, "Спросить")
     browser.wait_for("document.querySelector('#main .status.ok') !== null", timeout=20)
     time.sleep(0.5)   # let a second in-flight request, if the page fired one, finish and log
     made = browser.count_requests("POST /retrieve") - before
 
     assert made == 1, (
-        f"double-clicking 'Спросить озеро' fired {made} POST /retrieve requests, want 1 — "
+        f"double-clicking 'Спросить' fired {made} POST /retrieve requests, want 1 — "
         f"no guard against a second click before the first answer lands")
 
 
@@ -3186,7 +3192,7 @@ def test_phone_content_tables_become_cards(browser: Browser, base_url: str):
     browser.goto(f"{base_url}/ui#dial")
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
     browser.fill("#main textarea", "e2e phone card-table probe")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelector('.graphwrap svg') !== null", timeout=20)
     browser.wait_for("document.querySelector('#main table.tbl.cardable tbody tr') !== null", timeout=10)
     checks = {"dial hits": cardable_table_check(browser)}
@@ -3274,7 +3280,7 @@ def test_phone_buttons_meet_minimum_touch_target(browser: Browser, base_url: str
     """§2.3: at max-width:620, `button.act`/`button.ghost` get `min-height:44px`, and
     `.ghost.sm` (measured smaller before this pass — the pager arrows, each row's own
     "открыть") additionally gets `min-width:44px` (WCAG 2.5.5). Checked on real rendered
-    buttons a phone user would actually tap — the dial's "Разложить" (`button.act`), and
+    buttons a phone user would actually tap — the dial's "Показать" (`button.act`), and
     the ideas pager's arrows plus a row's own "открыть" (`button.ghost.sm`) — not a CSS
     rule read out of the stylesheet, which would still pass even if the selector had
     stopped matching the real markup."""
@@ -3284,13 +3290,13 @@ def test_phone_buttons_meet_minimum_touch_target(browser: Browser, base_url: str
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
     act_rect = browser.evaluate("""
       (() => { const b = [...document.querySelectorAll('#main button.act')]
-                 .find((x) => x.textContent.trim() === 'Разложить');
+                 .find((x) => x.textContent.trim() === 'Показать');
                 if (!b) return null; const r = b.getBoundingClientRect();
                 return { width: r.width, height: r.height }; })()
     """)
-    assert act_rect, "no 'Разложить' button.act found on #dial at 390px"
+    assert act_rect, "no 'Показать' button.act found on #dial at 390px"
     assert act_rect["width"] >= 44 and act_rect["height"] >= 44, (
-        f"'Разложить' (button.act) is {act_rect['width']}x{act_rect['height']} at 390px, "
+        f"'Показать' (button.act) is {act_rect['width']}x{act_rect['height']} at 390px, "
         f"want >=44x44")
 
     browser.goto(f"{base_url}/ui#ideas")
@@ -3343,7 +3349,7 @@ def test_phone_dial_height_scales_with_width_not_just_window_height(browser: Bro
         browser.goto(f"{base_url}/ui#dial")
         browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
         browser.fill("#main textarea", "e2e phone dial-square probe")
-        click_button_with_text(browser, "Разложить")
+        click_button_with_text(browser, "Показать")
         browser.wait_for("document.querySelector('.graphwrap svg') !== null", timeout=20)
         return browser.evaluate("""
           (() => {
@@ -3428,7 +3434,7 @@ def test_phone_leaves_off_default_status_matches_dial_total(browser: Browser, ba
 
     k = read_labeled_number(browser, "k")
     browser.fill("#main textarea", hypothesis)
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelector('.graphwrap svg') !== null", timeout=20)
     browser.wait_for("document.querySelector('#main .status.warn, #main .status.ok') !== null",
                       timeout=20)
@@ -3461,11 +3467,11 @@ def test_phone_leaves_off_default_status_matches_dial_total(browser: Browser, ba
         f"{data['total']}: mismatch")
 
 
-@test("phone_top_default_is_narrow_not_desktop")
-def test_phone_top_default_is_narrow_not_desktop(browser: Browser, base_url: str):
-    """§2.3: "число идей по умолчанию на узком — 15, не 30" — the ring at 390px is a
-    third the desktop's size (the square-by-width fix above), and even 30 no longer
-    fits. Checked on a bare `#dial` open with NO `top=` in the address at all, so this is
+@test("phone_top_default_is_15")
+def test_phone_top_default_is_15(browser: Browser, base_url: str):
+    """§2.3: "число идей по умолчанию — 15". It used to be 15 narrow / 30 desktop; one
+    number at every width replaced the pair, and 15 is the one that survived — the ring
+    at 390px is a third the desktop's size and 30 never fit there. Checked on a bare `#dial` open with NO `top=` in the address at all, so this is
     the actual default, not an echoed URL param —
     `url_reproduces_the_view_on_a_narrow_phone` already covers "an explicit value
     survives"; this covers "no value at all still lands on the right number"."""
@@ -3490,7 +3496,7 @@ def test_phone_dial_marks_scale_with_ring_width(browser: Browser, base_url: str)
     browser.goto(f"{base_url}/ui#dial")
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
     browser.fill("#main textarea", "e2e phone dial-scale probe")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0",
                       timeout=20)
 
@@ -3535,7 +3541,7 @@ def test_phone_dial_ring_gap_scales_with_ring_width(browser: Browser, base_url: 
     Instead this captures the ARGUMENT `drawDial` actually calls `ringLayout` with,
     exactly once, regardless of what the layout goes on to do with it: `ringLayout` is a
     plain top-level `function` in this classic (non-module) `<script>`, so it is a real
-    `window` property, and monkey-patching it before "Разложить" is clicked — call
+    `window` property, and monkey-patching it before "Показать" is clicked — call
     through to the original, just also record its own 4th argument — reads the exact
     number the page computed, no convergence or real data involved at all."""
     browser.set_device(390, 844, mobile=True, touch=True)
@@ -3553,7 +3559,7 @@ def test_phone_dial_ring_gap_scales_with_ring_width(browser: Browser, base_url: 
       };
     """)
     browser.fill("#main textarea", "e2e phone dial-scale probe")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("window.__e2e_gapPx !== null", timeout=20)
     gap_px = browser.evaluate("window.__e2e_gapPx")
     assert abs(gap_px - 12) < 0.5, (
@@ -3798,7 +3804,7 @@ def _checkbox_state(browser: Browser, label_text: str, root: str = "#main"):
 
 
 def _draw_dial_for_touch_tests(browser: Browser, base_url: str, hypothesis: str, leaves=False):
-    """Shared setup for every test below: a fresh `#dial` load, a hypothesis, "Разложить",
+    """Shared setup for every test below: a fresh `#dial` load, a hypothesis, "Показать",
     and "точки-листья" left in whichever state the caller asked for (`leaves`). Idea nodes
     only exist once `withGraph` (checked by default) has actually resolved, hence the wait
     on `circle.ideanode`, not just on the SVG's existence.
@@ -3818,7 +3824,7 @@ def _draw_dial_for_touch_tests(browser: Browser, base_url: str, hypothesis: str,
     assert checked is not None, "no 'точки-листья' checkbox found on #dial"
     if checked != leaves:
         click_checkbox_with_label(browser, "точки-листья")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
 
 
@@ -4457,7 +4463,13 @@ def _switch_theme(browser: Browser, theme: str):
     deadline = time.monotonic() + 5
     got = current
     while got != theme and time.monotonic() < deadline:
-        browser.click("#theme-btn")
+        # `.click()` on the element, not a coordinate click: #theme-btn is `display:none`
+        # since the bar was cut down to brand + numbers, and a synthetic mouse event at
+        # its (zero) box hits nothing. The button's real onclick still runs — this drives
+        # the same handler the old coordinate click did, which is the point: the ramp
+        # check below is only worth anything if the theme changed the way the page
+        # changes it.
+        browser.evaluate("document.querySelector('#theme-btn').click()")
         time.sleep(0.1)
         got = browser.evaluate("document.documentElement.dataset.theme")
     assert got == theme, (
@@ -4509,7 +4521,7 @@ def measure_class_contrast(browser: Browser, html: str, fg_selector: str) -> flo
 
 
 def _rerender_dial(browser: Browser):
-    """Clicks 'Разложить' and waits for a NEW `<svg>` node under `.graphwrap` — not just
+    """Clicks 'Показать' and waits for a NEW `<svg>` node under `.graphwrap` — not just
     for "some svg" to exist, which the PREVIOUS render already left sitting there for a
     moment before a re-click's fetch resolves. Every test below that needs a fresh dial
     picture (in particular the ramp test, which re-renders mid-test right after switching
@@ -4519,7 +4531,7 @@ def _rerender_dial(browser: Browser):
     (a mouse half under touch emulation, a stat read ten times without the query ever
     changing) — a stale SVG node passing as "the new render" would be a third."""
     browser.evaluate("window.__prevDialSvg = document.querySelector('.graphwrap svg') || null")
-    click_button_with_text(browser, "Разложить")
+    click_button_with_text(browser, "Показать")
     browser.wait_for(
         "(() => { const svg = document.querySelector('.graphwrap svg'); "
         "return !!svg && svg !== window.__prevDialSvg; })()", timeout=20)

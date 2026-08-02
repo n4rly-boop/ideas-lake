@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ideas Lake — консоль блока A</title>
+<title>Ideas Lake</title>
 <style>
 :root{
   color-scheme:dark;
@@ -52,12 +52,21 @@ button,input,select,textarea{font:inherit;color:inherit}
 header.bar{background:var(--surface);
   border-bottom:1px solid var(--hair);padding:10px 18px;display:flex;gap:16px;
   align-items:center;flex-wrap:wrap}
-.brand{font-weight:650;letter-spacing:-.01em}
+/* nowrap: the bar is a flex row and the brand is its first item, so with a chip strip
+   that wants 890px next to it "Ideas Lake" was being squeezed onto two lines at 390px —
+   87px of header for two words. It is two words; it gets one line, and the strip (which
+   scrolls) gives up the space instead. */
+.brand{font-weight:650;letter-spacing:-.01em;white-space:nowrap;flex:0 0 auto}
 .brand small{display:block;font-weight:400;font-size:11px;color:var(--muted);letter-spacing:.06em;
   text-transform:uppercase}
 .stat-strip{display:flex;gap:14px;flex-wrap:wrap;margin-left:auto;align-items:center}
-.chip{display:inline-flex;align-items:center;gap:6px;background:var(--surface-2);
-  border:1px solid var(--hair);border-radius:999px;padding:5px 11px;font-size:12px;color:var(--ink-2)}
+/* nowrap, and `flex:0 0 auto` so the strip's own `overflow-x` is what handles a chip
+   that does not fit. Without it a long chip ("сервер --no-auth — ручки открыты") broke
+   into three lines INSIDE the pill and made the whole bar 60px tall — a scrolling strip
+   whose items still wrapped vertically, which is the worst of both. */
+.chip{display:inline-flex;align-items:center;gap:6px;background:var(--surface-2);flex:0 0 auto;
+  border:1px solid var(--hair);border-radius:999px;padding:5px 11px;font-size:12px;
+  color:var(--ink-2);white-space:nowrap}
 .chip b{color:var(--ink);font-variant-numeric:tabular-nums}
 .chip .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
 .chip.ok .dot{background:var(--good)} .chip.warn .dot{background:var(--warning)}
@@ -158,8 +167,29 @@ table.tbl th.num{text-align:right}
      width, which is what "grow" meant on the desktop row in the first place. */
   label.f.grow{flex:0 0 auto}
   .panel{padding:12px 12px}
+  /* The sticky header is a tax on every screen below it, paid in the only scarce
+     dimension a phone has. Tighter padding and a smaller chip here, plus the one-line
+     brand above, is what pays for the dial actually being visible on first open. */
+  header.bar{padding:8px 12px;gap:10px}
+  nav.tabs{padding:0 8px}
+  .chip{padding:4px 9px;font-size:11px}
+  .stat-strip{gap:8px}
   button.act,button.ghost{min-height:44px}
   button.ghost.sm{min-height:44px;min-width:44px}
+  /* Opt-out of the column stacking above, for rows of SMALL fields that already fit side
+     by side (the graph explorer's хопов/min_weight/идей). Stacking those spends a whole
+     screen of the one scarce dimension on three inputs 90 px wide — the picture is what
+     the phone came for. `min-width:0` is what actually lets them shrink: `label.f input`
+     sets `min-width:90px`, and a flex item never goes below its own min-width. */
+  /* `align-items` too, not just the direction: the block above switches it to `stretch`
+     for the column case, and a stretched `label.f` puts its input directly under a caption
+     that may be one line or two — so "идей максимум" (wraps) sat a line lower than
+     "хопов" (does not). Bottom-aligned, the inputs line up whatever the captions do. */
+  .row.tight{flex-direction:row;flex-wrap:wrap;align-items:flex-end}
+  .row.tight label.f{flex:1 1 88px;min-width:0}
+  .row.tight label.f.grow{flex:1 1 160px}
+  .row.tight label.f input,.row.tight label.f select{min-width:0;width:100%}
+  .row.tight button.act{flex:0 0 auto}
 }
 
 /* 430: phone. The four content tables (dial hits, "Идеи", "Тезисы", "Источники") reflow
@@ -255,11 +285,13 @@ svg.graph{display:block;width:100%;height:min(70vh,720px)}
 svg.graph .edge{stroke:var(--ink-2)}
 svg.graph .node{stroke:var(--surface);stroke-width:1;cursor:pointer}
 svg.graph .node.sel{stroke:var(--s2);stroke-width:2.5}
-svg.graph text.nl{fill:var(--ink);font-size:10.5px;pointer-events:none}
+svg.graph text.nl{fill:var(--ink);font-size:11.5px;pointer-events:none}
 /* Halo, not just colour: these captions sit on top of three thousand dots, and stroke
-   under fill is the only thing that keeps them readable there. */
-svg.graph text.ringlab,svg.graph text.hitlab{pointer-events:none;paint-order:stroke;
-  stroke:var(--surface-2);stroke-width:4.5px;stroke-linejoin:round}
+   under fill is the only thing that keeps them readable there. `.nl` (the graph
+   explorer's "корень") sits on top of 200 nodes and 1 400 edges and had the same problem
+   — one rule, three caption classes, rather than a second copy of the same halo. */
+svg.graph text.ringlab,svg.graph text.hitlab,svg.graph text.nl{pointer-events:none;
+  paint-order:stroke;stroke:var(--surface-2);stroke-width:4.5px;stroke-linejoin:round}
 svg.graph text.ringlab{fill:var(--ink-2);font-size:13px;font-variant-numeric:tabular-nums}
 svg.graph text.hitlab{fill:var(--ink);font-size:14px}
 svg.graph circle.ideanode{cursor:pointer}
@@ -280,6 +312,9 @@ svg.graph circle.hoverring{pointer-events:none}
   .hovercard{position:fixed!important;left:0!important;right:0!important;bottom:0!important;
     top:auto!important;max-width:none!important;width:100%!important;
     border-radius:12px 12px 0 0;box-sizing:border-box}
+  /* 11.5px inside a 352 px-wide picture is the same physical size as 11.5px inside a
+     1400 px one, i.e. a third as many pixels of the screen it has to be read from. */
+  svg.graph text.nl{font-size:13px}
 }
 .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--ink-2);
   align-items:center}
@@ -302,10 +337,14 @@ svg.graph circle.hoverring{pointer-events:none}
 
 <div class="chrome">
   <header class="bar">
-    <div class="brand">Ideas Lake<small>блок A · консоль</small></div>
+    <div class="brand">Ideas Lake</div>
     <div class="stat-strip" id="strip"><span class="chip"><span class="dot"></span>подключаюсь…</span></div>
-    <button class="pill" id="theme-btn" title="Светлая / тёмная">◐ тема</button>
-    <button class="pill" id="key-btn" title="Сменить ключ">🔑 ключ</button>
+    <!-- Theme and key are not on the bar any more: the page is read-first for a room
+         that has no key, and two controls neither of them touches cost a header row
+         on a phone. Both machineries stay — the theme still follows the saved choice,
+         and the key gate still opens itself on the first 401 from a write. -->
+    <button class="pill hide" id="theme-btn" title="Светлая / тёмная">◐ тема</button>
+    <button class="pill hide" id="key-btn" title="Сменить ключ">🔑 ключ</button>
   </header>
   <nav class="tabs" id="tabs"></nav>
 </div>
@@ -641,11 +680,19 @@ async function refreshStrip() {
   const chips = [];
   const add = (kind, ...kids) => chips.push(el("span", { class: "chip " + kind },
     el("span", { class: "dot" }), ...kids));
-  add(health.status === "ok" ? "ok" : "bad", "healthz ", el("b", {}, health.status),
-      health.mock ? " (mock)" : "");
+  // Shown only when it is NOT ok. A green "healthz ok" is a word for the operator and
+  // noise for the room, and it was the first chip on a strip where the lake's own
+  // numbers already scroll off a phone. Hiding a HEALTHY status hides nothing; hiding
+  // a broken one would be the lie §1 is about, so the bad case still gets its chip.
+  if (health.status !== "ok" || health.mock)
+    add(health.status === "ok" ? "warn" : "bad", "healthz ", el("b", {}, health.status),
+        health.mock ? " (mock)" : "");
   // Said out loud, because from the inside an open server looks exactly like a guarded
   // one: this port answers everything to anyone who can reach it.
-  if (NO_AUTH) add("warn", "сервер ", el("b", {}, "--no-auth"), " — ручки открыты");
+  // NO_AUTH is a dev stand only — prod runs with a key and this chip could never
+  // appear there, so it was a permanent line of noise in the room for a state the room
+  // will never be in. The warning itself is not gone: `--no-auth` is a flag somebody
+  // types, and the server still says so on its own stdout at start.
   if (AUTH === "readonly") add("warn", el("b", {}, "только чтение"), " — ключ нужен для записи и /retrieve");
   add(stats.in_sync ? "ok" : "bad", "индекс/хранилище ",
       el("b", {}, `${fmt(stats.theses_indexed)}/${fmt(stats.theses)}`));
@@ -859,9 +906,7 @@ view("retrieve", "Retrieve", (host, ctx) => {
   const locked = !canWrite();
   host.replaceChildren(
     el("div", { class: "panel" },
-      el("h2", {}, "POST /retrieve"),
-      el("p", { class: "help" }, "Запрос эволюции → идеи с провенансом. Recall-first: отказа по низкому "
-        + "скору нет, выдача дозаполняется до k — поэтому смотри via и cosine, а не score."),
+      el("h2", {}, "Спросить озеро"),
       ignoredRunNote(ctx),
       locked ? lockedNote("Вызов стоит денег (35B) и пишет строку в retrieve.jsonl — за ключом всегда, "
         + "не только пока нет доступа.") : null,
@@ -873,10 +918,10 @@ view("retrieve", "Retrieve", (host, ctx) => {
         el("label", { class: "cb" }, rewrite, "rewrite"),
         el("button", { class: "act", disabled: locked ? "" : null,
           title: locked ? "нужен ключ — вызов стоит денег" : null,
-          onclick: guard(() => fire(false)) }, "Спросить озеро"),
+          onclick: guard(() => fire(false)) }, "Спросить"),
         el("button", { class: "ghost", disabled: locked ? "" : null,
           title: locked ? "нужен ключ — вызов стоит денег" : null,
-          onclick: guard(() => fire(true)) }, "Оба плеча рядом")),
+          onclick: guard(() => fire(true)) }, "Сравнить два ответа")),
       statusHost),
     out);
   q.focus();
@@ -948,10 +993,33 @@ function markAnswerStale(statusHost, message) {
   statusHost.insertBefore(el("div", { class: "status warn" }, message), box ? box.nextSibling : null);
 }
 
-async function loadGraph(force = false) {
+/* One read in flight, shared by everyone who asks while it runs. Two callers at once —
+   the graph tab drawing on open and a click on «Нарисовать» a second later, or that tab
+   and the dial — each used to run the WHOLE paged read: twice 859 ideas and 14 806 edges
+   down the same connection. That is not merely wasteful; measured on this stand at 390 px
+   (draw-on-open, then the button ~1 s later) the second read came back "Failed to fetch"
+   and the picture never appeared. The promise is dropped as soon as it settles, so a later
+   call — or a `force` re-read from «Перечитать граф», which must never be answered from an
+   older in-flight read — starts a fresh one. `readGraph` still assigns GRAPH_CACHE only on
+   its very last line, so a shared failure leaves the previous graph untouched for every
+   caller waiting on it, exactly as before. */
+let GRAPH_LOADING = null;
+function loadGraph(force = false) {
   const fresh = GRAPH_CACHE && LAST_STATS
     && GRAPH_CACHE.edgeTotal === LAST_STATS.edges && GRAPH_CACHE.ideaTotal === LAST_STATS.ideas;
-  if (GRAPH_CACHE && !force && (fresh || !LAST_STATS)) return GRAPH_CACHE;
+  if (GRAPH_CACHE && !force && (fresh || !LAST_STATS)) return Promise.resolve(GRAPH_CACHE);
+  if (GRAPH_LOADING && !force) return GRAPH_LOADING;
+  const mine = readGraph();
+  GRAPH_LOADING = mine;
+  // `.then(clear, clear)`, not `.finally(clear)`: `finally` returns a DERIVED promise that
+  // nobody awaits, so a failed read would surface as an unhandled rejection in the console
+  // on top of the one the caller already handles. A two-argument `then` swallows it.
+  const clear = () => { if (GRAPH_LOADING === mine) GRAPH_LOADING = null; };
+  mine.then(clear, clear);
+  return mine;
+}
+
+async function readGraph() {
   const edges = [];
   let edgeTotal = 0;
   for (let offset = 0; ; offset += 5000) {
@@ -1016,6 +1084,30 @@ function ringLayout(nodes, links, iters = 400, gapPx = 19) {
    and so the touch handler a later commit adds can reuse it with its own search radius.
    `rank` is the layer priority (0 leaf, 1 idea, 2 hit, 3 hypothesis centre) — subtracted
    harder than plain distance so a hit buried under a cloud of leaves still wins. */
+/* "This value at 390 px of picture, that one at 900 px and up", linear in between and
+   clamped outside. A touch target that reads on a phone is a blob on a desktop, and a
+   1.5 px hairline that reads on a desktop is invisible on a phone — every size in either
+   svg that needs both numbers goes through here. Lived inside the dial's `drawDial` until
+   the graph explorer needed exactly the same rule; one definition, two callers. */
+const wScale = (w, narrow, desktop) =>
+  narrow + (desktop - narrow) * Math.max(0, Math.min(1, (w - 390) / (900 - 390)));
+
+/* Client coordinates -> viewBox units. Both svgs are `width:100%` with a fixed viewBox,
+   so client pixels are not viewBox units and the box is letterboxed on whichever axis has
+   slack; using the raw offset put the dial's card a couple of centimetres from the mark it
+   described. Returns the box and scale too — the dial positions its card from them. */
+function viewPoint(svg, w, h, event) {
+  const box = svg.getBoundingClientRect();
+  const scale = Math.min(box.width / w, box.height / h);
+  return [(event.clientX - box.left - (box.width - w * scale) / 2) / scale,
+          (event.clientY - box.top - (box.height - h * scale) / 2) / scale, box, scale];
+}
+
+/* Reach, in viewBox units, for the nearest-mark search both svgs do on a pointer: a finger
+   is not a pixel, and a mark 4 px across is a target nobody can hit with one. Mouse is the
+   only pointer that gets the small number. */
+const REACH = (event) => (event.pointerType === "mouse" ? 9 : 18);
+
 function nearestMark(marks, x, y) {
   let mark = null, score = Infinity;
   for (const m of marks) {
@@ -1038,17 +1130,18 @@ view("dial", "Гипотеза", (host, ctx) => {
   // would have been silently ignored and every restored/linked hypothesis would render
   // as an empty box. Set as the DOM property instead, which is what actually works.
   q.value = p.q || "";
-  const k = el("input", { type: "number", min: 1, max: 50, value: Number(p.k) || 12 });
+  const k = el("input", { type: "number", min: 1, max: 50, value: Number(p.k) || 5 });
   // Defect 1 (§2.2): one default, one place. Width-dependent defaults used to be spelled
   // out twice — once at the mount-read sites below, once (as a bare desktop constant) in
   // `syncParams` — and the two spellings only agreed by coincidence at desktop widths.
   // Both sides now call these instead of re-deriving the number/bit themselves.
   const isNarrow = () => window.innerWidth < 430;
-  // 30 by default because the top ideas all sit in a thin band of cosine — their radii
-  // are nearly equal, and that ring only fits so many circles before they overlap. §2.3:
-  // at 390 px the ring itself is a third the size (the square-by-width fix below), so
-  // even 30 does not fit — 15 is the narrow default instead, `p.top` still wins outright.
-  const topDefault = () => isNarrow() ? 15 : 30;
+  // 15 at every width. The top ideas all sit in a thin band of cosine — their radii are
+  // nearly equal, and that ring only fits so many circles before they overlap; 30 was a
+  // desktop-only number that needed a narrow exception (§2.3), and one number that reads
+  // the same on both is worth more than four extra circles. `p.top` still wins outright.
+  // Kept as a function so mount and `syncParams` cannot drift apart again (defect 1).
+  const topDefault = () => 15;
   const top = el("input", { type: "number", min: 5, max: 300,
     value: Number(p.top) || topDefault() });
   const withGraph = el("input", { type: "checkbox", checked: p.graph === "0" ? null : true });
@@ -1077,8 +1170,11 @@ view("dial", "Гипотеза", (host, ctx) => {
     const narrow = isNarrow();
     setParams({
       q: q.value.trim() || undefined,
-      k: (Number(k.value) || 12) !== 12 ? k.value : undefined,
-      top: narrow ? top.value : ((Number(top.value) || 30) !== 30 ? top.value : undefined),
+      k: (Number(k.value) || 5) !== 5 ? k.value : undefined,
+      // `topDefault()`, never a literal — the 30 that used to sit here is exactly how
+      // the two spellings drifted apart the first time. No longer width-dependent, so
+      // omitting it at the default is safe at any width the link later opens on.
+      top: (Number(top.value) || topDefault()) !== topDefault() ? top.value : undefined,
       graph: withGraph.checked ? undefined : "0",
       leaves: narrow ? (withLeaves.checked ? "1" : "0")
                      : (withLeaves.checked ? undefined : "0"),
@@ -1177,10 +1273,10 @@ view("dial", "Гипотеза", (host, ctx) => {
     // §4.1: the params THIS call answers, stashed with whatever it returns — a later mount
     // compares them against the fields/address instead of trusting that a cached body still
     // matches whatever text happens to sit in the textarea by then.
-    const reqParams = { q: text, k: Number(k.value) || 12 };
+    const reqParams = { q: text, k: Number(k.value) || 5 };
     await run(statusHost, "считаю косинус до каждого листа…", async () => {
       try {
-        const data = await api(`/dial?q=${encodeURIComponent(text)}&k=${Number(k.value) || 12}`);
+        const data = await api(`/dial?q=${encodeURIComponent(text)}&k=${Number(k.value) || 5}`);
         if (stale()) return data;
 
         // The graph is a separate read and a separate failure: a dead Neo4j costs the idea
@@ -1243,14 +1339,11 @@ view("dial", "Гипотеза", (host, ctx) => {
     // 900 px and up": idea nodes and hit dots get BIGGER on a phone (touch targets, and
     // §2.3's own default of 15 ideas instead of 30 leaves each one more ring room), while
     // `gapPx` shrinks with the ring itself, since a smaller `R` has less circumference to
-    // spread separation across.
-    const wScale = (narrow, desktop) => {
-      const t = Math.max(0, Math.min(1, (w - 390) / (900 - 390)));
-      return narrow + (desktop - narrow) * t;
-    };
-    const nodeBaseR = wScale(5, 3.6);
-    const hitDotR = { top: wScale(5, 8), rest: wScale(5, 4) };
-    const gapPx = wScale(12, 19);
+    // spread separation across. `wScale` itself now lives at module scope (next to
+    // `nearestMark`) — the graph explorer needs the identical rule.
+    const nodeBaseR = wScale(w, 5, 3.6);
+    const hitDotR = { top: wScale(w, 5, 8), rest: wScale(w, 5, 4) };
+    const gapPx = wScale(w, 12, 19);
 
     const mk = (tag, attrs = {}) => {
       const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
@@ -1488,15 +1581,9 @@ view("dial", "Гипотеза", (host, ctx) => {
     const ring = mk("circle", { class: "hoverring hide", r: 11, fill: "none",
                                 stroke: "var(--s2)", "stroke-width": 1.5 });
     gLab.append(ring);
-    // The svg is width:100% with a fixed viewBox, so client pixels are not viewBox units
-    // and the box is letterboxed on the axis that has slack. Both are undone here; using
-    // the raw offset put the card a couple of centimetres from the mark it described.
-    const toView = (event) => {
-      const box = svg.getBoundingClientRect();
-      const scale = Math.min(box.width / w, box.height / h);
-      return [(event.clientX - box.left - (box.width - w * scale) / 2) / scale,
-              (event.clientY - box.top - (box.height - h * scale) / 2) / scale, box, scale];
-    };
+    // See `viewPoint` at module scope for why the raw offset is not enough. Bound to this
+    // svg's own dimensions once, so the call sites below read as they always did.
+    const toView = (event) => viewPoint(svg, w, h, event);
     // Armed by a tap that showed a mark's card (pointerdown below), so a second tap on the
     // SAME mark knows to open instead of just re-showing. Declared here, next to `hideCard`,
     // because `hideCard` is the one place that disarms it: every path that can hide the card
@@ -1563,7 +1650,7 @@ view("dial", "Гипотеза", (host, ctx) => {
     svg.addEventListener("pointermove", (event) => {
       if (!hasHover(event)) return;   // no hover concept for touch/pen
       const [vx, vy, box, scale] = toView(event);
-      const best = showMark(vx, vy, 9);
+      const best = showMark(vx, vy, REACH(event));
       if (best) positionCard(box, scale, best);
     });
     svg.addEventListener("pointerleave", (event) => {
@@ -1590,7 +1677,7 @@ view("dial", "Гипотеза", (host, ctx) => {
       // suppressing the synthetic click (that guard lives on the `click` listener above).
       event.preventDefault();
       const [vx, vy, box, scale] = toView(event);
-      const best = showMark(vx, vy, 18);
+      const best = showMark(vx, vy, REACH(event));
       if (!best) return;   // showMark already called hideCard, which disarmed lastTapMark
       if (best === lastTapMark && best.openId) {
         openIdea(best.openId);
@@ -1606,10 +1693,6 @@ view("dial", "Гипотеза", (host, ctx) => {
 
   function renderHits(data) {
     listHost.replaceChildren(
-      el("p", { class: "help" }, `Угол — первые две компоненты PCA остатка, и они несут `
-        + `${(data.angle_variance * 100).toFixed(1)} % его дисперсии: это украшение, `
-        + `расстояния в нём нет. Правда — радиус и таблица: косинус, тот же, что печатает `
-        + `/retrieve. Список — то же, что вернул бы GET /search.`),
       el("div", { class: "scroller" }, labelCells(el("table", { class: "tbl cardable" },
         el("thead", {}, el("tr", {}, ...["#", "cos", "тезис", "идея", "RRF", "BM25", "vector"]
           .map((head) => el("th", { class: NUM_HEADS.has(head) ? "num" : undefined }, head)))),
@@ -1668,14 +1751,11 @@ view("dial", "Гипотеза", (host, ctx) => {
 
   host.replaceChildren(
     el("div", { class: "panel" },
-      el("h2", {}, "GET /dial — гипотеза против всего озера"),
-      el("p", { class: "help" }, "Фраза с трибуны сравнивается с каждым листом индекса. Ни rewrite, "
-        + "ни 9B, ни записи: в графе от этого ничего не появляется и в retrieve.jsonl "
-        + "(лог замера A/B) строки не остаётся."),
+      el("h2", {}, "Гипотеза против всего озера"),
       el("div", { class: "row" }, el("label", { class: "f grow" }, "гипотеза", q),
         el("label", { class: "f" }, "k", k),
         el("label", { class: "f" }, "идей", top),
-        el("button", { class: "act", onclick: guard(fire) }, "Разложить")),
+        el("button", { class: "act", onclick: guard(fire) }, "Показать")),
       el("div", { class: "row" },
         el("label", { class: "cb" }, withGraph, "идеи и рёбра"),
         el("label", { class: "cb" }, withLeaves, "точки-листья"),
@@ -1721,7 +1801,7 @@ view("dial", "Гипотеза", (host, ctx) => {
     if (ctx.state.data) renderAll(ctx.state.data, ctx.state.graph, ctx.state.graphError, ctx.state.ideas);
     failed(statusHost, ctx.state.err);
     const ep = ctx.state.errParams;
-    if (ep && (ep.q !== (p.q || "") || ep.k !== (Number(p.k) || 12)))
+    if (ep && (ep.q !== (p.q || "") || ep.k !== (Number(p.k) || 5)))
       statusHost.append(el("div", { class: "status warn" },
         `неудачным был запрос «${ep.q}» (k=${ep.k}) — текущая гипотеза другая, жми «Разложить» для неё`));
   } else if (ctx.state.data) {
@@ -1729,7 +1809,7 @@ view("dial", "Гипотеза", (host, ctx) => {
     // request. This is the entire fix for "switch tabs and back loses the dial".
     renderAll(ctx.state.data, ctx.state.graph, ctx.state.graphError, ctx.state.ideas);
     const rp = ctx.state.reqParams;
-    const cur = { q: p.q || "", k: Number(p.k) || 12 };
+    const cur = { q: p.q || "", k: Number(p.k) || 5 };
     if (rp && (rp.q !== cur.q || rp.k !== cur.k))
       markAnswerStale(statusHost,
         `показан ответ на прежний запрос «${rp.q}» (k=${rp.k}) — текущая гипотеза другая, жми «Разложить» для ответа на неё`);
@@ -2665,7 +2745,7 @@ view("graph", "Граф", (host, ctx) => {
   const picks = el("div", { class: "legend wrap", style: "margin-top:10px" });
   const p = ctx.params;
   const seed = el("input", { class: "grow", placeholder: "запрос словами, или idea_… (пусто = всё озеро)", value: p.root || "" });
-  const hops = el("select", {}, ...[1, 2, 3].map((n) => el("option", { selected: String(n) === (p.hops || "1") ? "" : null }, n)));
+  const hops = el("select", {}, ...[1, 2, 3].map((n) => el("option", { selected: String(n) === (p.hops || "3") ? "" : null }, n)));
   const minW = el("input", { type: "number", min: 0, step: 1, placeholder: "любой", value: p.min_weight || "" });
   const cap = el("input", { type: "number", min: 10, max: 400, value: Number(p.cap) || 200 });
   // Idea text for a candidate outside the drawn neighbourhood, filled in by `drawPicks`
@@ -2679,7 +2759,7 @@ view("graph", "Граф", (host, ctx) => {
   function syncParams(root) {
     setParams({
       root: root || undefined,
-      hops: hops.value !== "1" ? hops.value : undefined,
+      hops: hops.value !== "3" ? hops.value : undefined,
       min_weight: minW.value || undefined,
       cap: (Number(cap.value) || 200) !== 200 ? cap.value : undefined,
     });
@@ -2720,7 +2800,7 @@ view("graph", "Граф", (host, ctx) => {
     }
 
     const data = await run(statusHost, rootId ? "тяну окрестность идеи…"
-      : "тяну идеи и рёбра каждой из них…", async () => {
+      : "тяну идеи и рёбра озера…", async () => {
       if (rootId) {
         const [idea, edges] = await Promise.all([
           api(`/ideas/${encodeURIComponent(rootId)}`),
@@ -2729,12 +2809,24 @@ view("graph", "Граф", (host, ctx) => {
         const ids = [...new Set([idea.id, ...edges.flatMap((e) => [e.source_id, e.target_id])])]
           .filter((id) => id !== idea.id);
         const bodies = new Map([[idea.id, idea]]);
-        // Neighbours come back as edges only, so their bodies are fetched one by one —
-        // there is no bulk read for a set of ids, and inventing one client-side would
-        // mean drawing a node whose trust and leaf count nobody looked up. A 404 here
-        // is a real answer (an edge to an idea that is gone), so it drops the node
-        // rather than the whole picture.
-        for (const [id, body] of await pool(ids, (id) =>
+        // Neighbours come back as edges only, so their bodies have to be looked up — and
+        // one `/ideas/{id}` each is 723 requests for a 3-hop neighbourhood of a hub, which
+        // is what a bare `#graph?root=…` link used to cost the moment it drew itself. The
+        // shared bulk read holds those very bodies (paged `/ideas`, the same rows the same
+        // endpoint would have answered one at a time), so it answers them instead. Not
+        // "invented client-side": every node still comes from a row the server sent. Cold
+        // AND small, the bulk read is the more expensive of the two, so it is only forced
+        // past a dozen ids; once anything has warmed the cache it is free either way.
+        const lake = (GRAPH_CACHE || ids.length > 12) ? await loadGraph() : null;
+        if (lake) for (const id of ids) {
+          const body = lake.ideas.get(id);
+          if (body) bodies.set(id, body);
+        }
+        // Whatever the bulk read did not have — an idea ingested since it ran, or no bulk
+        // read at all — still gets its own call, so a drawn node is never a node whose
+        // trust and leaf count nobody looked up. A 404 here is a real answer (an edge to
+        // an idea that is gone), so it drops the node rather than the whole picture.
+        for (const [id, body] of await pool(ids.filter((id) => !bodies.has(id)), (id) =>
             api(`/ideas/${encodeURIComponent(id)}`).catch((err) => {
               if (err.status === 404) return null;
               throw err;
@@ -2745,14 +2837,28 @@ view("graph", "Граф", (host, ctx) => {
         return { bodies, edges, total: bodies.size, shown: bodies.size, truncated: false,
                  code: codeOf(idea) };
       }
-      const page = await api(`/ideas?limit=${limit}&offset=0`);
-      const bodies = new Map(page.items.map((idea) => [idea.id, idea]));
-      const edges = [];
-      for (const [, part] of await pool([...bodies.keys()], (id) =>
-          api(`/ideas/${encodeURIComponent(id)}/neighbors?${params}`)))
-        for (const edge of part) if (bodies.has(edge.target_id)) edges.push(edge);
-      return { bodies, edges, total: page.total, shown: bodies.size,
-               truncated: page.total > bodies.size, code: codeOf(page) };
+      // `loadGraph()` — the same paged bulk read the dial already uses, and the same
+      // GRAPH_CACHE: 859 ideas in 5 requests of /ideas plus 14 806 edges in 3 of /edges,
+      // against the 201 the per-idea /neighbors sweep cost for the identical picture (see
+      // GRAPH_CACHE's own comment, which says exactly this). Shared with the dial, so a
+      // second visit to either tab costs nothing — that is what makes drawing on open
+      // affordable rather than a 201-request ambush.
+      const lake = await loadGraph();
+      // hops is meaningless here whatever the select says: this branch keeps only edges
+      // whose BOTH ends are on the drawn page, so depth cannot add anything. Depth is a
+      // property of an EGO graph, and the ego branch above uses the select as typed.
+      const bodies = new Map([...lake.ideas].slice(0, limit));
+      // `min_weight` was a query param on /neighbors; /edges has no such filter, so the
+      // same cut is made here instead. Empty field = no floor, exactly as before.
+      const floor = Number(minW.value) || 0;
+      const edges = lake.edges.filter((e) => bodies.has(e.source_id) && bodies.has(e.target_id)
+                                             && (e.weight || 1) >= floor);
+      // `total` is the server's own count of ideas (`/ideas`' `total`, carried on the
+      // cache), never `bodies.size` — the whole point of the "СПИСОК ОБРЕЗАН" line below
+      // is that the two differ. No status code: a cache hit answered nothing this call,
+      // and printing a 200 nobody received would be a code with nothing behind it.
+      return { bodies, edges, total: lake.ideaTotal, shown: bodies.size,
+               truncated: lake.ideaTotal > bodies.size, code: null };
     });
     if (stale() || !data) return;
     ctx.state.graph = { data, rootId, found, typed };   // §2.2: cached for mount-time restore
@@ -2767,8 +2873,9 @@ view("graph", "Граф", (host, ctx) => {
   // no request" fix for this view.
   function paint(data, rootId, found, typed, stale) {
 
-    const nodes = [...data.bodies.values()].map((idea) => ({
-      id: idea.id, idea, r: 4 + 1.5 * Math.sqrt(Math.max(0, idea.theses.length - 1)) }));
+    // `r` is filled in below, once `w` is known: a dot big enough to see on a 352 px-wide
+    // phone picture is a blob on a 1400 px desktop one (see `wScale`).
+    const nodes = [...data.bodies.values()].map((idea) => ({ id: idea.id, idea, r: 0 }));
     const seen = new Set();
     const links = [];
     for (const edge of data.edges) {
@@ -2818,13 +2925,17 @@ view("graph", "Граф", (host, ctx) => {
       picks.append(el("span", { class: "dim" }, "другие совпадения индекса:"));
       for (const candidate of shortlist) {
         const text = labels.get(candidate.id);
-        picks.append(el("button", {
-          class: "ghost sm",
-          style: candidate.id === rootId ? "border-color:var(--s2);color:var(--ink)" : null,
-          title: `${candidate.id}\n${text || "(текст не прочитан)"}`,
-          onclick: () => draw(candidate.id),
-        }, candidate.id === rootId ? "● " : "", text ? cut(text, 64) : candidate.id),
-          armBadge(candidate));
+        // Button and its arm badge in ONE flex item, not two: `.legend.wrap` is a flex
+        // container, and on a phone the button alone fills the line — which put every
+        // "слова + смысл" on a line of its own, six candidates costing twelve lines.
+        picks.append(el("span", { style: "display:inline-flex;gap:6px;align-items:center" },
+          el("button", {
+            class: "ghost sm",
+            style: candidate.id === rootId ? "border-color:var(--s2);color:var(--ink)" : null,
+            title: `${candidate.id}\n${text || "(текст не прочитан)"}`,
+            onclick: () => draw(candidate.id),
+          }, candidate.id === rootId ? "● " : "", text ? cut(text, 64) : candidate.id),
+          armBadge(candidate)));
       }
     }
     };
@@ -2834,6 +2945,15 @@ view("graph", "Граф", (host, ctx) => {
     // of lie as an empty list for a broken store, so it gets the same treatment.
     try {
     const w = wrap.clientWidth || 1200, h = Math.min(720, Math.round(window.innerHeight * 0.7));
+    // §2.3, same rule as the dial: marks get BIGGER on a phone and lines get thicker and
+    // less transparent there, because the picture is a third the width while the finger
+    // and the eye stay the size they are. `h` deliberately keeps the plain window formula
+    // — `svg.graph`'s CSS height rule is only ever provable on this svg (the dial's own
+    // inline style always wins over it), so an inline height here would take the only
+    // check that rule has with it.
+    const baseR = wScale(w, 5, 4), leafR = wScale(w, 1.9, 1.5);
+    for (const node of nodes)
+      node.r = baseR + leafR * Math.sqrt(Math.max(0, node.idea.theses.length - 1));
     layout(nodes, links, w, h);
     const pos = new Map(nodes.map((node) => [node.id, node]));
     const mk = (tag, attrs = {}) => {
@@ -2852,33 +2972,60 @@ view("graph", "Граф", (host, ctx) => {
       if (!a || !b) continue;
       const strength = Math.min(1, Math.log1p(link.weight) / Math.log1p(6));
       const line = mk("line", { class: "edge", x1: a.x.toFixed(1), y1: a.y.toFixed(1),
-        x2: b.x.toFixed(1), y2: b.y.toFixed(1), "stroke-opacity": (0.06 + 0.24 * strength).toFixed(3),
-        "stroke-width": (0.6 + 0.9 * strength).toFixed(2) });
+        x2: b.x.toFixed(1), y2: b.y.toFixed(1),
+        "stroke-opacity": (wScale(w, 0.10, 0.06) + wScale(w, 0.30, 0.24) * strength).toFixed(3),
+        "stroke-width": (wScale(w, 0.9, 0.6) + wScale(w, 1.3, 0.9) * strength).toFixed(2) });
       tip(line, `${link.type} · вес ${link.weight}`);
       gEdges.append(line);
     }
+    // Every node also lands here, and the card below is opened by a nearest-mark search
+    // rather than by a `click` on the circle itself — the same reason the dial does it:
+    // a node is 4–12 px across, 200 of them share a 352 px-wide box on a phone, and a
+    // target that small is one nobody can hit with a finger.
+    const marks = [];
     for (const node of nodes) {
       const circle = mk("circle", { class: "node" + (node.id === rootId ? " sel" : ""),
         cx: node.x.toFixed(1), cy: node.y.toFixed(1), r: node.r.toFixed(1),
         fill: trustColor(node.idea.trust_score) });
       tip(circle, `${cut(node.idea.text, 160)}\ntrust ${node.idea.trust_score.toFixed(1)} · `
         + `листьев ${node.idea.theses.length}`);
-      circle.addEventListener("click", () => {
-        info.replaceChildren(el("div", { class: "cards" }, ideaCard(node.idea, null)),
-          el("div", { class: "row", style: "margin-top:10px" },
-            el("button", { class: "ghost", onclick: () => { seed.value = node.id; draw(); } },
-              "Раскрыть окрестность этой идеи"),
-            el("button", { class: "ghost", onclick: () => openIdea(node.id) }, "Открыть в «Идеях»")));
-        info.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      });
       gNodes.append(circle);
+      marks.push({ x: node.x, y: node.y, r: node.r, rank: 0, node });
       if (node.id === rootId) {
         const label = mk("text", { class: "nl", x: node.x.toFixed(1),
-          y: (node.y - node.r - 7).toFixed(1), "text-anchor": "middle" });
+          y: (node.y - node.r - wScale(w, 10, 7)).toFixed(1), "text-anchor": "middle" });
         label.textContent = "корень";
         gLabels.append(label);
       }
     }
+    // Which node the finger actually landed on — with a nearest-mark search the answer is
+    // not "the one under the fingertip", so it has to be shown, or the card below is about
+    // an idea the operator has no way of identifying on the picture.
+    const ring = mk("circle", { class: "hoverring hide", r: 11, fill: "none",
+                                stroke: "var(--s2)", "stroke-width": 2 });
+    gLabels.append(ring);
+    // `click`, not `pointerdown` (which is what the dial listens to): the whole picture is
+    // one big svg on a 390 px screen, and a `pointerdown` handler that swaps the card below
+    // and scrolls to it fires on the DOWN of every scroll gesture that starts on the graph.
+    // A tap's `click` still carries the tapping pointer's own `pointerType` in Chromium —
+    // the dial's own listeners rely on exactly that — so `REACH` still tells finger from
+    // mouse here, without the handler firing on a drag.
+    svg.addEventListener("click", (event) => {
+      const [vx, vy] = viewPoint(svg, w, h, event);
+      const { mark, score } = nearestMark(marks, vx, vy);
+      if (!mark || score > REACH(event)) { ring.classList.add("hide"); return; }
+      ring.setAttribute("cx", mark.x.toFixed(1));
+      ring.setAttribute("cy", mark.y.toFixed(1));
+      ring.setAttribute("r", (mark.r + 5).toFixed(1));
+      ring.classList.remove("hide");
+      const node = mark.node;
+      info.replaceChildren(el("div", { class: "cards" }, ideaCard(node.idea, null)),
+        el("div", { class: "row", style: "margin-top:10px" },
+          el("button", { class: "ghost", onclick: () => { seed.value = node.id; draw(); } },
+            "Раскрыть окрестность этой идеи"),
+          el("button", { class: "ghost", onclick: () => openIdea(node.id) }, "Открыть в «Идеях»")));
+      info.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
     svg.append(gEdges, gNodes, gLabels);
     wrap.replaceChildren(svg);
     drawPicks();                     // not awaited: the graph is already on screen
@@ -2890,47 +3037,77 @@ view("graph", "Граф", (host, ctx) => {
     }
   }
 
+  // §2.3: two paragraphs and ~350 words used to open this tab, and on a 390 px screen
+  // that is the entire first screen — the picture started on the third. Nothing is cut:
+  // the same text, in full, one native `<details>` down (no library, no state, and the
+  // browser's own disclosure widget is already styled in this file as `details.blk`).
+  // The one line that stays open is the one an operator has to read before typing.
+  const explainer = el("details", { class: "blk" },
+    el("summary", {}, "как это устроено"),
+    el("p", { class: "help", style: "margin:10px 0 14px" },
+      "Корень задаётся словами, а не id: текст уходит в тот же "
+      + "гибридный индекс, что и read path (BM25 + косинус, слитые RRF), и корнем берётся "
+      + "идея лучшего попадания. Поиск идёт по тезисам, поэтому это идея-родитель "
+      + "ближайшего листа, а не ближайшая по своему тексту идея. Точный id, если он есть под "
+      + "рукой, тоже принимается. Ничего не нашлось — граф не строится, а не подменяется "
+      + "всем озером."),
+    el("p", { class: "help", style: "margin:0" },
+      "Окрестность одной идеи читается через /ideas/{id}/neighbors — по одной идее за вызов. "
+      + "«Всё озеро» идёт другим путём: постраничные GET /ideas и GET /edges (те же, что "
+      + "кэширует циферблат) — 859 идей и 14 806 рёбер за восемь запросов вместо 201, и на "
+      + "второй заход бесплатно. Поэтому картинка и рисуется сразу при открытии вкладки. "
+      + "Раскладка force-directed в браузере, цвет — trust, размер — число листьев."));
+
   host.replaceChildren(
     el("div", { class: "panel" },
       el("h2", {}, "Граф идея—идея"),
-      el("p", { class: "help" }, "Корень задаётся словами, а не id: текст уходит в тот же "
-        + "гибридный индекс, что и read path (BM25 + косинус, слитые RRF), и корнем берётся "
-        + "идея лучшего попадания. Поиск идёт по тезисам, поэтому это идея-родитель "
-        + "ближайшего листа, а не ближайшая по своему тексту идея. Точный id, если он есть под "
-        + "рукой, тоже принимается. Ничего не нашлось — граф не строится, а не подменяется "
-        + "всем озером."),
-      el("p", { class: "help" }, "Рёбра читаются через /ideas/{id}/neighbors — по одной идее за вызов, "
-        + "массового чтения рёбер в API нет. Поэтому «всё озеро» это N+1 запросов (по 6 в полёте): "
-        + "при 261 идее терпимо, при полном корпусе понадобится отдельная ручка. Раскладка "
-        + "force-directed в браузере, цвет — trust, размер — число листьев."),
+      el("p", { class: "help", style: "margin-bottom:10px" },
+        "Корень — запросом словами или точным id. Пустое поле рисует всё озеро."),
       ignoredRunNote(ctx),
-      el("div", { class: "row" },
+      // Two rows, not one: the root field is the only one anybody types into, and giving
+      // it its own line with the button is what lets the three numeric fields stay side
+      // by side on a phone (`.row.tight`, CSS) instead of eating a screen each.
+      el("div", { class: "row tight" },
         el("label", { class: "f grow" }, "корень: запрос или id", seed),
+        el("button", { class: "act", onclick: guard(() => draw()) }, "Нарисовать")),
+      el("div", { class: "row tight", style: "margin-top:10px" },
         el("label", { class: "f" }, "хопов", hops),
         el("label", { class: "f" }, "min_weight", minW),
-        el("label", { class: "f" }, "идей максимум", cap),
-        el("button", { class: "act", onclick: guard(() => draw()) }, "Нарисовать")),
-      statusHost, picks,
+        el("label", { class: "f" }, "идей максимум", cap)),
+      statusHost),
+    wrap,
+    // Legend, candidate shortlist and explainer all BELOW the picture: every one of them
+    // describes it, and every pixel they took above it was a pixel of the picture a phone
+    // never got to see. The shortlist is the worst offender — six two-line buttons, i.e.
+    // the whole screen, between a typed query and its answer.
+    el("div", { class: "panel", style: "margin-top:14px" },
+      picks,
       el("div", { class: "legend" },
         el("span", {}, el("span", { class: "ramp" },
           ...TRUST_RAMP.map((c) => el("i", { style: "background:" + c }))), " trust 0.0 → 0.8"),
         el("span", {}, el("span", { class: "sw", style: "border-radius:50%;width:7px;height:7px" }),
           el("span", { class: "sw", style: "border-radius:50%;width:15px;height:15px;margin-left:4px" }),
           " размер — число листьев"),
-        el("span", { class: "dim" }, "клик по узлу — карточка идеи ниже"))),
-    wrap, el("div", { style: "height:14px" }), info);
+        el("span", { class: "dim" }, "тап или клик по узлу — карточка идеи ниже")),
+      explainer),
+    info);
   if (ctx.state.graph) {
     // §2.2: redraw the last neighbourhood from state — no request, and in particular no
-    // repeat of the N+1 read (up to 261 calls for the whole lake) that built it.
+    // repeat of the read that built it. This branch is also what keeps the auto-draw below
+    // from firing again on every return to the tab.
     const g = ctx.state.graph;
     const mine = ++generation;
     paint(g.data, g.rootId, g.found, g.typed, () => mine !== generation);
   } else {
-    // Nothing is drawn on a bare mount on purpose: the whole-lake view is one request per
-    // idea, and spending 261 of them because a tab was opened is not a default anybody
-    // asked for (same rule as everywhere else in §2.2 — no auto-request on open).
-    setStatus(statusHost, "", null, "Введи запрос словами — корень найдётся по смыслу. "
-      + "Пустое поле нарисует всё озеро, и это по одному запросу на идею.");
+    // A picture on open, not a wall of text with a button under it. This used to be
+    // forbidden and said so: the whole-lake branch cost one request per idea, and spending
+    // 201 of them because a tab was opened is not a default anybody asked for. It now goes
+    // through `loadGraph()`'s shared cache — eight paged requests cold, zero once either
+    // this tab or the dial has read the lake — so the objection is gone with the cost.
+    // Fires ONCE per tab: the `ctx.state.graph` branch above catches every later return.
+    // A `root` in the address draws its own ego graph instead (two requests), which is
+    // what makes such a link reproduce the view rather than a blank box.
+    draw();
   }
 });
 
@@ -2979,6 +3156,23 @@ view("raw", "Ручки", (host, ctx) => {
       statusHost),
     out);
 });
+
+/* ================================================================ tab order */
+
+// Registration order is source order and stays that way; what the room sees is this
+// list. Three tabs, in the order the demo walks them — a hypothesis, then the graph
+// around it, then retrieve. Everything else is the machine room: still mounted, still
+// reachable by address (`openIdea` sends every click on a point to `#ideas/…`, and that
+// has to keep working), just not offered as a tab.
+//
+// VIEWS is reordered in place rather than filtered, because `VIEWS[0]` is what an empty
+// hash resolves to — putting the dial first here is what makes it the landing view.
+const PUBLIC_TABS = ["dial", "graph", "retrieve"];
+VIEWS.sort((a, b) => {
+  const ia = PUBLIC_TABS.indexOf(a.id), ib = PUBLIC_TABS.indexOf(b.id);
+  return (ia === -1 ? PUBLIC_TABS.length : ia) - (ib === -1 ? PUBLIC_TABS.length : ib);
+});
+for (const v of VIEWS) v.hidden = !PUBLIC_TABS.includes(v.id);
 
 /* =================================================================== router */
 
@@ -3105,7 +3299,10 @@ function render() {
   // The ingest tab is entirely write/machine-room (§ border note): every route under it
   // stays behind the key even for GET. Marked right on the tab label in "readonly" so the
   // lock is visible before a click, not just inside the panel that click lands on.
-  tabs.replaceChildren(...VIEWS.map((v) => el("button", {
+  // A hidden view that is nonetheless MOUNTED still gets its tab — clicking a point on
+  // the dial lands on `#ideas/…`, and a strip where nothing is selected and nothing
+  // leads back is a dead end. It appears while you are there and goes away when you leave.
+  tabs.replaceChildren(...VIEWS.filter((v) => !v.hidden || v.id === CURRENT).map((v) => el("button", {
     role: "tab", "aria-selected": String(v.id === CURRENT), onclick: () => switchTo(v.id),
   }, v.id === "ingest" && AUTH === "readonly" ? v.title + " 🔒" : v.title)));
   const main = $("#main");
