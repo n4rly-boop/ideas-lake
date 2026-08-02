@@ -4371,6 +4371,470 @@ def test_pen_tap_after_other_hide_does_not_open(browser: Browser, base_url: str)
         "reset by, so a stale mark from before that hide was still 'confirmed' by this tap")
 
 
+# ==================================================================== §5 visual hierarchy
+#
+# knowledge/15-console-spec.md §5: colour that lies (5.1), ring labels buried under the
+# idea cloud (5.2), type sized for a code review rather than a projector (5.3). All three
+# checks below read the RESOLVED value the browser actually computed — getComputedStyle,
+# a real WCAG contrast ratio, real DOM order / elementFromPoint — never a colour literal
+# or a class name compared against another string. A check that only greps for
+# "--warning:#8a6100" would stay green on a build where that hex sits on the wrong
+# surface; these render the real cascade for whichever theme is actually applied and do
+# the arithmetic themselves.
+
+def _srgb_channel_to_linear(c):
+    c = c / 255.0
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _relative_luminance(rgb):
+    r, g, b = rgb
+    return (0.2126 * _srgb_channel_to_linear(r) + 0.7152 * _srgb_channel_to_linear(g)
+            + 0.0722 * _srgb_channel_to_linear(b))
+
+
+def _contrast_ratio(rgb1, rgb2):
+    """WCAG 2.x contrast ratio: (L_lighter + 0.05) / (L_darker + 0.05)."""
+    l1, l2 = _relative_luminance(rgb1), _relative_luminance(rgb2)
+    lighter, darker = max(l1, l2), min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+_RGB_RE = re.compile(r"rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+))?\s*\)")
+
+
+def _parse_css_color(css):
+    """Parses what `getComputedStyle(...).color` / `...backgroundColor` actually returns
+    in Chrome — "rgb(r, g, b)" or "rgba(r, g, b, a)", CSS custom properties already
+    resolved by the browser — into an (r, g, b, a) tuple. Raises rather than guessing if
+    the string is some third shape (`color-mix`, a keyword) this project's stylesheet
+    never emits today."""
+    m = _RGB_RE.match(css.strip())
+    assert m, f"not a resolved rgb()/rgba() colour: {css!r}"
+    r, g, b = float(m.group(1)), float(m.group(2)), float(m.group(3))
+    a = float(m.group(4)) if m.group(4) is not None else 1.0
+    return (r, g, b, a)
+
+
+def _hex_to_rgb(hexstr):
+    h = hexstr.lstrip("#")
+    assert len(h) == 6, f"not a 6-digit hex colour: {hexstr!r}"
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _blend_over(fg_rgb, alpha, bg_rgb):
+    return tuple(alpha * f + (1 - alpha) * b for f, b in zip(fg_rgb, bg_rgb))
+
+
+def _w_scale(width, narrow, desktop):
+    """Same interpolation as console.html's own `wScale` (§2.3): `narrow` at 390px,
+    `desktop` at 900px and up, linear between, clamped outside that range. Reimplemented
+    here only to turn a measured pixel radius into a pass/fail number — the width and the
+    radius it is compared against both come from the live page, never guessed."""
+    t = max(0.0, min(1.0, (width - 390) / (900 - 390)))
+    return narrow + (desktop - narrow) * t
+
+
+def _switch_theme(browser: Browser, theme: str):
+    """Clicks the real `#theme-btn` (the same element a user's mouse would hit) rather
+    than poking `dataset.theme` from outside, then MEASURES that the theme actually
+    landed via `getComputedStyle(...).colorScheme` — a real computed CSS property tied to
+    the `:root[data-theme=...]` selector, not something this test can fake by only
+    setting the dataset attribute. This project has already shipped checks that ran
+    against the wrong half of the page without the check itself noticing; this one
+    confirms its own target state before trusting anything measured after it.
+
+    The click is retried for up to 5s: a synthetic `Input.dispatchMouseEvent` fired right
+    after `goto()` (headless Chrome, no compositor frame yet settled) measurably misses
+    `#theme-btn`'s own `onclick` some fraction of the time — confirmed directly by
+    dispatching the identical click in a loop and watching `dataset.theme` fail to move on
+    some iterations and not others, same element, same coordinates, same handler. Retrying
+    is what makes this check about the THEME, not about a one-shot CDP timing coin flip;
+    it still fails loudly, with the real element/attribute state, if the theme genuinely
+    never moves."""
+    browser.wait_for("document.querySelector('#theme-btn') !== null", timeout=10)
+    current = browser.evaluate("document.documentElement.dataset.theme")
+    deadline = time.monotonic() + 5
+    got = current
+    while got != theme and time.monotonic() < deadline:
+        browser.click("#theme-btn")
+        time.sleep(0.1)
+        got = browser.evaluate("document.documentElement.dataset.theme")
+    assert got == theme, (
+        f"theme toggle never reached {theme!r} within 5s of retried clicks on #theme-btn "
+        f"(dataset.theme={got!r})")
+    scheme = browser.evaluate("getComputedStyle(document.documentElement).colorScheme")
+    assert scheme == theme, (
+        f"dataset.theme={got!r} but computed color-scheme={scheme!r} — the CSS block for "
+        f"{theme!r} never actually applied, measuring anything after this would be "
+        f"measuring the wrong theme")
+
+
+def measure_class_contrast(browser: Browser, html: str, fg_selector: str) -> float:
+    """Injects `html` into a hidden container appended to `<body>` (real cascade, real
+    theme currently applied to `<html data-theme=...>`), reads the RESOLVED text colour of
+    `fg_selector` via `getComputedStyle`, walks up `parentElement` for the first ancestor
+    with an opaque `background-color` (the actual surface that colour sits on, not a
+    guess), computes the WCAG contrast ratio, then removes the container."""
+    js = """
+    (() => {
+      const host = document.createElement('div');
+      host.style.cssText = 'position:fixed;left:-9999px;top:0';
+      host.innerHTML = %s;
+      document.body.appendChild(host);
+      try {
+        const fg = host.querySelector(%s);
+        if (!fg) throw new Error('selector matched nothing: ' + %s);
+        const color = getComputedStyle(fg).color;
+        let node = fg, bg = null;
+        while (node && !bg) {
+          const m = getComputedStyle(node).backgroundColor.match(/rgba?\\(([^)]+)\\)/);
+          if (m) {
+            const parts = m[1].split(',').map(Number);
+            const alpha = parts.length > 3 ? parts[3] : 1;
+            if (alpha > 0.99) bg = `rgb(${parts[0]}, ${parts[1]}, ${parts[2]})`;
+          }
+          node = node.parentElement;
+        }
+        return { color, bg: bg || getComputedStyle(document.body).backgroundColor };
+      } finally {
+        host.remove();
+      }
+    })()
+    """ % (json.dumps(html), json.dumps(fg_selector), json.dumps(fg_selector))
+    result = browser.evaluate(js)
+    fg_rgb = _parse_css_color(result["color"])[:3]
+    bg_rgb = _parse_css_color(result["bg"])[:3]
+    return _contrast_ratio(fg_rgb, bg_rgb)
+
+
+def _rerender_dial(browser: Browser):
+    """Clicks 'Разложить' and waits for a NEW `<svg>` node under `.graphwrap` — not just
+    for "some svg" to exist, which the PREVIOUS render already left sitting there for a
+    moment before a re-click's fetch resolves. Every test below that needs a fresh dial
+    picture (in particular the ramp test, which re-renders mid-test right after switching
+    theme) calls this instead of a bare `wait_for('.graphwrap svg')`, then adds its own
+    further wait for whatever element ITS OWN check needs on top of that. This project's
+    own history is two checks that ran against a stale half of the page without noticing
+    (a mouse half under touch emulation, a stat read ten times without the query ever
+    changing) — a stale SVG node passing as "the new render" would be a third."""
+    browser.evaluate("window.__prevDialSvg = document.querySelector('.graphwrap svg') || null")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for(
+        "(() => { const svg = document.querySelector('.graphwrap svg'); "
+        "return !!svg && svg !== window.__prevDialSvg; })()", timeout=20)
+
+
+def _dial_ramp_sample(browser: Browser):
+    """Reads the ACTUAL `fill` + `fill-opacity` the current render put on the two extreme
+    leaf circles in `gPts` (the plain, class-less dots drawn by `withLeaves`) — the one
+    nearest the dial's own centre (highest cosine) and the one farthest (lowest) — plus
+    the real `backgroundColor` of `.graphwrap`, and returns each one's WCAG contrast once
+    blended over that background. No ramp array, index formula, or hex literal from
+    console.html is read here: only the two circles' own attributes, as drawn."""
+    data = browser.evaluate("""
+    (() => {
+      const svg = document.querySelector('.graphwrap svg');
+      if (!svg) throw new Error('no dial svg to sample');
+      const gRings = svg.children[0], gPts = svg.children[1];
+      const rings = [...gRings.querySelectorAll('circle')];
+      if (!rings.length) throw new Error('gRings is empty — nothing to find the centre from');
+      const outer = rings.reduce((a, b) => (+b.getAttribute('r') > +a.getAttribute('r') ? b : a));
+      const ocx = +outer.getAttribute('cx'), ocy = +outer.getAttribute('cy');
+      const pts = [...gPts.querySelectorAll('circle')].map((c) => {
+        const x = +c.getAttribute('cx'), y = +c.getAttribute('cy');
+        return { dist: Math.hypot(x - ocx, y - ocy), fill: c.getAttribute('fill'),
+                 opacity: parseFloat(c.getAttribute('fill-opacity')) };
+      });
+      if (pts.length < 2) throw new Error('gPts has fewer than 2 leaf circles: ' + pts.length);
+      pts.sort((a, b) => a.dist - b.dist);
+      const bg = getComputedStyle(document.querySelector('.graphwrap')).backgroundColor;
+      return { near: pts[0], far: pts[pts.length - 1], bg };
+    })()
+    """)
+    bg_rgb = _parse_css_color(data["bg"])[:3]
+
+    def contrast_of(mark):
+        fg_rgb = _hex_to_rgb(mark["fill"])
+        blended = _blend_over(fg_rgb, mark["opacity"], bg_rgb)
+        return _contrast_ratio(blended, bg_rgb)
+
+    return contrast_of(data["near"]), contrast_of(data["far"])
+
+
+@test("light_theme_cos_mid_contrast")
+def test_light_theme_cos_mid_contrast(browser: Browser, base_url: str):
+    """§5.1: `.cos-mid{color:var(--warning)}` (console.html, css block near `.cos-hi`)
+    paints the headline cosine on every idea card — `cosClass()` picks this class for
+    0.52<=v<0.60, the band the spec calls "the answer, not a word in the caption" over in
+    §5.3. Before the fix, light theme never overrode `--warning` and this text measured
+    1.79:1 on its own card background, well under WCAG AA's 4.5:1 floor for normal-size
+    text. 4.5:1 (not the spec's own measured 5.40:1) is the threshold asserted here: 5.40
+    is where THIS fix happens to land, 4.5 is the actual contract an operator needs met."""
+    browser.goto(f"{base_url}/ui")
+    _switch_theme(browser, "light")
+    ratio = measure_class_contrast(
+        browser,
+        '<div class="card"><span class="m"><span class="v cos-mid">0.550</span></span></div>',
+        ".cos-mid")
+    assert ratio >= 4.5, (
+        f".cos-mid measures {ratio:.2f}:1 against its own .card background in light theme — "
+        f"below WCAG AA's 4.5:1 floor for normal text")
+    _switch_theme(browser, "dark")   # leave localStorage clean for whatever test runs next
+
+
+@test("light_theme_status_lines_contrast")
+def test_light_theme_status_lines_contrast(browser: Browser, base_url: str):
+    """§5.1: light theme never overrode `--warning`/`--good`/`--critical`, and
+    `.status.ok`/`.warn`/`.err` colour both the status line's border AND (for warn/err)
+    its own text off the same variables. Checking all three classes, not just the one the
+    spec's own table happened to quote for `--warning` — a fix that only touches
+    `--warning` would leave `--critical`'s light-theme number silently unverified."""
+    browser.goto(f"{base_url}/ui")
+    _switch_theme(browser, "light")
+    for cls in ("ok", "warn", "err"):
+        ratio = measure_class_contrast(
+            browser, f'<div class="status {cls}">операция завершена</div>', f".status.{cls}")
+        assert ratio >= 4.5, (
+            f".status.{cls} text measures {ratio:.2f}:1 against the status line's own "
+            f"background in light theme — below WCAG AA's 4.5:1 floor")
+    _switch_theme(browser, "dark")
+
+
+@test("light_theme_muted_contrast")
+def test_light_theme_muted_contrast(browser: Browser, base_url: str):
+    """§5.1: `--muted` stayed the SAME hex in both themes — 5.13:1 on the dark surface,
+    3.50:1 on the light one — and this one variable inks every `table.tbl th`, every field
+    caption and the dial's own ring legend. `table.tbl th` (the instance the brief names)
+    checked here inside a real `.panel`, the ancestor every actual table on this page is
+    wrapped in."""
+    browser.goto(f"{base_url}/ui")
+    _switch_theme(browser, "light")
+    ratio = measure_class_contrast(
+        browser,
+        '<div class="panel"><table class="tbl"><thead><tr><th>тезис</th></tr></thead>'
+        '</table></div>',
+        "table.tbl th")
+    assert ratio >= 4.5, (
+        f"table.tbl th (--muted) measures {ratio:.2f}:1 in light theme — below WCAG AA's "
+        f"4.5:1 floor")
+    _switch_theme(browser, "dark")
+
+
+@test("dial_ramp_near_not_less_visible_than_far")
+def test_dial_ramp_near_not_less_visible_than_far(browser: Browser, base_url: str):
+    """§5.1, the section's own headline defect: `DIAL_RAMP`'s dark end used to sit on the
+    CLOSEST leaves — 1.26:1 over the dark theme's own dot background — while the far edge
+    (meant to read as background noise, the tail of the lake) came in at 2.35:1, twice as
+    loud as the point the whole picture is about. The fix swaps which ramp array each
+    theme reads (dark theme now uses `TRUST_RAMP`, the same nine hues reversed), not the
+    arrays themselves — checked here as the ratio it actually has to hold, not as which
+    array is in use: whichever leaf sits nearest the dial's own centre must not measure
+    LESS visible than the farthest one, in EITHER theme (the bug was dark-only; asserting
+    both catches a fix that flips the wrong theme's assignment instead of the right one).
+    Runs the SAME dial render under both themes (a mid-test theme switch, not two
+    independent test runs) so a colour read under the wrong theme cannot slip through."""
+    hypothesis = "e2e dial ramp visibility probe"
+    browser.goto(f"{base_url}/ui#dial")
+    theme0 = browser.evaluate("document.documentElement.dataset.theme")
+    assert theme0 == "dark", (
+        f"expected a clean load to start in dark theme, got {theme0!r} — a previous test "
+        f"leaked its own theme switch into this one via localStorage")
+
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", hypothesis)
+    _rerender_dial(browser)
+    browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0",
+                      timeout=20)
+    dark_near, dark_far = _dial_ramp_sample(browser)
+
+    _switch_theme(browser, "light")
+    _rerender_dial(browser)
+    browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0",
+                      timeout=20)
+    light_near, light_far = _dial_ramp_sample(browser)
+
+    _switch_theme(browser, "dark")   # leave localStorage clean for whatever test runs next
+
+    assert dark_near >= dark_far - 1e-9, (
+        f"dark theme: the leaf nearest the dial's centre measures {dark_near:.2f}:1, the "
+        f"farthest measures {dark_far:.2f}:1 — the close point is LESS visible than the "
+        f"far one, the exact lie §5.1 names")
+    assert light_near >= light_far - 1e-9, (
+        f"light theme: the leaf nearest the dial's centre measures {light_near:.2f}:1, the "
+        f"farthest measures {light_far:.2f}:1 — the close point is less visible than the "
+        f"far one")
+    # The relative check above passes as long as the RAMP DIRECTION is right, even if
+    # `leafAlpha` regressed back to 0.3 — the fix's own numbers (1.26 -> 3.67 at .45, vs
+    # 2.34 at .3) show alpha alone moves dark_near from comfortably above this floor to
+    # comfortably below it, so a floor here is what actually catches that regression too.
+    assert dark_near >= 3.0, (
+        f"dark theme close-point contrast is {dark_near:.2f}:1 — comfortably below the "
+        f"~3.67:1 the fix (TRUST_RAMP at fill-opacity 0.45) lands on; this floor is what "
+        f"a leafAlpha regression back to 0.3 (~2.34:1) trips, even though the ramp "
+        f"DIRECTION would still be right")
+
+
+@test("ring_label_group_paints_last")
+def test_ring_label_group_paints_last(browser: Browser, base_url: str):
+    """§5.2: `svg.append(gRings, gPts, gEdges, gIdeas, gHits, gLab, gRingLab)` — SVG (this
+    markup uses no `z-index`/`isolation` on any group, confirmed by grep) paints children
+    in strict document order with no override, so DOM order alone already IS the paint
+    order — the group holding every `text.ringlab` must be the SVG's own last child, not
+    merely a distinct group ("added but still buried" would also satisfy a weaker check).
+    On top of that, a real hit-test at a real label's own on-screen centre: `text.ringlab`
+    carries `pointer-events:none` (so a hover over the number still reaches the chart
+    under it), which makes a bare `elementFromPoint` there always report the element
+    BENEATH the label regardless of paint order — confirmed directly: the plain
+    `elementFromPoint` version of this probe failed against the CORRECTLY-ordered,
+    already-fixed markup, reporting a `<circle>` under a label the DOM order proves is
+    painted last. Hit-testing is switched on for this one probe only
+    (`pointerEvents:'auto'`, restored after) so the result reflects what is actually
+    painted on top, not what merely allows a click through it."""
+    hypothesis = "e2e ring label z-order probe"
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", hypothesis)
+    _rerender_dial(browser)
+    browser.wait_for("document.querySelectorAll('.graphwrap svg text.ringlab').length > 0",
+                      timeout=20)
+
+    info = browser.evaluate("""
+    (() => {
+      const svg = document.querySelector('.graphwrap svg');
+      const groups = [...svg.children];
+      const lastGroup = groups[groups.length - 1];
+      const label = lastGroup.querySelector('text.ringlab');
+      if (!label) return { lastGroupHasLabel: false, groupCount: groups.length };
+      // elementFromPoint only ever hits something inside the visible viewport — a label
+      // that getBoundingClientRect() places off-screen (below the fold at this window
+      // size) would otherwise make this read a real bug ("something covers the label")
+      // out of a plain scroll position, so this scrolls it into view first.
+      label.scrollIntoView({ block: "center", inline: "center" });
+      const r = label.getBoundingClientRect();
+      const x = r.left + r.width / 2, y = r.top + r.height / 2;
+      // text.ringlab is pointer-events:none by design — bypassed for this one probe so
+      // elementFromPoint reports what is actually painted on top, not what merely lets a
+      // click fall through to the chart underneath.
+      const prevPE = label.style.pointerEvents;
+      label.style.pointerEvents = "auto";
+      const hit = document.elementFromPoint(x, y);
+      label.style.pointerEvents = prevPE;
+      return {
+        lastGroupHasLabel: true,
+        groupCount: groups.length,
+        hitIsLabel: !!(hit && hit.classList && hit.classList.contains('ringlab')),
+        hitTag: hit ? hit.tagName : null,
+      };
+    })()
+    """)
+    assert info["lastGroupHasLabel"], (
+        f"the SVG's last child group (of {info['groupCount']}) has no text.ringlab inside "
+        f"it — ring labels are not the last thing painted")
+    assert info["hitIsLabel"], (
+        f"elementFromPoint at a real ring label's own centre hit a <{info['hitTag']}>, not "
+        f"the label itself — something else is still painted on top of it despite the DOM "
+        f"order")
+
+
+@test("dial_font_sizes_and_top5_hit_radius")
+def test_dial_font_sizes_and_top5_hit_radius(browser: Browser, base_url: str):
+    """§5.3: the smallest type in the whole project used to sit on the one picture the
+    talk is actually about — `ringlab` 10px, `hitlab` 11.5px, `hitrank` 9.5px, all under
+    the ~12px floor the brief names, and the top-5 hit dot too small to hold a two-digit
+    rank. Measured via `getComputedStyle` on the real rendered nodes (`viewBox` is 1:1
+    with CSS px per console.html's own comment, so this is what actually lands on a
+    screen) — a `font-size` rule overridden by something more specific downstream would
+    pass a text-search of the stylesheet and still render small, which is why this reads
+    the resolved value instead. The top-5 radius is checked against the SAME `wScale`
+    formula console.html uses, at the CURRENT real `.graphwrap` width, not a fixed pixel
+    guess that would only hold at one particular window size."""
+    hypothesis = "e2e font size and top5 radius probe"
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", hypothesis)
+    _rerender_dial(browser)
+    browser.wait_for("document.querySelectorAll('.graphwrap svg text.hitrank').length > 0",
+                      timeout=20)
+
+    info = browser.evaluate("""
+    (() => {
+      const px = (sel) => {
+        const el = document.querySelector(sel);
+        return el ? parseFloat(getComputedStyle(el).fontSize) : null;
+      };
+      const width = document.querySelector('.graphwrap').clientWidth;
+      const gHits = document.querySelector('.graphwrap svg').children[4];
+      const dots = [...gHits.querySelectorAll('circle')].map((c) => +c.getAttribute('r'));
+      return {
+        width,
+        ringlab: px('text.ringlab'), hitlab: px('text.hitlab'), hitrank: px('text.hitrank'),
+        top5Radii: dots.slice(0, 5), restCount: Math.max(0, dots.length - 5),
+      };
+    })()
+    """)
+    assert info["ringlab"] is not None and info["ringlab"] >= 13, (
+        f"text.ringlab font-size is {info['ringlab']}px, expected >= 13px")
+    assert info["hitlab"] is not None and info["hitlab"] >= 14, (
+        f"text.hitlab font-size is {info['hitlab']}px, expected >= 14px")
+    assert info["hitrank"] is not None and info["hitrank"] >= 11, (
+        f"text.hitrank font-size is {info['hitrank']}px, expected >= 11px")
+
+    assert len(info["top5Radii"]) == 5, (
+        f"expected 5 top-ranked hit dots drawn first into gHits, found "
+        f"{len(info['top5Radii'])} (plus {info['restCount']} more)")
+    old_top5 = _w_scale(info["width"], 5, 6.5)
+    new_top5 = _w_scale(info["width"], 5, 8)
+    for r in info["top5Radii"]:
+        assert r > old_top5 + 0.01, (
+            f"top-5 hit dot radius {r} does not clear the pre-fix wScale(5, 6.5)="
+            f"{old_top5:.2f} at .graphwrap width {info['width']}px")
+        assert abs(r - new_top5) < 0.05, (
+            f"top-5 hit dot radius {r} != wScale(5, 8)={new_top5:.2f} at .graphwrap width "
+            f"{info['width']}px")
+
+
+@test("dial_cosine_max_is_its_own_larger_node")
+def test_dial_cosine_max_is_its_own_larger_node(browser: Browser, base_url: str):
+    """§5.3: "ближайший 0.653" used to sit in the same 13px sentence as the word around
+    it — the one number the whole dial answers for, wearing no more weight than its own
+    caption. Fixed by lifting `data.cosine.max` into its own `<b class="cosine-max">`.
+    Checked as a real DOM/CSS fact: the node exists, its computed font-size is strictly
+    bigger than its own ambient `.status` line's font-size (not compared against a
+    hardcoded 13px — the ambient size is read live, so a later change to the sentence's
+    own size cannot make this test meaningless), and it carries `tabular-nums` so the
+    digits don't jitter width from a code review to a projector."""
+    hypothesis = "e2e cosine max node probe"
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", hypothesis)
+    _rerender_dial(browser)
+    browser.wait_for("document.querySelector('#main .status.ok .cosine-max') !== null",
+                      timeout=20)
+
+    info = browser.evaluate("""
+    (() => {
+      const node = document.querySelector('#main .status.ok .cosine-max');
+      const status = node.closest('.status');
+      return {
+        ownSize: parseFloat(getComputedStyle(node).fontSize),
+        ambientSize: parseFloat(getComputedStyle(status).fontSize),
+        variant: getComputedStyle(node).fontVariantNumeric,
+        text: node.textContent,
+      };
+    })()
+    """)
+    assert info["ownSize"] > info["ambientSize"], (
+        f".cosine-max font-size {info['ownSize']}px is not bigger than its own ambient "
+        f".status font-size {info['ambientSize']}px")
+    assert "tabular-nums" in info["variant"], (
+        f".cosine-max font-variant-numeric is {info['variant']!r}, expected it to include "
+        f"'tabular-nums'")
+    assert re.match(r"^\d\.\d{3}$", info["text"]), (
+        f".cosine-max textContent {info['text']!r} does not look like a 3-decimal cosine")
+
+
+
 # ================================================================================ main
 
 def main(argv=None):

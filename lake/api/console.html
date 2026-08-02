@@ -11,14 +11,25 @@
   --ink:#fff; --ink-2:#c3c2b7; --muted:#898781;
   --grid:#2c2c2a; --axis:#383835; --hair:rgba(255,255,255,.10);
   --s1:#3987e5; --s2:#d95926;
-  --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
+  /* §5.1: --critical paints TEXT (.status.err, .b-failed), and that text sits on
+     --surface-2 #1a1a19, where the spec's #d03b3b measures 3.62:1 — under the 4.5:1
+     floor, in the theme that ships by default. The spec's 4.68:1 for it was computed
+     against --surface, the idea-card background, not the status line's own. */
+  --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#ff6b6b;
 }
 :root[data-theme="light"]{
   color-scheme:light;
   --plane:#f9f9f7; --surface:#fcfcfb; --surface-2:#f4f3f0; --raised:#fff;
-  --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
+  --ink:#0b0b0b; --ink-2:#52514e; --muted:#6b6a65;
   --grid:#e1e0d9; --axis:#c3c2b7; --hair:rgba(11,11,11,.10);
   --s1:#2a78d6; --s2:#eb6834;
+  /* §5.1: the dark-theme statuses (--warning etc., :root above) measure 1.79-3.27:1
+     on this theme's own light surfaces — WCAG requires 4.5:1 for text this size, and
+     --warning specifically paints .cos-mid (the headline cosine in every idea card).
+     Same failure for --muted just above: 3.50:1 unmodified, now 5.28:1. --critical is
+     NOT left alone: the spec's 4.68:1 for it was measured against --surface #fcfcfb,
+     but .status.err's text sits on --surface-2 #f4f3f0, where #d03b3b is 4.33:1. */
+  --good:#0a7a0a; --warning:#8a6100; --serious:#b4531f; --critical:#c02c2c;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--plane);color:var(--ink);
@@ -112,6 +123,11 @@ button.danger{border-color:var(--serious);color:var(--serious)}
 .status.warn{border-color:var(--warning);color:var(--warning)}
 .status.ok{border-color:var(--good)}
 .status .code{font-family:ui-monospace,Menlo,monospace;font-weight:650}
+/* §5.3: "ближайший 0.653" used to sit in the same 13px sentence as "расставлены" —
+   the one number the whole dial answers for, printed with no more weight than its
+   own caption. Median stays inline at sentence size on purpose: it is context, not
+   the answer. */
+.cosine-max{font-size:21px;font-weight:650;font-variant-numeric:tabular-nums}
 .spinner{display:inline-block;width:11px;height:11px;border:2px solid var(--hair);
   border-top-color:var(--s1);border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -127,6 +143,7 @@ table.tbl td{padding:9px 10px;border-bottom:1px solid var(--hair);color:var(--in
    "stuck" hovered on hover:none screens otherwise, since there is no pointer to leave. */
 @media (hover:hover){table.tbl tr:hover td{background:var(--surface-2)}}
 table.tbl td.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+table.tbl th.num{text-align:right}
 .scroller{overflow:auto;max-height:60vh;border:1px solid var(--hair);border-radius:10px}
 .pager{display:flex;gap:10px;align-items:center;margin-top:10px;font-size:12.5px;color:var(--muted)}
 
@@ -242,12 +259,12 @@ svg.graph text.nl{fill:var(--ink);font-size:10.5px;pointer-events:none}
 /* Halo, not just colour: these captions sit on top of three thousand dots, and stroke
    under fill is the only thing that keeps them readable there. */
 svg.graph text.ringlab,svg.graph text.hitlab{pointer-events:none;paint-order:stroke;
-  stroke:var(--surface-2);stroke-width:3.5px;stroke-linejoin:round}
-svg.graph text.ringlab{fill:var(--ink-2);font-size:10px;font-variant-numeric:tabular-nums}
-svg.graph text.hitlab{fill:var(--ink);font-size:11.5px}
+  stroke:var(--surface-2);stroke-width:4.5px;stroke-linejoin:round}
+svg.graph text.ringlab{fill:var(--ink-2);font-size:13px;font-variant-numeric:tabular-nums}
+svg.graph text.hitlab{fill:var(--ink);font-size:14px}
 svg.graph circle.ideanode{cursor:pointer}
 @media (hover:hover){svg.graph circle.ideanode:hover{stroke:var(--s2);stroke-width:2.5}}
-svg.graph text.hitrank{fill:#fff;font-size:9.5px;font-weight:600;pointer-events:none}
+svg.graph text.hitrank{fill:#fff;font-size:11px;font-weight:600;pointer-events:none}
 svg.graph circle.hoverring{pointer-events:none}
 .hovercard{position:absolute;z-index:5;max-width:340px;pointer-events:none;
   background:var(--raised);border:1px solid var(--hair);border-radius:9px;padding:9px 11px;
@@ -342,6 +359,21 @@ const el = (tag, attrs = {}, ...kids) => {
 };
 const fmt = (n) => typeof n === "number" ? n.toLocaleString("ru-RU") : n;
 const cut = (s, n) => (s || "").length > n ? s.slice(0, n - 1) + "…" : (s || "");
+
+// §5.3: `td.num` (numeric columns) has always right-aligned itself — its own `<th>`
+// never did, so every table read as numbers switched-left over labels switched-right.
+// One set of known numeric header labels, checked wherever a table builds its own
+// `<thead>` from a plain string array, beats hand-tagging each header call site.
+const NUM_HEADS = new Set(["#", "cos", "RRF", "BM25", "vector", "RRF score", "BM25 rank",
+  "vector rank", "trust", "листьев", "вес", "хоп", "свидетельства", "попыток", "строк",
+  "кандидатов"]);
+
+// §5.3: every idea id shares the same 5-char "idea_" prefix — printed at full weight,
+// those five characters are the ones burning the reader's attention while the actual
+// differences (the tail) sit at the same weight as the noise. Returns kids for `el()`,
+// not a string, so callers spread it straight into a `<td>`/`<a>`.
+const dimId = (id) => typeof id === "string" && id.startsWith("idea_")
+  ? [el("span", { class: "dim" }, "idea_"), id.slice(5)] : [id];
 
 // §2.3: the four content tables (dial hits, "Идеи", "Тезисы", "Источники") reflow into
 // cards at max-width:430 — CSS alone does the reflow (`table.tbl.cardable` below), but a
@@ -1022,8 +1054,13 @@ view("dial", "Гипотеза", (host, ctx) => {
     setStatus(statusHost, lost ? "warn" : "ok", codeOf(data),
       lost ? `сервер насчитал ${fmt(data.total)} листьев, доехало ${fmt(data.points.length)} — `
              + "картинка неполная, числам ниже верить нельзя"
-           : `${fmt(data.total)} листьев расставлены: ближайший ${data.cosine.max.toFixed(3)}, `
-             + `медиана озера ${data.cosine.median.toFixed(3)}`);
+           // §5.3: the one number this whole view answers used to print at the same
+           // size as the sentence around it — pulled into its own tabular-nums node so
+           // it reads as the answer, not as a word in a caption. Median stays inline:
+           // it is context for the max, not a second answer.
+           : [`${fmt(data.total)} листьев расставлены: ближайший `,
+              el("b", { class: "cosine-max" }, data.cosine.max.toFixed(3)),
+              `, медиана озера ${data.cosine.median.toFixed(3)}`]);
     // §2.3: the checkbox can be off either by the narrow-screen default above or by a
     // deliberate uncheck — this line says so in words either way, because a picture with
     // no leaf dots on it looks exactly like "the lake has nothing near this hypothesis"
@@ -1144,7 +1181,16 @@ view("dial", "Гипотеза", (host, ctx) => {
     // Nothing here is a projection of distance: 2 components of these embeddings carry
     // ~10 % of the variance, which is why the angle is labelled decoration.
     const radius = (c) => R0 + (hi - c) / span * (R - R0);
-    const shade = (c) => DIAL_RAMP[Math.max(0, Math.min(8,
+    // §5.1: DIAL_RAMP puts its dark end (index 8) on the closest leaves — 1.26:1 over
+    // the DARK theme's own dot background, while the far tail's light end reads 2.35:1,
+    // twice as loud as the near edge it's supposed to defer to. TRUST_RAMP (§7, below)
+    // is already these same nine hues in the opposite order — reusing it for the dark
+    // theme puts the LIGHT end on the closest leaves instead, which is what actually
+    // reads on a dark surface; DIAL_RAMP's own order already does the right thing on
+    // light surfaces (dark end = high contrast there), so light theme keeps it as-is.
+    // No new constant needed for either direction.
+    const ramp = document.documentElement.dataset.theme === "light" ? DIAL_RAMP : TRUST_RAMP;
+    const shade = (c) => ramp[Math.max(0, Math.min(8,
       Math.round((c - lo) / span * 8)))];
     // §2.3: mark radii and the ring's separation gap scale off the SVG's OWN width —
     // 390 px on a phone, 900+ px on desktop — linearly between the two, clamped outside
@@ -1158,7 +1204,7 @@ view("dial", "Гипотеза", (host, ctx) => {
       return narrow + (desktop - narrow) * t;
     };
     const nodeBaseR = wScale(5, 3.6);
-    const hitDotR = { top: wScale(5, 6.5), rest: wScale(5, 4) };
+    const hitDotR = { top: wScale(5, 8), rest: wScale(5, 4) };
     const gapPx = wScale(12, 19);
 
     const mk = (tag, attrs = {}) => {
@@ -1184,7 +1230,7 @@ view("dial", "Гипотеза", (host, ctx) => {
     // in this file) needs no such override: its `h` already equals the CSS formula exactly.
     const svg = mk("svg", { class: "graph", viewBox: `0 0 ${w} ${h}`, style: `height:${h}px` });
     const gRings = mk("g"), gPts = mk("g"), gEdges = mk("g"), gIdeas = mk("g"),
-          gHits = mk("g"), gLab = mk("g");
+          gHits = mk("g"), gLab = mk("g"), gRingLab = mk("g");
 
     const share = (c) => data.points.filter((p) => p.cosine >= c).length;
     // On the ring goes the number and nothing else — the sentence explaining it lands in
@@ -1194,7 +1240,11 @@ view("dial", "Гипотеза", (host, ctx) => {
     const ringLabel = (r, text) => {
       const tag = mk("text", { x: cx + 7, y: cy + r - 5, class: "ringlab" });
       tag.textContent = text;
-      gRings.append(tag);
+      // §5.2: rings, then leaves, ideas and hits all draw on top of them — the halo
+      // (CSS) fights the plain background, not three thousand dots. A group added
+      // LAST, after everything else, is what actually keeps a ring's own number
+      // readable once the cloud is drawn over it.
+      gRingLab.append(tag);
     };
     for (const [value] of rings) {
       const r = radius(value);
@@ -1235,7 +1285,7 @@ view("dial", "Гипотеза", (host, ctx) => {
       // the subject of the picture, and there the subject is the graph. Gated on `drawIdeas`,
       // not on `graph` alone — a cached graph from an earlier fetch must not dim the leaves
       // for a layer that (per the checkbox) isn't actually drawn this pass.
-      const leafAlpha = drawIdeas ? 0.3 : 0.72, leafR = drawIdeas ? 1.5 : 1.9;
+      const leafAlpha = drawIdeas ? 0.45 : 0.72, leafR = drawIdeas ? 1.5 : 1.9;
       for (const p of data.points) {
         if (hitIds.has(p.thesis_id)) continue;
         const r = radius(p.cosine);
@@ -1357,7 +1407,7 @@ view("dial", "Гипотеза", (host, ctx) => {
       const x = onIdea ? onIdea[0] : cx + Math.cos(p.angle) * r;
       const y = onIdea ? onIdea[1] : cy + Math.sin(p.angle) * r;
       gHits.append(mk("line", { x1: cx, y1: cy, x2: x, y2: y, stroke: "var(--s2)",
-                                "stroke-width": 1, "stroke-opacity": .45 }));
+                                "stroke-width": 1.6, "stroke-opacity": .7 }));
       const top5 = i < 5;
       const dot = mk("circle", { cx: x, cy: y, r: top5 ? hitDotR.top : hitDotR.rest, fill: "var(--s2)",
                                  stroke: "var(--surface)", "stroke-width": 2 });
@@ -1388,7 +1438,7 @@ view("dial", "Гипотеза", (host, ctx) => {
     note.textContent = `гипотеза · разрыв шкалы: 1.000 → ${hi.toFixed(3)}`;
     gLab.append(note);
 
-    svg.append(gRings, gPts, gEdges, gIdeas, gHits, gLab);
+    svg.append(gRings, gPts, gEdges, gIdeas, gHits, gLab, gRingLab);
     const card = el("div", { class: "hovercard hide" });
     const ring = mk("circle", { class: "hoverring hide", r: 11, fill: "none",
                                 stroke: "var(--s2)", "stroke-width": 1.5 });
@@ -1517,13 +1567,13 @@ view("dial", "Гипотеза", (host, ctx) => {
         + `/retrieve. Список — то же, что вернул бы GET /search.`),
       el("div", { class: "scroller" }, labelCells(el("table", { class: "tbl cardable" },
         el("thead", {}, el("tr", {}, ...["#", "cos", "тезис", "идея", "RRF", "BM25", "vector"]
-          .map((head) => el("th", {}, head)))),
+          .map((head) => el("th", { class: NUM_HEADS.has(head) ? "num" : undefined }, head)))),
         el("tbody", {}, ...data.hits.map((hit, i) => el("tr", {},
           el("td", { class: "num" }, i + 1),
           el("td", { class: "num mono " + cosClass(hit.cosine) }, hit.cosine.toFixed(3)),
           el("td", {}, cut(hit.text, 110)),
           el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
-            e.preventDefault(); openIdea(hit.idea_id); } }, hit.idea_id)),
+            e.preventDefault(); openIdea(hit.idea_id); } }, ...dimId(hit.idea_id))),
           el("td", { class: "num mono" }, hit.score.toFixed(5)),
           el("td", { class: "num mono" }, hit.bm25_rank ?? "—"),
           el("td", { class: "num mono" }, hit.vec_rank ?? "—"))))))));
@@ -1664,12 +1714,12 @@ view("search", "Индекс", (host, ctx) => {
     out.replaceChildren(hits.length ? el("div", { class: "scroller" },
       el("table", { class: "tbl" },
         el("thead", {}, el("tr", {}, ...["#", "тезис", "идея", "RRF score", "BM25 rank", "vector rank"]
-          .map((h) => el("th", {}, h)))),
+          .map((h) => el("th", { class: NUM_HEADS.has(h) ? "num" : undefined }, h)))),
         el("tbody", {}, ...hits.map((h, i) => el("tr", {},
           el("td", { class: "num" }, i + 1),
           el("td", { class: "mono" }, h.thesis_id),
           el("td", { class: "mono" },
-            el("a", { href: "#", onclick: (e) => { e.preventDefault(); openIdea(h.idea_id); } }, h.idea_id)),
+            el("a", { href: "#", onclick: (e) => { e.preventDefault(); openIdea(h.idea_id); } }, ...dimId(h.idea_id))),
           el("td", { class: "num mono" }, h.score.toFixed(5)),
           el("td", { class: "num mono" }, h.bm25_rank ?? "—"),
           el("td", { class: "num mono" }, h.vec_rank ?? "—"))))))
@@ -1791,9 +1841,9 @@ view("ideas", "Идеи", (host, ctx) => {
     out.replaceChildren(
       el("div", { class: "scroller" }, labelCells(el("table", { class: "tbl cardable" },
         el("thead", {}, el("tr", {}, ...["идея", "текст", "trust", "листьев", "origin", "обновлена", ""]
-          .map((h) => el("th", {}, h)))),
+          .map((h) => el("th", { class: NUM_HEADS.has(h) ? "num" : undefined }, h)))),
         el("tbody", {}, ...page.items.map((idea) => el("tr", {},
-          el("td", { class: "mono" }, idea.id),
+          el("td", { class: "mono" }, ...dimId(idea.id)),
           el("td", {}, cut(idea.text, 150)),
           el("td", { class: "num" }, idea.trust_score.toFixed(1),
             idea.dirty ? el("span", { class: "badge b-dirty", style: "margin-left:6px" }, "dirty") : null),
@@ -1926,11 +1976,11 @@ view("ideas", "Идеи", (host, ctx) => {
         el("h2", {}, "рёбра из идеи · GET /ideas/{id}/neighbors"),
         edges.length ? el("div", { class: "scroller" }, el("table", { class: "tbl" },
           el("thead", {}, el("tr", {}, ...["тип", "куда", "вес", "хоп", "свидетельства", "заметка"]
-            .map((h) => el("th", {}, h)))),
+            .map((h) => el("th", { class: NUM_HEADS.has(h) ? "num" : undefined }, h)))),
           el("tbody", {}, ...edges.map((edge) => el("tr", {},
             el("td", {}, el("span", { class: "badge" }, edge.type)),
             el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
-              e.preventDefault(); openIdea(edge.target_id); } }, edge.target_id)),
+              e.preventDefault(); openIdea(edge.target_id); } }, ...dimId(edge.target_id))),
             el("td", { class: "num" }, edge.weight ?? "—"),
             el("td", { class: "num" }, edge.hop),
             el("td", { class: "num" }, (edge.evidence || []).length || "—"),
@@ -2003,7 +2053,7 @@ view("theses", "Тезисы", (host, ctx) => {
     out.replaceChildren(
       el("div", { class: "scroller" }, labelCells(el("table", { class: "tbl cardable" },
         el("thead", {}, el("tr", {}, ...["тезис", "текст", "эффект", "локатор", "источник", "идея"]
-          .map((h) => el("th", {}, h)))),
+          .map((h) => el("th", { class: NUM_HEADS.has(h) ? "num" : undefined }, h)))),
         el("tbody", {}, ...page.items.map((leaf) => el("tr", {},
           el("td", { class: "mono" }, leaf.id),
           el("td", {}, cut(leaf.text, 180)),
@@ -2013,7 +2063,7 @@ view("theses", "Тезисы", (host, ctx) => {
             cut(leaf.source_title, 60)),
             el("span", { class: "badge b-" + leaf.source_type, style: "margin-left:6px" }, leaf.source_type)),
           el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
-            e.preventDefault(); openIdea(leaf.idea_id); } }, leaf.idea_id)))))))),
+            e.preventDefault(); openIdea(leaf.idea_id); } }, ...dimId(leaf.idea_id))))))))),
       pager(state, page.total, load));
   }
 
@@ -2070,7 +2120,7 @@ view("sources", "Источники", (host, ctx) => {
     out.replaceChildren(
       el("div", { class: "scroller" }, labelCells(el("table", { class: "tbl cardable" },
         el("thead", {}, el("tr", {}, ...["источник", "тип", "название", "версия", "получен", "прогон", ""]
-          .map((h) => el("th", {}, h)))),
+          .map((h) => el("th", { class: NUM_HEADS.has(h) ? "num" : undefined }, h)))),
         el("tbody", {}, ...page.items.map((src) => el("tr", {},
           el("td", { class: "mono" }, src.id),
           el("td", {}, el("span", { class: "badge b-" + src.type }, src.type)),
@@ -2194,7 +2244,7 @@ view("ingest", "Ингест и ops", (host, ctx) => {
         `${jobs.length} заданий в списке (limit 30 — список обрезан сервером, если их больше), в работе ${live}`);
       jobsHost.replaceChildren(el("div", { class: "scroller" }, el("table", { class: "tbl" },
         el("thead", {}, el("tr", {}, ...["задание", "что", "статус", "попыток", "создано", "итог"]
-          .map((h) => el("th", {}, h)))),
+          .map((h) => el("th", { class: NUM_HEADS.has(h) ? "num" : undefined }, h)))),
         el("tbody", {}, ...jobs.map((job) => el("tr", {},
           el("td", { class: "mono" }, job.id),
           el("td", {}, JOB_KIND[job.kind] || job.kind,
@@ -2217,7 +2267,7 @@ view("ingest", "Ингест и ops", (host, ctx) => {
         `${jobs.length} заданий в списке (limit 30 — список обрезан сервером, если их больше), в работе ${live}`);
       jobsHost.replaceChildren(el("div", { class: "scroller" }, el("table", { class: "tbl" },
         el("thead", {}, el("tr", {}, ...["задание", "что", "статус", "попыток", "создано", "итог"]
-          .map((h) => el("th", {}, h)))),
+          .map((h) => el("th", { class: NUM_HEADS.has(h) ? "num" : undefined }, h)))),
         el("tbody", {}, ...jobs.map((job) => el("tr", {},
           el("td", { class: "mono" }, job.id),
           el("td", {}, JOB_KIND[job.kind] || job.kind,
@@ -2271,7 +2321,7 @@ view("ingest", "Ингест и ops", (host, ctx) => {
             `ждёт фазы 2: ${st.pending_lines}`)),
         st.sources.length ? el("div", { class: "scroller", style: "margin-top:10px;max-height:32vh" },
           el("table", { class: "tbl" },
-            el("thead", {}, el("tr", {}, ...["источник", "название", "строк", "внесён"].map((h) => el("th", {}, h)))),
+            el("thead", {}, el("tr", {}, ...["источник", "название", "строк", "внесён"].map((h) => el("th", { class: NUM_HEADS.has(h) ? "num" : undefined }, h)))),
             el("tbody", {}, ...st.sources.map((s) => el("tr", {},
               el("td", { class: "mono" }, s.id),
               el("td", {}, cut(s.title, 90)),
@@ -2294,7 +2344,7 @@ view("ingest", "Ингест и ops", (host, ctx) => {
       pendingHost.replaceChildren(rows.length
         ? el("div", { class: "scroller", style: "max-height:36vh" }, el("table", { class: "tbl" },
             el("thead", {}, el("tr", {}, ...["когда", "ошибка", "тезис", "источник", "кандидатов"]
-              .map((h) => el("th", {}, h)))),
+              .map((h) => el("th", { class: NUM_HEADS.has(h) ? "num" : undefined }, h)))),
             el("tbody", {}, ...rows.map((row) => el("tr", {},
               el("td", { class: "mono dim" }, (row.ts || "").slice(0, 19).replace("T", " ")),
               el("td", { style: "color:var(--warning)" }, cut(row.error, 90)),
