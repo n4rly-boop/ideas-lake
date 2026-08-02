@@ -268,7 +268,13 @@ class ApiError extends Error {
   }
 }
 
-async function api(path, { method = "GET", body = null, timeout = 120000 } = {}) {
+// The server's real status code, hung off the parsed body instead of threaded through
+// every caller by hand. A Symbol key so the "Ручки" tab's `JSON.stringify(res)` never
+// prints it — a plain string key would leak into that raw-response view.
+const HTTP_STATUS = Symbol("http status");
+const codeOf = (res) => (res && typeof res === "object" && HTTP_STATUS in res) ? res[HTTP_STATUS] : "—";
+
+async function api(path, { method = "GET", body = null, timeout = 120000, onStatus = null } = {}) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeout);
   let res;
@@ -290,6 +296,10 @@ async function api(path, { method = "GET", body = null, timeout = 120000 } = {})
       : `сеть недоступна: ${err.message}`, null);
   }
   clearTimeout(timer);
+  // The one place the real HTTP status is available for every response, 204 included:
+  // codeOf() reads it off the parsed body, and a 204 body is `null` with nothing to
+  // hang it on. A caller that needs the code even then (the "Ручки" tab) takes it here.
+  if (onStatus) onStatus(res.status);
   const text = await res.text();
   let payload = null;
   try { payload = text ? JSON.parse(text) : null; } catch { payload = { error: text }; }
@@ -299,14 +309,21 @@ async function api(path, { method = "GET", body = null, timeout = 120000 } = {})
     throw new ApiError(res.status, (payload && payload.error) || res.statusText,
                        retry ? { ...payload, retry_after: retry } : payload);
   }
+  // 204 parses to `null` above — nothing to hang a status on, and codeOf() already
+  // answers "—" for that, which matches a body that genuinely carries none.
+  if (payload !== null && typeof payload === "object") payload[HTTP_STATUS] = res.status;
   return payload;
 }
 
 /* Human wording per status, so no caller has to invent one. The distinctions are
-   the API's own: 409 is a refusal to act, 503 is a broken lake, 0 is no answer. */
+   the API's own: 409 is a refusal to act, 503 is a broken lake, 0 is no answer,
+   null is an answer that arrived but did not parse into what the caller expected —
+   a render throw inside run()'s fn, not a transport failure, so it must not share
+   0's "нет связи с API". */
 function explain(err) {
   const map = {
     0: "нет связи с API",
+    null: "ответ не той формы",
     400: "запрос не принят",
     401: "ключ не принят",
     404: "такой строки нет",
@@ -346,15 +363,23 @@ async function pool(items, worker, width = 6) {
   return out;
 }
 
-/* Wraps a call so no view can forget the three outcomes. */
+/* Wraps a call so no view can forget the three outcomes: busy while `fn` runs, then
+   either its return value or a status line in `host` — never a spinner left spinning.
+   That only holds because every `fn` passed in does its OWN rendering before returning,
+   inside this try — run() itself has no idea what a view's response shape looks like,
+   so it cannot catch a render throw that happens after the caller already got its value
+   back. A 200 with a body of the wrong shape (captive portal, transparent proxy) throws
+   from `fn`'s own rendering code (e.g. `page.items.map`), which is why that code has to
+   live in here and not after `await run(...)` returns. Not an ApiError — no HTTP status
+   applies to a render bug — so it gets `status: null`, distinct from the 0 a dead
+   transport uses, and its own line in explain(). */
 async function run(host, label, fn) {
   busy(host, label);
   try {
     const out = await fn();
     return out;
   } catch (err) {
-    if (!(err instanceof ApiError)) throw err;
-    failed(host, err);
+    failed(host, err instanceof ApiError ? err : new ApiError(null, err.message, null));
     return undefined;
   }
 }
@@ -363,11 +388,13 @@ async function run(host, label, fn) {
 
 function openGate(message) {
   $("#gate").classList.remove("hide");
-  $("#key-msg").textContent = message || "";
+  // Only a caller with an actual explanation may overwrite whatever is already there —
+  // api()'s "Ключ не принят: 401." must survive a render() that runs right after it.
+  if (message) $("#key-msg").textContent = message;
   $("#key-input").value = "";
   $("#key-input").focus();
 }
-$("#key-btn").onclick = () => openGate("");
+$("#key-btn").onclick = () => openGate("Ключ доступа к озеру.");
 $("#key-save").onclick = async () => {
   const value = $("#key-input").value.trim();
   if (!value) { $("#key-msg").textContent = "пустой ключ — сервер такой не примет"; return; }
@@ -382,7 +409,10 @@ $("#key-save").onclick = async () => {
   }
   sessionStorage.setItem(KEY_STORE, value);
   $("#gate").classList.add("hide");
-  refreshStrip();
+  // AUTH is the new state render() branches on (added alongside probe()/boot()): a
+  // key that just checked out is "open" regardless of what the pre-key probe found.
+  AUTH = "open";
+  startStrip();
   render();
 };
 $("#key-input")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("#key-save").click(); });
@@ -434,6 +464,15 @@ async function refreshStrip() {
   const dead = Object.entries(stats.workers || {}).filter(([, alive]) => !alive);
   if (dead.length) add("bad", "мертвы: ", el("b", {}, dead.map(([n]) => n).join(", ")));
   strip.replaceChildren(...chips);
+}
+
+let stripTimer = null;
+// One entry point for "the strip is now live": an immediate read plus the repeating
+// one, guarded against starting twice (the key-save path and boot can both reach here).
+function startStrip() {
+  if (stripTimer) return;
+  refreshStrip();
+  stripTimer = setInterval(refreshStrip, 20000);
 }
 
 /* ===================================================================== views */
@@ -525,7 +564,7 @@ function answerBlock(answer, label, rewriteAsked) {
                     `${padded} добито до k`) : null),
     ideas.length
       ? el("div", { class: "cards" }, ...ideas.map((item, i) => ideaCard(item, i + 1)))
-      : el("div", { class: "status warn" }, el("span", { class: "code" }, "200"),
+      : el("div", { class: "status warn" }, el("span", { class: "code" }, codeOf(answer)),
           "выдача пуста, и это ДАННЫЕ: живое хранилище ответило нулём идей (не 503)"));
 }
 
@@ -552,7 +591,12 @@ view("retrieve", "Retrieve", (host) => {
     });
     if (!answers) return;
     const totalMs = answers.reduce((s, [, a]) => s + a.cost.wall_ms, 0);
-    setStatus(statusHost, "ok", 200, `${answers.length} вызов(а) · ${totalMs.toFixed(0)} мс суммарно`);
+    // Each arm's own code, checked rather than assumed: nothing in the protocol says two
+    // POSTs to the same route must answer with the same status. Print one only if they
+    // in fact agree; otherwise show both, so a mixed result cannot read as a clean one.
+    const codes = new Set(answers.map(([, a]) => codeOf(a)));
+    setStatus(statusHost, "ok", [...codes].join("/"),
+      `${answers.length} вызов(а) · ${totalMs.toFixed(0)} мс суммарно`);
     out.replaceChildren(el("div", { class: answers.length > 1 ? "ab" : "" },
       ...answers.map(([rw, a]) => answerBlock(a, rw ? "rewrite on" : "rewrite off", rw))));
   }
@@ -677,59 +721,61 @@ view("dial", "Гипотеза", (host) => {
     if (!text) { setStatus(statusHost, "warn", null, "пустой q → 400"); return; }
     const mine = ++generation;
     const stale = () => mine !== generation;
-    const data = await run(statusHost, "считаю косинус до каждого листа…", () =>
-      api(`/dial?q=${encodeURIComponent(text)}&k=${Number(k.value) || 12}`));
-    if (stale() || !data) return;
+    await run(statusHost, "считаю косинус до каждого листа…", async () => {
+      const data = await api(`/dial?q=${encodeURIComponent(text)}&k=${Number(k.value) || 12}`);
+      if (stale()) return data;
 
-    // The graph is a separate read and a separate failure: a dead Neo4j costs the idea
-    // layer and says so, while the dial — which is index-only — still stands.
-    let graph = null, graphError = null;
-    if (withGraph.checked) {
-      busy(statusHost, "читаю идеи и рёбра…");
-      try { graph = await loadGraph(); }
-      catch (err) { if (!(err instanceof ApiError)) throw err; graphError = err; }
-      if (stale()) return;
-    }
+      // The graph is a separate read and a separate failure: a dead Neo4j costs the idea
+      // layer and says so, while the dial — which is index-only — still stands.
+      let graph = null, graphError = null;
+      if (withGraph.checked) {
+        busy(statusHost, "читаю идеи и рёбра…");
+        try { graph = await loadGraph(); }
+        catch (err) { if (!(err instanceof ApiError)) throw err; graphError = err; }
+        if (stale()) return data;
+      }
 
-    // `total` is the server's count of index rows, not points.length: the two differing
-    // would mean the payload lost rows on the way, and that must not read as a thinner lake.
-    const lost = data.total !== data.points.length;
-    setStatus(statusHost, lost ? "warn" : "ok", 200,
-      lost ? `сервер насчитал ${fmt(data.total)} листьев, доехало ${fmt(data.points.length)} — `
-             + "картинка неполная, числам ниже верить нельзя"
-           : `${fmt(data.total)} листьев расставлены: ближайший ${data.cosine.max.toFixed(3)}, `
-             + `медиана озера ${data.cosine.median.toFixed(3)}`);
+      // `total` is the server's count of index rows, not points.length: the two differing
+      // would mean the payload lost rows on the way, and that must not read as a thinner lake.
+      const lost = data.total !== data.points.length;
+      setStatus(statusHost, lost ? "warn" : "ok", codeOf(data),
+        lost ? `сервер насчитал ${fmt(data.total)} листьев, доехало ${fmt(data.points.length)} — `
+               + "картинка неполная, числам ниже верить нельзя"
+             : `${fmt(data.total)} листьев расставлены: ближайший ${data.cosine.max.toFixed(3)}, `
+               + `медиана озера ${data.cosine.median.toFixed(3)}`);
 
-    let drawn = null;
-    try {
-      drawn = drawDial(data, graph);
-    } catch (err) {
-      // A throw here used to mean an empty box under a green 200 — same lie as an empty
-      // list for a broken store.
-      wrap.replaceChildren();
-      setStatus(statusHost, "err", null, "отрисовка упала: " + err.message);
-      return;
-    }
-    // The dial's own line first, then what the graph layer did or did not manage: two
-    // reads, two verdicts, and the second must not be able to overwrite the first.
-    if (graphError) {
-      statusHost.append(el("div", { class: "status " + (graphError.status === 503 ? "err" : "warn") },
-        el("span", { class: "code" }, graphError.status || "—"),
-        `${explain(graphError)} — идеи и рёбра не прочитаны. Циферблат считается из индекса `
-        + "и от графа не зависит."));
-    } else if (drawn && drawn.ideas) {
-      statusHost.append(el("div", { class: "status" },
-        `идей на картинке ${drawn.ideas} из ${fmt(graph.ideaTotal)}, рёбер между ними `
-        + `${fmt(drawn.inside)}; наружу из показанных ведут ещё ${fmt(drawn.outside)} — `
-        + "окрестность продолжается за кадром, всего в озере "
-        + `${fmt(graph.edgeTotal)} рёбер`
-        + (drawn.offIdea
-            ? `. Попаданий на своей идее ${drawn.onIdea}, на листе ${drawn.offIdea}: `
-              + "их идея не вошла в показанные по косинусу лучшего листа"
-            : "")));
-    }
-    renderHits(data);
-    loadIdeas(data, stale);
+      let drawn = null;
+      try {
+        drawn = drawDial(data, graph);
+      } catch (err) {
+        // A throw here used to mean an empty box under a green 200 — same lie as an empty
+        // list for a broken store.
+        wrap.replaceChildren();
+        setStatus(statusHost, "err", null, "отрисовка упала: " + err.message);
+        return data;
+      }
+      // The dial's own line first, then what the graph layer did or did not manage: two
+      // reads, two verdicts, and the second must not be able to overwrite the first.
+      if (graphError) {
+        statusHost.append(el("div", { class: "status " + (graphError.status === 503 ? "err" : "warn") },
+          el("span", { class: "code" }, graphError.status || "—"),
+          `${explain(graphError)} — идеи и рёбра не прочитаны. Циферблат считается из индекса `
+          + "и от графа не зависит."));
+      } else if (drawn && drawn.ideas) {
+        statusHost.append(el("div", { class: "status" },
+          `идей на картинке ${drawn.ideas} из ${fmt(graph.ideaTotal)}, рёбер между ними `
+          + `${fmt(drawn.inside)}; наружу из показанных ведут ещё ${fmt(drawn.outside)} — `
+          + "окрестность продолжается за кадром, всего в озере "
+          + `${fmt(graph.edgeTotal)} рёбер`
+          + (drawn.offIdea
+              ? `. Попаданий на своей идее ${drawn.onIdea}, на листе ${drawn.offIdea}: `
+                + "их идея не вошла в показанные по косинусу лучшего листа"
+              : "")));
+      }
+      renderHits(data);
+      loadIdeas(data, stale);
+      return data;
+    });
   }
 
   function drawDial(data, graph) {
@@ -1075,27 +1121,32 @@ view("search", "Индекс", (host) => {
 
   async function fire() {
     if (!q.value.trim()) { setStatus(statusHost, "warn", null, "пустой q → 400"); return; }
-    const hits = await run(statusHost, "ищу по тезисам…", () =>
-      api(`/search?q=${encodeURIComponent(q.value.trim())}&k=${Number(k.value) || 10}`));
-    if (!hits) return;
-    const deadFts = hits.length && hits.every((h) => h.bm25_rank === null);
-    setStatus(statusHost, deadFts ? "warn" : "ok", 200,
-      deadFts ? "BM25 не вернул ни одной строки: гибрид работает на одном косинусе — проверь FTS-индекс"
-              : `${hits.length} попаданий, обе руки индекса живы`);
-    out.replaceChildren(hits.length ? el("div", { class: "scroller" },
-      el("table", { class: "tbl" },
-        el("thead", {}, el("tr", {}, ...["#", "тезис", "идея", "RRF score", "BM25 rank", "vector rank"]
-          .map((h) => el("th", {}, h)))),
-        el("tbody", {}, ...hits.map((h, i) => el("tr", {},
-          el("td", { class: "num" }, i + 1),
-          el("td", { class: "mono" }, h.thesis_id),
-          el("td", { class: "mono" },
-            el("a", { href: "#", onclick: (e) => { e.preventDefault(); openIdea(h.idea_id); } }, h.idea_id)),
-          el("td", { class: "num mono" }, h.score.toFixed(5)),
-          el("td", { class: "num mono" }, h.bm25_rank ?? "—"),
-          el("td", { class: "num mono" }, h.vec_rank ?? "—"))))))
-      : el("div", { class: "status warn" }, el("span", { class: "code" }, "200"),
-          "индекс ответил нулём строк — это данные, а не поломка"));
+    await run(statusHost, "ищу по тезисам…", async () => {
+      const hits = await api(`/search?q=${encodeURIComponent(q.value.trim())}&k=${Number(k.value) || 10}`);
+      // `hits.length` alone treats any non-array body (a shape mismatch) as the falsy
+      // "zero rows" case below — a captive portal's `{surprise: ...}` would read as a
+      // clean empty result instead of the broken response it is.
+      if (!Array.isArray(hits)) throw new Error("ответ /search — не массив: " + JSON.stringify(hits).slice(0, 200));
+      const deadFts = hits.length && hits.every((h) => h.bm25_rank === null);
+      setStatus(statusHost, deadFts ? "warn" : "ok", codeOf(hits),
+        deadFts ? "BM25 не вернул ни одной строки: гибрид работает на одном косинусе — проверь FTS-индекс"
+                : `${hits.length} попаданий, обе руки индекса живы`);
+      out.replaceChildren(hits.length ? el("div", { class: "scroller" },
+        el("table", { class: "tbl" },
+          el("thead", {}, el("tr", {}, ...["#", "тезис", "идея", "RRF score", "BM25 rank", "vector rank"]
+            .map((h) => el("th", {}, h)))),
+          el("tbody", {}, ...hits.map((h, i) => el("tr", {},
+            el("td", { class: "num" }, i + 1),
+            el("td", { class: "mono" }, h.thesis_id),
+            el("td", { class: "mono" },
+              el("a", { href: "#", onclick: (e) => { e.preventDefault(); openIdea(h.idea_id); } }, h.idea_id)),
+            el("td", { class: "num mono" }, h.score.toFixed(5)),
+            el("td", { class: "num mono" }, h.bm25_rank ?? "—"),
+            el("td", { class: "num mono" }, h.vec_rank ?? "—"))))))
+        : el("div", { class: "status warn" }, el("span", { class: "code" }, codeOf(hits)),
+            "индекс ответил нулём строк — это данные, а не поломка"));
+      return hits;
+    });
   }
 
   host.replaceChildren(
@@ -1115,14 +1166,18 @@ view("search", "Индекс", (host) => {
 
 const PAGE = 25;
 
+// `reload` is the view's `load(offset)`: it takes the CANDIDATE offset and only commits
+// it to `state.offset` once that page actually arrives. Moving `state.offset` here,
+// before the request settles, is how a flaky "вперёд" used to lose rows silently — three
+// failed pages forward and the next success would quietly start mid-list.
 function pager(state, total, reload) {
   const from = total ? state.offset + 1 : 0;
   const to = Math.min(state.offset + state.limit, total);
   return el("div", { class: "pager" },
     el("button", { class: "ghost sm", disabled: state.offset === 0 ? "" : null,
-      onclick: () => { state.offset = Math.max(0, state.offset - state.limit); reload(); } }, "← назад"),
+      onclick: () => reload(Math.max(0, state.offset - state.limit)) }, "← назад"),
     el("button", { class: "ghost sm", disabled: to >= total ? "" : null,
-      onclick: () => { state.offset += state.limit; reload(); } }, "вперёд →"),
+      onclick: () => reload(state.offset + state.limit) }, "вперёд →"),
     el("span", {}, `показано ${from}–${to} из ${fmt(total)} (total от сервера, не длина списка)`));
 }
 
@@ -1130,40 +1185,62 @@ let openIdea = () => {};
 
 view("ideas", "Идеи", (host) => {
   const out = el("div"), statusHost = el("div"), detail = el("div");
+  // Outside `detail` on purpose: `show()` wipes `detail` on every re-read, and a write
+  // confirmation living inside it would vanish the instant the page re-fetches the idea
+  // it just wrote — "Записано" that is never seen is the same lie as no confirmation.
+  // scroll-margin-top: native scrollIntoView(block:"start") lands the target's top edge
+  // at viewport y=0, which the sticky header+tabs then draw straight over — "on screen"
+  // per the DOM, invisible in the rendered page. Not a constant: on a narrow viewport the
+  // chip strip wraps to several lines and the header's real height is nothing like its
+  // desktop height, so it is measured fresh right before each scroll instead.
+  const writeStatus = el("div");
   const state = { offset: 0, limit: PAGE };
   const jump = el("input", { class: "mono", placeholder: "idea_…" });
+  let shownIdeaId = null;
 
-  async function load() {
-    const page = await run(statusHost, "читаю идеи…", () =>
-      api(`/ideas?limit=${state.limit}&offset=${state.offset}`));
-    if (!page) return;
-    setStatus(statusHost, "ok", 200, `${page.items.length} строк на странице, total ${fmt(page.total)}`);
-    out.replaceChildren(
-      el("div", { class: "scroller" }, el("table", { class: "tbl" },
-        el("thead", {}, el("tr", {}, ...["идея", "текст", "trust", "листьев", "origin", "обновлена", ""]
-          .map((h) => el("th", {}, h)))),
-        el("tbody", {}, ...page.items.map((idea) => el("tr", {},
-          el("td", { class: "mono" }, idea.id),
-          el("td", {}, cut(idea.text, 150)),
-          el("td", { class: "num" }, idea.trust_score.toFixed(1),
-            idea.dirty ? el("span", { class: "badge b-dirty", style: "margin-left:6px" }, "dirty") : null),
-          el("td", { class: "num" }, idea.theses.length),
-          el("td", {}, idea.origin),
-          el("td", { class: "mono dim" }, idea.updated_at || "«»"),
-          el("td", {}, el("button", { class: "ghost sm", onclick: () => show(idea.id) }, "открыть"))))))),
-      pager(state, page.total, load));
+  async function load(offset = state.offset) {
+    await run(statusHost, "читаю идеи…", async () => {
+      const page = await api(`/ideas?limit=${state.limit}&offset=${offset}`);
+      // Same shape check as /search above: a 200 with the wrong body (captive portal,
+      // transparent proxy) must not commit `offset` — committing here first is what let
+      // the stale pager's next click silently skip a page of rows.
+      if (!Array.isArray(page.items) || typeof page.total !== "number")
+        throw new Error("ответ /ideas — не страница: " + JSON.stringify(page).slice(0, 200));
+      state.offset = offset;   // committed only now — the page actually has items+total
+      setStatus(statusHost, "ok", codeOf(page), `${page.items.length} строк на странице, total ${fmt(page.total)}`);
+      out.replaceChildren(
+        el("div", { class: "scroller" }, el("table", { class: "tbl" },
+          el("thead", {}, el("tr", {}, ...["идея", "текст", "trust", "листьев", "origin", "обновлена", ""]
+            .map((h) => el("th", {}, h)))),
+          el("tbody", {}, ...page.items.map((idea) => el("tr", {},
+            el("td", { class: "mono" }, idea.id),
+            el("td", {}, cut(idea.text, 150)),
+            el("td", { class: "num" }, idea.trust_score.toFixed(1),
+              idea.dirty ? el("span", { class: "badge b-dirty", style: "margin-left:6px" }, "dirty") : null),
+            el("td", { class: "num" }, idea.theses.length),
+            el("td", {}, idea.origin),
+            el("td", { class: "mono dim" }, idea.updated_at || "«»"),
+            el("td", {}, el("button", { class: "ghost sm", onclick: () => show(idea.id) }, "открыть"))))))),
+        pager(state, page.total, load));
+      return page;
+    });
   }
 
   async function show(ideaId) {
+    // A stale "Записано" belongs to whatever idea was actually written, not to the next
+    // one someone happens to open — clear it only when the id actually changes, so the
+    // re-read that follows a successful PATCH (same id) leaves it standing.
+    if (ideaId !== shownIdeaId) writeStatus.replaceChildren();
+    shownIdeaId = ideaId;
     detail.replaceChildren();
     const statusBox = el("div");
     detail.append(el("div", { class: "panel" }, el("h2", {}, "идея " + ideaId), statusBox));
-    const [idea, edges] = await run(statusBox, "читаю идею и её рёбра…", () => Promise.all([
+    await run(statusBox, "читаю идею и её рёбра…", async () => {
+    const [idea, edges] = await Promise.all([
       api(`/ideas/${encodeURIComponent(ideaId)}`),
       api(`/ideas/${encodeURIComponent(ideaId)}/neighbors?hops=1`),
-    ])) || [];
-    if (!idea) return;
-    setStatus(statusBox, "ok", 200, `${idea.theses.length} листьев, ${edges.length} рёбер (1 хоп)`);
+    ]);
+    setStatus(statusBox, "ok", codeOf(idea), `${idea.theses.length} листьев, ${edges.length} рёбер (1 хоп)`);
 
     /* PATCH form: only the fields the API allows. `trust_score`, `dirty` and `origin`
        are absent on purpose — the judge writes the first two in one update, and a
@@ -1194,11 +1271,25 @@ view("ideas", "Идеи", (host) => {
             setStatus(patchStatus, "warn", null, "ничего не изменено — пустой PATCH сервер отклонит (400)");
             return;
           }
+          // A fresh attempt starts with no stale confirmation: a failing second PATCH
+          // must not leave a first PATCH's green "записано" standing.
+          writeStatus.replaceChildren();
           const updated = await run(patchStatus, "пишу…", () =>
             api(`/ideas/${encodeURIComponent(ideaId)}`, { method: "PATCH", body }));
           if (!updated) return;
-          setStatus(patchStatus, "ok", 200,
+          // Lives in `writeStatus`, not `patchStatus`: `show()` below rebuilds `detail`
+          // (and `patchStatus` is inside it) to re-read the idea, and this line must
+          // outlive that — including a re-read that itself fails.
+          setStatus(writeStatus, "ok", codeOf(updated),
             `записано: ${Object.keys(body).join(", ")}; updated_at ${updated.updated_at || "«»"}`);
+          // Scrolled from here, not from show()'s tail: a re-read that 503s returns out of
+          // show() before it ever reaches its own scrollIntoView, and whether the
+          // confirmation lands in frame would then depend on the browser's scroll anchoring
+          // instead of on this line.
+          writeStatus.style.scrollMarginTop = (Math.max(
+            $("header.bar").getBoundingClientRect().bottom,
+            $("nav.tabs").getBoundingClientRect().bottom) + 10) + "px";
+          writeStatus.scrollIntoView({ behavior: "smooth", block: "start" });
           show(ideaId); load();
         } }, "Записать изменения"),
         el("button", { class: "ghost", onclick: () => show(ideaId) }, "Сбросить")),
@@ -1220,11 +1311,20 @@ view("ideas", "Идеи", (host) => {
             el("td", { class: "num" }, edge.hop),
             el("td", { class: "num" }, (edge.evidence || []).length || "—"),
             el("td", { class: "dim" }, cut(edge.note, 80)))))))
-          : el("div", { class: "status" }, el("span", { class: "code" }, "200"),
+          : el("div", { class: "status" }, el("span", { class: "code" }, codeOf(edges)),
               "рёбер нет — у этой идеи их действительно ноль (ручка ответила пустым списком)")),
       el("div", { class: "row" },
-        el("button", { class: "ghost", onclick: () => { detail.replaceChildren(); } }, "Закрыть карточку")));
-    detail.scrollIntoView({ behavior: "smooth", block: "start" });
+        el("button", { class: "ghost", onclick: () => {
+          // Closing clears the confirmation too: a "записано" that outlives its card
+          // reads as fresh on the next open, of this idea or another.
+          detail.replaceChildren(); writeStatus.replaceChildren();
+        } }, "Закрыть карточку")));
+    // Scroll to whichever the operator needs to see: a just-written confirmation sits
+    // ABOVE `detail`, and `block:"start"` on `detail` alone would run it off the top.
+    (writeStatus.childNodes.length ? writeStatus : detail)
+      .scrollIntoView({ behavior: "smooth", block: "start" });
+    return idea;
+    });
   }
   openIdea = (id) => { switchTo("ideas"); setTimeout(() => show(id), 0); };
 
@@ -1235,9 +1335,9 @@ view("ideas", "Идеи", (host) => {
       el("div", { class: "row" },
         el("label", { class: "f grow" }, "открыть по id", jump),
         el("button", { class: "act", onclick: () => jump.value.trim() && show(jump.value.trim()) }, "Открыть"),
-        el("button", { class: "ghost", onclick: load }, "Обновить список")),
+        el("button", { class: "ghost", onclick: () => load() }, "Обновить список")),
       statusHost),
-    detail, out);
+    writeStatus, detail, out);
   load();
 });
 
@@ -1249,28 +1349,36 @@ view("theses", "Тезисы", (host) => {
   const byIdea = el("input", { class: "mono", placeholder: "idea_…" });
   const bySource = el("input", { class: "mono", placeholder: "источник" });
 
-  async function load() {
-    const params = new URLSearchParams({ limit: state.limit, offset: state.offset });
+  async function load(offset = state.offset) {
+    const params = new URLSearchParams({ limit: state.limit, offset });
     if (byIdea.value.trim()) params.set("idea_id", byIdea.value.trim());
     if (bySource.value.trim()) params.set("source_id", bySource.value.trim());
-    const page = await run(statusHost, "читаю тезисы…", () => api(`/theses?${params}`));
-    if (!page) return;
-    setStatus(statusHost, "ok", 200, `total ${fmt(page.total)} при этом фильтре`);
-    out.replaceChildren(
-      el("div", { class: "scroller" }, el("table", { class: "tbl" },
-        el("thead", {}, el("tr", {}, ...["тезис", "текст", "эффект", "локатор", "источник", "идея"]
-          .map((h) => el("th", {}, h)))),
-        el("tbody", {}, ...page.items.map((leaf) => el("tr", {},
-          el("td", { class: "mono" }, leaf.id),
-          el("td", {}, cut(leaf.text, 180)),
-          el("td", {}, leaf.effect || "—"),
-          el("td", { class: "mono dim" }, leaf.locator || "—"),
-          el("td", {}, el("a", { href: leaf.source_url, target: "_blank", rel: "noreferrer" },
-            cut(leaf.source_title, 60)),
-            el("span", { class: "badge b-" + leaf.source_type, style: "margin-left:6px" }, leaf.source_type)),
-          el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
-            e.preventDefault(); openIdea(leaf.idea_id); } }, leaf.idea_id))))))),
-      pager(state, page.total, load));
+    await run(statusHost, "читаю тезисы…", async () => {
+      const page = await api(`/theses?${params}`);
+      // Same shape check as /search above: a 200 with the wrong body must not commit
+      // `offset` — committing here first is what let the stale pager's next click
+      // silently skip a page of rows.
+      if (!Array.isArray(page.items) || typeof page.total !== "number")
+        throw new Error("ответ /theses — не страница: " + JSON.stringify(page).slice(0, 200));
+      state.offset = offset;   // committed only now — the page actually has items+total
+      setStatus(statusHost, "ok", codeOf(page), `total ${fmt(page.total)} при этом фильтре`);
+      out.replaceChildren(
+        el("div", { class: "scroller" }, el("table", { class: "tbl" },
+          el("thead", {}, el("tr", {}, ...["тезис", "текст", "эффект", "локатор", "источник", "идея"]
+            .map((h) => el("th", {}, h)))),
+          el("tbody", {}, ...page.items.map((leaf) => el("tr", {},
+            el("td", { class: "mono" }, leaf.id),
+            el("td", {}, cut(leaf.text, 180)),
+            el("td", {}, leaf.effect || "—"),
+            el("td", { class: "mono dim" }, leaf.locator || "—"),
+            el("td", {}, el("a", { href: leaf.source_url, target: "_blank", rel: "noreferrer" },
+              cut(leaf.source_title, 60)),
+              el("span", { class: "badge b-" + leaf.source_type, style: "margin-left:6px" }, leaf.source_type)),
+            el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
+              e.preventDefault(); openIdea(leaf.idea_id); } }, leaf.idea_id))))))),
+        pager(state, page.total, load));
+      return page;
+    });
   }
 
   host.replaceChildren(
@@ -1281,7 +1389,7 @@ view("theses", "Тезисы", (host) => {
       el("div", { class: "row" },
         el("label", { class: "f" }, "idea_id", byIdea),
         el("label", { class: "f" }, "source_id", bySource),
-        el("button", { class: "act", onclick: () => { state.offset = 0; load(); } }, "Фильтровать")),
+        el("button", { class: "act", onclick: () => load(0) }, "Фильтровать")),
       statusHost),
     out);
   load();
@@ -1293,30 +1401,37 @@ view("sources", "Источники", (host) => {
   const out = el("div"), statusHost = el("div"), formStatus = el("div");
   const state = { offset: 0, limit: PAGE };
 
-  async function load() {
-    const page = await run(statusHost, "читаю источники…", () =>
-      api(`/sources?limit=${state.limit}&offset=${state.offset}`));
-    if (!page) return;
-    setStatus(statusHost, "ok", 200, `total ${fmt(page.total)}`);
-    out.replaceChildren(
-      el("div", { class: "scroller" }, el("table", { class: "tbl" },
-        el("thead", {}, el("tr", {}, ...["источник", "тип", "название", "версия", "получен", "прогон", ""]
-          .map((h) => el("th", {}, h)))),
-        el("tbody", {}, ...page.items.map((src) => el("tr", {},
-          el("td", { class: "mono" }, src.id),
-          el("td", {}, el("span", { class: "badge b-" + src.type }, src.type)),
-          el("td", {}, el("a", { href: src.url, target: "_blank", rel: "noreferrer" }, cut(src.title, 90))),
-          el("td", { class: "mono" }, src.version),
-          el("td", { class: "mono dim" }, (src.retrieved_at || "").slice(0, 16)),
-          el("td", {}, src.run_success === null || src.run_success === undefined ? "—"
-            : el("span", { class: "badge " + (src.run_success ? "b-ok" : "b-failed") },
-                src.run_success ? "успех" : "провал")),
-          el("td", {}, el("button", { class: "ghost sm", onclick: () => {
-            switchTo("theses");
-            setTimeout(() => { $("main input.mono[placeholder='источник']").value = src.id;
-                               $("main button.act").click(); }, 0);
-          } }, "тезисы"))))))),
-      pager(state, page.total, load));
+  async function load(offset = state.offset) {
+    await run(statusHost, "читаю источники…", async () => {
+      const page = await api(`/sources?limit=${state.limit}&offset=${offset}`);
+      // Same shape check as /search above: a 200 with the wrong body must not commit
+      // `offset` — committing here first is what let the stale pager's next click
+      // silently skip a page of rows.
+      if (!Array.isArray(page.items) || typeof page.total !== "number")
+        throw new Error("ответ /sources — не страница: " + JSON.stringify(page).slice(0, 200));
+      state.offset = offset;   // committed only now — the page actually has items+total
+      setStatus(statusHost, "ok", codeOf(page), `total ${fmt(page.total)}`);
+      out.replaceChildren(
+        el("div", { class: "scroller" }, el("table", { class: "tbl" },
+          el("thead", {}, el("tr", {}, ...["источник", "тип", "название", "версия", "получен", "прогон", ""]
+            .map((h) => el("th", {}, h)))),
+          el("tbody", {}, ...page.items.map((src) => el("tr", {},
+            el("td", { class: "mono" }, src.id),
+            el("td", {}, el("span", { class: "badge b-" + src.type }, src.type)),
+            el("td", {}, el("a", { href: src.url, target: "_blank", rel: "noreferrer" }, cut(src.title, 90))),
+            el("td", { class: "mono" }, src.version),
+            el("td", { class: "mono dim" }, (src.retrieved_at || "").slice(0, 16)),
+            el("td", {}, src.run_success === null || src.run_success === undefined ? "—"
+              : el("span", { class: "badge " + (src.run_success ? "b-ok" : "b-failed") },
+                  src.run_success ? "успех" : "провал")),
+            el("td", {}, el("button", { class: "ghost sm", onclick: () => {
+              switchTo("theses");
+              setTimeout(() => { $("main input.mono[placeholder='источник']").value = src.id;
+                                 $("main button.act").click(); }, 0);
+            } }, "тезисы"))))))),
+        pager(state, page.total, load));
+      return page;
+    });
   }
 
   const f = {
@@ -1333,7 +1448,7 @@ view("sources", "Источники", (host) => {
       el("h2", {}, "GET /sources"),
       el("p", { class: "help" }, "Статьи, документация и логи прогонов. id выводится из (url, version), "
         + "поэтому повторный POST заменяет строку, а не плодит вторую."),
-      el("div", { class: "row" }, el("button", { class: "ghost", onclick: load }, "Обновить")),
+      el("div", { class: "row" }, el("button", { class: "ghost", onclick: () => load() }, "Обновить")),
       statusHost),
     el("details", { class: "panel" },
       el("summary", { style: "cursor:pointer;color:var(--muted);font-size:12px;letter-spacing:.1em;text-transform:uppercase" },
@@ -1359,7 +1474,7 @@ view("sources", "Источники", (host) => {
           const src = await run(formStatus, "пишу источник…", () =>
             api("/sources", { method: "POST", body }));
           if (!src) return;
-          setStatus(formStatus, "ok", 200, `записан ${src.id}`);
+          setStatus(formStatus, "ok", codeOf(src), `записан ${src.id}`);
           load();
         } }, "Записать")),
       formStatus),
@@ -1379,28 +1494,53 @@ view("ingest", "Ингест и ops", (host) => {
   let timer = null;
 
   async function loadJobs(quiet) {
-    const jobs = await (quiet
-      ? api("/ingest/jobs?limit=30").catch((err) => { failed(jobStatus, err); return undefined; })
-      : run(jobStatus, "читаю очередь…", () => api("/ingest/jobs?limit=30")));
-    if (!jobs) return;
-    const live = jobs.filter((j) => ["queued", "running", "staged"].includes(j.status)).length;
-    setStatus(jobStatus, live ? "warn" : "ok", 200,
-      `${jobs.length} заданий в списке (limit 30 — список обрезан сервером, если их больше), в работе ${live}`);
-    jobsHost.replaceChildren(el("div", { class: "scroller" }, el("table", { class: "tbl" },
-      el("thead", {}, el("tr", {}, ...["задание", "что", "статус", "попыток", "создано", "итог"]
-        .map((h) => el("th", {}, h)))),
-      el("tbody", {}, ...jobs.map((job) => el("tr", {},
-        el("td", { class: "mono" }, job.id),
-        el("td", {}, JOB_KIND[job.kind] || job.kind,
-          job.stage ? el("span", { class: "dim" }, " · " + job.stage) : null,
-          el("div", { class: "dim mono", style: "font-size:11px" },
-            cut(JSON.stringify(job.args || {}), 90))),
-        el("td", {}, el("span", { class: "badge b-" + job.status }, job.status)),
-        el("td", { class: "num" }, job.attempts),
-        el("td", { class: "mono dim" }, (job.created_at || "").slice(0, 19).replace("T", " ")),
-        el("td", {}, job.error
-          ? el("span", { style: "color:var(--critical)" }, cut(job.error, 160))
-          : el("span", { class: "dim mono" }, cut(JSON.stringify(job.report || {}), 160)))))))));
+    // quiet (auto-refresh) never calls busy() — no spinner is left hanging on a
+    // render throw here, so it keeps its own .catch and stays outside run().
+    if (quiet) {
+      const jobs = await api("/ingest/jobs?limit=30").catch((err) => { failed(jobStatus, err); return undefined; });
+      if (!jobs) return;
+      const live = jobs.filter((j) => ["queued", "running", "staged"].includes(j.status)).length;
+      setStatus(jobStatus, live ? "warn" : "ok", codeOf(jobs),
+        `${jobs.length} заданий в списке (limit 30 — список обрезан сервером, если их больше), в работе ${live}`);
+      jobsHost.replaceChildren(el("div", { class: "scroller" }, el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["задание", "что", "статус", "попыток", "создано", "итог"]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...jobs.map((job) => el("tr", {},
+          el("td", { class: "mono" }, job.id),
+          el("td", {}, JOB_KIND[job.kind] || job.kind,
+            job.stage ? el("span", { class: "dim" }, " · " + job.stage) : null,
+            el("div", { class: "dim mono", style: "font-size:11px" },
+              cut(JSON.stringify(job.args || {}), 90))),
+          el("td", {}, el("span", { class: "badge b-" + job.status }, job.status)),
+          el("td", { class: "num" }, job.attempts),
+          el("td", { class: "mono dim" }, (job.created_at || "").slice(0, 19).replace("T", " ")),
+          el("td", {}, job.error
+            ? el("span", { style: "color:var(--critical)" }, cut(job.error, 160))
+            : el("span", { class: "dim mono" }, cut(JSON.stringify(job.report || {}), 160)))))))));
+      return;
+    }
+    await run(jobStatus, "читаю очередь…", async () => {
+      const jobs = await api("/ingest/jobs?limit=30");
+      const live = jobs.filter((j) => ["queued", "running", "staged"].includes(j.status)).length;
+      setStatus(jobStatus, live ? "warn" : "ok", codeOf(jobs),
+        `${jobs.length} заданий в списке (limit 30 — список обрезан сервером, если их больше), в работе ${live}`);
+      jobsHost.replaceChildren(el("div", { class: "scroller" }, el("table", { class: "tbl" },
+        el("thead", {}, el("tr", {}, ...["задание", "что", "статус", "попыток", "создано", "итог"]
+          .map((h) => el("th", {}, h)))),
+        el("tbody", {}, ...jobs.map((job) => el("tr", {},
+          el("td", { class: "mono" }, job.id),
+          el("td", {}, JOB_KIND[job.kind] || job.kind,
+            job.stage ? el("span", { class: "dim" }, " · " + job.stage) : null,
+            el("div", { class: "dim mono", style: "font-size:11px" },
+              cut(JSON.stringify(job.args || {}), 90))),
+          el("td", {}, el("span", { class: "badge b-" + job.status }, job.status)),
+          el("td", { class: "num" }, job.attempts),
+          el("td", { class: "mono dim" }, (job.created_at || "").slice(0, 19).replace("T", " ")),
+          el("td", {}, job.error
+            ? el("span", { style: "color:var(--critical)" }, cut(job.error, 160))
+            : el("span", { class: "dim mono" }, cut(JSON.stringify(job.report || {}), 160)))))))));
+      return jobs;
+    });
   }
 
   const url = el("input", { class: "grow", placeholder: "https://arxiv.org/abs/2406.04824" });
@@ -1410,49 +1550,64 @@ view("ingest", "Ингест и ops", (host) => {
   const trustIds = el("input", { class: "mono grow", placeholder: "idea_… через запятую; пусто = все dirty" });
 
   const post = (statusHost, label, path, body) => async () => {
-    const job = await run(statusHost, label, () => api(path, { method: "POST", body }));
-    if (!job) return;
-    setStatus(statusHost, "ok", 202, `задание ${job.id} · ${job.status}`);
-    loadJobs(true);
+    await run(statusHost, label, async () => {
+      const job = await api(path, { method: "POST", body });
+      // `job.id`/`job.status` interpolate straight into the string — undefined stringifies
+      // to "undefined" rather than throwing, so a shape mismatch would otherwise print a
+      // calm green "задание undefined · undefined" instead of surfacing as an error.
+      if (typeof job.id !== "string")
+        throw new Error(`ответ ${path} без id задания: ` + JSON.stringify(job).slice(0, 200));
+      setStatus(statusHost, "ok", codeOf(job), `задание ${job.id} · ${job.status}`);
+      loadJobs(true);
+      return job;
+    });
   };
 
   async function loadStaging() {
-    const st = await run(stagingHost, "читаю staging…", () => api("/ingest/staging"));
-    if (!st) return;
-    stagingHost.replaceChildren(
-      el("div", { class: "row" },
-        el("span", { class: "badge" }, `строк ${st.lines}`),
-        el("span", { class: "badge" }, `курсор ${st.cursor}`),
-        el("span", { class: "badge " + (st.pending_lines ? "b-queued" : "b-ok") },
-          `ждёт фазы 2: ${st.pending_lines}`)),
-      st.sources.length ? el("div", { class: "scroller", style: "margin-top:10px;max-height:32vh" },
-        el("table", { class: "tbl" },
-          el("thead", {}, el("tr", {}, ...["источник", "название", "строк", "внесён"].map((h) => el("th", {}, h)))),
-          el("tbody", {}, ...st.sources.map((s) => el("tr", {},
-            el("td", { class: "mono" }, s.id),
-            el("td", {}, cut(s.title, 90)),
-            el("td", { class: "num" }, s.lines),
-            el("td", {}, s.ingested ? el("span", { class: "badge b-ok" }, "да")
-                                    : el("span", { class: "badge b-queued" }, "нет")))))))
-        : el("div", { class: "status" }, el("span", { class: "code" }, "200"),
-            "staging пуст — между фазами ничего не лежит"));
+    await run(stagingHost, "читаю staging…", async () => {
+      const st = await api("/ingest/staging");
+      stagingHost.replaceChildren(
+        el("div", { class: "row" },
+          el("span", { class: "badge" }, `строк ${st.lines}`),
+          el("span", { class: "badge" }, `курсор ${st.cursor}`),
+          el("span", { class: "badge " + (st.pending_lines ? "b-queued" : "b-ok") },
+            `ждёт фазы 2: ${st.pending_lines}`)),
+        st.sources.length ? el("div", { class: "scroller", style: "margin-top:10px;max-height:32vh" },
+          el("table", { class: "tbl" },
+            el("thead", {}, el("tr", {}, ...["источник", "название", "строк", "внесён"].map((h) => el("th", {}, h)))),
+            el("tbody", {}, ...st.sources.map((s) => el("tr", {},
+              el("td", { class: "mono" }, s.id),
+              el("td", {}, cut(s.title, 90)),
+              el("td", { class: "num" }, s.lines),
+              el("td", {}, s.ingested ? el("span", { class: "badge b-ok" }, "да")
+                                      : el("span", { class: "badge b-queued" }, "нет")))))))
+          : el("div", { class: "status" }, el("span", { class: "code" }, codeOf(st)),
+              "staging пуст — между фазами ничего не лежит"));
+      return st;
+    });
   }
 
   async function loadPending() {
-    const rows = await run(pendingHost, "читаю очередь арбитра…", () => api("/ingest/pending-link?limit=50"));
-    if (!rows) return;
-    pendingHost.replaceChildren(rows.length
-      ? el("div", { class: "scroller", style: "max-height:36vh" }, el("table", { class: "tbl" },
-          el("thead", {}, el("tr", {}, ...["когда", "ошибка", "тезис", "источник", "кандидатов"]
-            .map((h) => el("th", {}, h)))),
-          el("tbody", {}, ...rows.map((row) => el("tr", {},
-            el("td", { class: "mono dim" }, (row.ts || "").slice(0, 19).replace("T", " ")),
-            el("td", { style: "color:var(--warning)" }, cut(row.error, 90)),
-            el("td", {}, cut(row.thesis_text, 160)),
-            el("td", { class: "mono" }, row.source_id),
-            el("td", { class: "num" }, row.candidates))))))
-      : el("div", { class: "status ok" }, el("span", { class: "code" }, "200"),
-          "очередь пуста: арбитр ни разу не отказался"));
+    await run(pendingHost, "читаю очередь арбитра…", async () => {
+      const rows = await api("/ingest/pending-link?limit=50");
+      // `rows.length` alone treats any non-array body (a shape mismatch) as the falsy
+      // "queue empty" case below — a green "арбитр ни разу не отказался" over a
+      // response that never actually answered the question.
+      if (!Array.isArray(rows)) throw new Error("ответ /ingest/pending-link — не массив: " + JSON.stringify(rows).slice(0, 200));
+      pendingHost.replaceChildren(rows.length
+        ? el("div", { class: "scroller", style: "max-height:36vh" }, el("table", { class: "tbl" },
+            el("thead", {}, el("tr", {}, ...["когда", "ошибка", "тезис", "источник", "кандидатов"]
+              .map((h) => el("th", {}, h)))),
+            el("tbody", {}, ...rows.map((row) => el("tr", {},
+              el("td", { class: "mono dim" }, (row.ts || "").slice(0, 19).replace("T", " ")),
+              el("td", { style: "color:var(--warning)" }, cut(row.error, 90)),
+              el("td", {}, cut(row.thesis_text, 160)),
+              el("td", { class: "mono" }, row.source_id),
+              el("td", { class: "num" }, row.candidates))))))
+        : el("div", { class: "status ok" }, el("span", { class: "code" }, codeOf(rows)),
+            "очередь пуста: арбитр ни разу не отказался"));
+      return rows;
+    });
   }
 
   host.replaceChildren(
@@ -1490,13 +1645,20 @@ view("ingest", "Ингест и ops", (host) => {
         + "откажется затирать заметки, которых не писала."),
       el("div", { class: "row" },
         el("button", { class: "ghost", onclick: async () => {
-          const res = await run(opsStatus, "пересобираю индекс…", () =>
-            api("/admin/reindex", { method: "POST" }));
-          if (!res) return;
-          setStatus(opsStatus, res.in_sync ? "ok" : "err", 200,
-            `было ${res.indexed_before}, в хранилище ${res.leaves_in_store}, стало ${res.indexed_after}`
-            + (res.in_sync ? " — сходится" : " — НЕ СХОДИТСЯ"));
-          refreshStrip();
+          await run(opsStatus, "пересобираю индекс…", async () => {
+            const res = await api("/admin/reindex", { method: "POST" });
+            // `in_sync` is a boolean the server always sets — undefined (a shape
+            // mismatch) would otherwise fall into the same falsy "err" branch as a
+            // real desync and print "не сходится" over three `undefined`s, which
+            // reads as a lake problem instead of the response-shape problem it is.
+            if (typeof res.in_sync !== "boolean")
+              throw new Error("ответ /admin/reindex без in_sync: " + JSON.stringify(res).slice(0, 200));
+            setStatus(opsStatus, res.in_sync ? "ok" : "err", codeOf(res),
+              `было ${res.indexed_before}, в хранилище ${res.leaves_in_store}, стало ${res.indexed_after}`
+              + (res.in_sync ? " — сходится" : " — НЕ СХОДИТСЯ"));
+            refreshStrip();
+            return res;
+          });
         } }, "Пересобрать индекс"),
         el("label", { class: "f grow" }, "судить идеи", trustIds),
         el("button", { class: "ghost", onclick: () => {
@@ -1504,12 +1666,19 @@ view("ingest", "Ингест и ops", (host) => {
           post(opsStatus, "ставлю суд…", "/admin/trust", ids.length ? { idea_ids: ids } : {})();
         } }, "Судить"),
         el("button", { class: "ghost", onclick: async () => {
-          const res = await run(opsStatus, "выгружаю vault…", () =>
-            api("/vault/export", { method: "POST" }));
-          if (!res) return;
-          setStatus(opsStatus, res.orphans ? "warn" : "ok", 200,
-            `${res.files} файлов в ${res.dest}: идей ${res.ideas}, тезисов ${res.theses}, `
-            + `источников ${res.sources}, сирот ${res.orphans}`);
+          await run(opsStatus, "выгружаю vault…", async () => {
+            const res = await api("/vault/export", { method: "POST" });
+            // `files` is always a number on a real answer. Skipping this check would
+            // let a shape mismatch fall through `res.orphans ? "warn" : "ok"` straight
+            // into a GREEN "ok" status printing four `undefined`s — no warning at all,
+            // exactly the silent accept this file's rules ban.
+            if (typeof res.files !== "number")
+              throw new Error("ответ /vault/export без files: " + JSON.stringify(res).slice(0, 200));
+            setStatus(opsStatus, res.orphans ? "warn" : "ok", codeOf(res),
+              `${res.files} файлов в ${res.dest}: идей ${res.ideas}, тезисов ${res.theses}, `
+              + `источников ${res.sources}, сирот ${res.orphans}`);
+            return res;
+          });
         } }, "Выгрузить в Obsidian")),
       opsStatus),
 
@@ -1610,7 +1779,7 @@ const LOOKS_LIKE_ID = /^idea_[0-9a-f]{6,}$/i;
    ближайшая по своему тексту идея. Векторов идей в браузере нет и энкодера тут нет,
    так что честнее так и сказать в интерфейсе, чем сделать вид, что сравниваем идеи. */
 async function resolveIdea(text, k = 12) {
-  if (LOOKS_LIKE_ID.test(text)) return { id: text, exact: true, candidates: [] };
+  if (LOOKS_LIKE_ID.test(text)) return { id: text, exact: true, candidates: [], hits: null };
   const hits = await api(`/search?q=${encodeURIComponent(text)}&k=${k}`);
   const candidates = [];
   for (const hit of hits) {
@@ -1618,7 +1787,9 @@ async function resolveIdea(text, k = 12) {
     candidates.push({ id: hit.idea_id, score: hit.score, bm25: hit.bm25_rank,
                       vec: hit.vec_rank, thesis: hit.thesis_id });
   }
-  return { id: candidates.length ? candidates[0].id : null, exact: false, candidates };
+  // `hits` kept on the result so a caller with nothing to draw can still show the real
+  // code the search answered with, instead of assuming 200.
+  return { id: candidates.length ? candidates[0].id : null, exact: false, candidates, hits };
 }
 
 /* Which arm of the hybrid found this row. `—` in one column is not a detail: a hit the
@@ -1663,7 +1834,7 @@ view("graph", "Граф", (host) => {
         // NOT a fall-through to the whole lake: drawing 200 unrelated ideas after a
         // query that matched nothing would look like the search had worked.
         wrap.replaceChildren();
-        setStatus(statusHost, "warn", 200, `индекс ничего не нашёл по «${typed}» — корня нет, `
+        setStatus(statusHost, "warn", codeOf(found.hits), `индекс ничего не нашёл по «${typed}» — корня нет, `
           + "граф не построен. Пустое поле нарисует всё озеро.");
         return;
       }
@@ -1691,7 +1862,10 @@ view("graph", "Граф", (host) => {
               throw err;
             })))
           if (body) bodies.set(id, body);
-        return { bodies, edges, total: bodies.size, shown: bodies.size, truncated: false };
+        // `idea` is the one call in this branch with a status worth showing — the
+        // neighbours and the pooled bodies can each fail their own way and already say so.
+        return { bodies, edges, total: bodies.size, shown: bodies.size, truncated: false,
+                 code: codeOf(idea) };
       }
       const page = await api(`/ideas?limit=${limit}&offset=0`);
       const bodies = new Map(page.items.map((idea) => [idea.id, idea]));
@@ -1700,7 +1874,7 @@ view("graph", "Граф", (host) => {
           api(`/ideas/${encodeURIComponent(id)}/neighbors?${params}`)))
         for (const edge of part) if (bodies.has(edge.target_id)) edges.push(edge);
       return { bodies, edges, total: page.total, shown: bodies.size,
-               truncated: page.total > bodies.size };
+               truncated: page.total > bodies.size, code: codeOf(page) };
     });
     if (stale() || !data) return;
 
@@ -1715,7 +1889,7 @@ view("graph", "Граф", (host) => {
       links.push({ source: edge.source_id, target: edge.target_id, weight: edge.weight || 1,
                    type: edge.type });
     }
-    setStatus(statusHost, data.truncated ? "warn" : "ok", 200, rootId
+    setStatus(statusHost, data.truncated ? "warn" : "ok", data.code, rootId
       ? `окрестность: ${nodes.length} узлов, ${links.length} связей на ${hops.value} хоп(а); `
         + `в озере всего ${fmt(LAST_STATS ? LAST_STATS.ideas : data.total)} идей`
         + (found && !found.exact
@@ -1872,7 +2046,8 @@ view("raw", "Ручки", (host) => {
       el("p", { class: "help" }, "Тот же ключ, тот же origin, ответ как есть. Полный список ручек — "),
       el("p", { class: "help" }, el("a", { href: "/docs", target: "_blank" }, "/docs"), " · ",
         el("a", { href: "/openapi.json", target: "_blank" }, "/openapi.json"),
-        " — эти два пути открыты без ключа: они и есть контракт."),
+        " — они и есть контракт; это два из нескольких путей, открытых без ключа "
+        + "(GET/HEAD only — полный список см. OPEN_PATHS в app.py)."),
       el("div", { class: "row" },
         el("label", { class: "f" }, "метод", method),
         el("label", { class: "f grow" }, "путь", path),
@@ -1882,10 +2057,15 @@ view("raw", "Ручки", (host) => {
             try { parsed = JSON.parse(body.value); }
             catch (err) { setStatus(statusHost, "err", null, "тело не JSON: " + err.message); return; }
           }
+          let status;
+          out.replaceChildren();
           const res = await run(statusHost, "…", () =>
-            api(path.value.trim(), { method: method.value, body: parsed }));
+            api(path.value.trim(), { method: method.value, body: parsed,
+                                     onStatus: (s) => { status = s; } }));
+          // `res === undefined` is the failure the wrapper already reported; `res === null`
+          // is a 204, a real answer with an empty body, not the same thing.
           if (res === undefined) return;
-          setStatus(statusHost, "ok", 200, "ответ ниже");
+          setStatus(statusHost, "ok", status ?? "—", "ответ ниже");
           out.replaceChildren(el("pre", { class: "mono", style:
             "background:var(--surface-2);border:1px solid var(--hair);border-radius:10px;padding:14px;overflow:auto;max-height:60vh" },
             JSON.stringify(res, null, 2)));
@@ -1899,11 +2079,21 @@ view("raw", "Ручки", (host) => {
 
 let CURRENT = location.hash.slice(1) || "retrieve";
 
+// What the boot probe found, not just "have a key or not": a dead upstream (503, or no
+// answer at all) is neither "open" nor "needs a key", and showing it as either is the
+// exact lie §4.1 names. `probing` is the state until the first probe resolves.
+let AUTH = API_KEY ? "open" : "probing";
+
 function switchTo(id) {
   CURRENT = id;
   history.replaceState(null, "", "#" + id);
   render();
 }
+
+// The one place that turns AUTH into #main content. Called before the probe even starts
+// (§7.6: tabs and an explanation belong on screen immediately, not after a 10s round trip),
+// so every branch below must tolerate LAST_PROBE_ERR being unset yet.
+let LAST_PROBE_ERR = null;
 
 function render() {
   const tabs = $("#tabs");
@@ -1912,7 +2102,29 @@ function render() {
   }, v.title)));
   const main = $("#main");
   main.replaceChildren();
-  if (!API_KEY && !NO_AUTH) { openGate(""); return; }
+  $("#gate").classList.add("hide");
+
+  if (AUTH === "probing") {
+    main.replaceChildren(el("div", { class: "panel" },
+      busy(el("div"), "проверяю сервер…")));
+    return;
+  }
+  if (AUTH === "broken" || AUTH === "offline") {
+    const err = LAST_PROBE_ERR;
+    const host = el("div");
+    main.replaceChildren(el("div", { class: "panel" }, host,
+      el("button", { class: "act", style: "margin-top:12px", onclick: probe }, "Повторить")));
+    if (err) failed(host, err);
+    else setStatus(host, "err", "—", "нет связи с API");
+    return;
+  }
+  if (AUTH === "need-key") {
+    // No message here on purpose: AUTH only reaches "need-key" from probe()'s catch on a
+    // 401, and api() already put a real explanation into #key-msg before throwing — this
+    // call must not have a fallback string that could clobber it (§4.1's third bug).
+    openGate();
+    return;
+  }
   const chosen = VIEWS.find((v) => v.id === CURRENT) || VIEWS[0];
   chosen.mount(main);
 }
@@ -1922,14 +2134,38 @@ window.addEventListener("hashchange", () => {
   if (id && id !== CURRENT) { CURRENT = id; render(); }
 });
 
-(async function boot() {
-  if (!API_KEY) {
-    // One keyless probe. 200 means this server runs --no-auth; a 401 means it does not,
-    // and `api()` has already put the gate up.
-    try { await api("/healthz", { timeout: 10000 }); NO_AUTH = true; } catch { /* gate */ }
+// One probe, shared by boot and the "Повторить" button. A 200 means this server runs
+// --no-auth; a 401 means it wants a key and `api()` has already primed the gate's text;
+// a 503 is `app.py`'s "started without LAKE_API_KEY" (or any other broken-lake reason) —
+// never a key problem; no status at all (network/timeout) is `offline`, also never a key
+// problem. `api()`'s own 401 handler already calls `openGate` with real text, so this
+// function only has to choose the AUTH value and let render() do the drawing.
+async function probe() {
+  if (API_KEY) { AUTH = "open"; render(); return; }
+  AUTH = "probing";
+  LAST_PROBE_ERR = null;
+  render();
+  try {
+    await api("/healthz", { timeout: 10000 });
+    NO_AUTH = true;
+    AUTH = "open";
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    LAST_PROBE_ERR = err;
+    AUTH = err.status === 401 ? "need-key" : err.status === 0 ? "offline" : "broken";
   }
   render();
-  if (API_KEY || NO_AUTH) { refreshStrip(); setInterval(refreshStrip, 20000); }
+  if (AUTH === "open") startStrip();
+}
+
+(async function boot() {
+  // §7.6: tabs and an explanation are on screen before any network round trip, not after.
+  render();
+  // A key in sessionStorage means no keyless probe (unchanged from before) — AUTH is
+  // already "open" from its initial value above; real requests report their own failures
+  // through the strip/view status (§4.1 already separates 0 from 401 there).
+  if (API_KEY) { startStrip(); return; }
+  await probe();
 })();
 </script>
 </body>
