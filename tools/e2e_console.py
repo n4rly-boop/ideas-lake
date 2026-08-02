@@ -879,8 +879,9 @@ def test_loads(browser: Browser, base_url: str):
     labels = browser.evaluate(
         "JSON.stringify([...document.querySelectorAll('nav.tabs button')]"
         ".map(b => b.textContent))")
-    assert json.loads(labels) == ["\u0413\u0438\u043f\u043e\u0442\u0435\u0437\u0430",
-                                  "\u0413\u0440\u0430\u0444", "Retrieve"], \
+    assert json.loads(labels) == ["\u0413\u0440\u0430\u0444",
+                                  "\u0413\u0438\u043f\u043e\u0442\u0435\u0437\u0430",
+                                  "Retrieve"], \
         f"tab order changed: {labels}"
 
 

@@ -828,7 +828,7 @@ function answerBlock(answer, label, rewriteAsked) {
 view("retrieve", "Retrieve", (host, ctx) => {
   const out = el("div"), statusHost = el("div");
   const p = ctx.params;
-  const q = el("input", { class: "grow", placeholder: "как задача или как решение…", value: p.q || "" });
+  const q = el("input", { class: "grow", placeholder: "запрос словами: «maintaining diversity in a population»", value: p.q || "" });
   const k = el("input", { type: "number", min: 1, max: 50, value: Number(p.k) || 5 });
   const budget = el("input", { type: "number", min: 1, placeholder: "по умолчанию", value: p.budget || "" });
   const runId = el("input", { placeholder: "run_id (в трейс)", value: p.run_id || "" });
@@ -1122,7 +1122,7 @@ view("dial", "Гипотеза", (host, ctx) => {
   const legendHost = el("div"), listHost = el("div"), ideasHost = el("div");
   const p = ctx.params;
   const q = el("textarea", { class: "grow", rows: 2, placeholder:
-    "гипотеза словами: «шедулить мутации по тому, как часто потомок бьёт родителя»",
+    "гипотеза словами: «schedule mutations by how often a child beats its parent»",
     style: "width:100%;background:var(--surface-2);border:1px solid var(--hair);"
          + "border-radius:8px;padding:10px;color:var(--ink);font:inherit;resize:vertical" });
   // `<textarea>` has no `value` ATTRIBUTE — unlike `<input>`, the browser only reads its
@@ -2744,7 +2744,7 @@ view("graph", "Граф", (host, ctx) => {
   const statusHost = el("div"), wrap = el("div", { class: "graphwrap" }), info = el("div");
   const picks = el("div", { class: "legend wrap", style: "margin-top:10px" });
   const p = ctx.params;
-  const seed = el("input", { class: "grow", placeholder: "запрос словами, или idea_… (пусто = всё озеро)", value: p.root || "" });
+  const seed = el("input", { class: "grow", placeholder: "«self-refinement», или idea_… (пусто = всё озеро)", value: p.root || "" });
   const hops = el("select", {}, ...[1, 2, 3].map((n) => el("option", { selected: String(n) === (p.hops || "3") ? "" : null }, n)));
   const minW = el("input", { type: "number", min: 0, step: 1, placeholder: "любой", value: p.min_weight || "" });
   const cap = el("input", { type: "number", min: 10, max: 400, value: Number(p.cap) || 200 });
@@ -3160,14 +3160,14 @@ view("raw", "Ручки", (host, ctx) => {
 /* ================================================================ tab order */
 
 // Registration order is source order and stays that way; what the room sees is this
-// list. Three tabs, in the order the demo walks them — a hypothesis, then the graph
-// around it, then retrieve. Everything else is the machine room: still mounted, still
-// reachable by address (`openIdea` sends every click on a point to `#ideas/…`, and that
-// has to keep working), just not offered as a tab.
+// list. Three tabs, in the order the demo walks them — the whole lake as a picture
+// first, then a hypothesis against it, then retrieve. Everything else is the machine
+// room: still mounted, still reachable by address (`openIdea` sends every click on a
+// point to `#ideas/…`, and that has to keep working), just not offered as a tab.
 //
 // VIEWS is reordered in place rather than filtered, because `VIEWS[0]` is what an empty
-// hash resolves to — putting the dial first here is what makes it the landing view.
-const PUBLIC_TABS = ["dial", "graph", "retrieve"];
+// hash resolves to — the first entry here is what a bare `/ui` lands on.
+const PUBLIC_TABS = ["graph", "dial", "retrieve"];
 VIEWS.sort((a, b) => {
   const ia = PUBLIC_TABS.indexOf(a.id), ib = PUBLIC_TABS.indexOf(b.id);
   return (ia === -1 ? PUBLIC_TABS.length : ia) - (ib === -1 ? PUBLIC_TABS.length : ib);
