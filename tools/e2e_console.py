@@ -37,6 +37,7 @@ import base64
 import fcntl
 import itertools
 import json
+import math
 import os
 import re
 import socket
@@ -419,6 +420,39 @@ class Browser:
         time.sleep(0.05)
         self._call("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
+    def tap_and_drag(self, x, y, dx=1, dy=1):
+        """Like `tap`, but with one `touchMove` of `(dx, dy)` px inserted before `touchEnd` —
+        a stationary `tap()` fires `pointerdown`/`pointerup` only (confirmed on the page: no
+        `pointermove` at all for a motionless touch), so it cannot exercise any code gated on
+        a touch `pointermove`. This is the only way to get a real, CDP-driven `pointermove`
+        with `pointerType: "touch"` onto the page at all."""
+        self._call("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [
+            {"x": x, "y": y, "radiusX": 5, "radiusY": 5, "force": 1}]})
+        time.sleep(0.05)
+        self._call("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [
+            {"x": x + dx, "y": y + dy, "radiusX": 5, "radiusY": 5, "force": 1}]})
+        time.sleep(0.05)
+        self._call("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+    def pen_tap(self, x, y):
+        """A tap driven by a real digital pen — `Input.dispatchMouseEvent` with
+        `pointerType: "pen"`, CDP's own primitive for this, no `Input.dispatchTouchEvent`
+        involved at all (that one only ever reports `pointerType: "touch"`, never `"pen"`).
+        Confirmed against the page (`event.pointerType` read back on `pointerdown`, both
+        pen tests below check it) rather than assumed: Chromium tags both the `pointerdown`
+        and its own synthetic `click` with `"pen"`, which is exactly the input `hasHover()`
+        (console.html) must treat the same as `"touch"` — the regression this exists to
+        catch shipped BECAUSE the click guard used to check `=== "touch"` and a pen's click
+        (`!== "touch"`) sailed straight through it."""
+        self._call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y,
+                                                  "pointerType": "pen"})
+        self._call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y,
+                                                  "button": "left", "clickCount": 1,
+                                                  "pointerType": "pen"})
+        self._call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y,
+                                                  "button": "left", "clickCount": 1,
+                                                  "pointerType": "pen"})
+
     def _center_of(self, selector):
         js = ("(() => { const el = document.querySelector(%s); "
               "if (!el) throw new Error('no element for selector: ' + %s); "
@@ -441,6 +475,17 @@ class Browser:
     def click(self, selector):
         pt = self._center_of(selector)
         self.click_point(pt["x"], pt["y"])
+
+    def hover_point(self, x, y):
+        """A real mouse move with no press, no release — `Input.dispatchMouseEvent` with
+        `type: mouseMoved`. Chrome's own hit-testing turns this into a genuine
+        `pointerType: "mouse"` `pointermove` (proven directly, not assumed — see
+        `mouse_hover_shows_card_and_leave_hides_it` below, which reads `event.pointerType`
+        back off the page). Split out from `click_point` because a hover-only probe (§2.3's
+        "наведение показывает, увод скрывает") must never also press — a press is a click,
+        and a click on an idea node is a SEPARATE, already-covered code path
+        (`click_idea_node_opens_it_on_first_load`)."""
+        self._call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
 
     _KEYS = {
         "Enter": {"key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13,
@@ -2984,6 +3029,684 @@ def test_phone_no_horizontal_scroll(browser: Browser, base_url: str):
                              f"is past nav.tabs' hardcoded top {overlap['navTop']:.0f}px — "
                              f"the tab strip is drawn under the header, not below it")
     assert not problems, "phone (390x844) overflows sideways: " + "; ".join(problems)
+
+
+# ==================================================== §2.3: touch instead of hover
+
+def dial_svg_view_box(browser: Browser) -> dict:
+    """The dial's own `w`/`h` (its `viewBox`, `mk("svg", {viewBox: "0 0 w h"})`) plus the
+    SVG element's CURRENT `getBoundingClientRect()` — everything `view_to_screen` below
+    needs to invert `toView()` (console.html:1222-1226) and land a dispatched pointer event
+    on an exact VIEW-space coordinate rather than a screen pixel guessed by eye. Scrolls the
+    SVG into view first (same `scrollIntoView({block:'center', inline:'center'})` as
+    `Browser._center_of`/`find_hittable_point` use) — the headless window here is smaller
+    than the dial, and a rect read WITHOUT scrolling first is relative to a scroll position
+    a caller's dispatched pointer event does not actually land in, off past `window.innerHeight`
+    and hitting nothing at all (confirmed directly: `elementFromPoint` at such a point
+    returned `null`)."""
+    return browser.evaluate("""
+      (() => {
+        const svg = document.querySelector('.graphwrap svg');
+        if (!svg) throw new Error('no .graphwrap svg on screen');
+        svg.scrollIntoView({block: 'center', inline: 'center'});
+        const vb = svg.viewBox.baseVal;
+        const box = svg.getBoundingClientRect();
+        return { w: vb.width, h: vb.height,
+                 box: { left: box.left, top: box.top, width: box.width, height: box.height } };
+      })()
+    """)
+
+
+def view_to_screen(geo: dict, vx: float, vy: float):
+    """Exact inverse of `toView()` (console.html:1222-1226) — the SVG is `width:100%` over a
+    fixed `viewBox`, letterboxed on whichever axis has slack, so a VIEW-space point (the
+    space `marks[]` and `nearestMark()` both work in) is not a screen point until this scale
+    and offset are undone. Used instead of eyeballing pixels so a probe point can be placed
+    at a computed, provably-correct distance from a mark's own centre (see
+    `find_radius_probe_point` below) rather than searched for by trial and error."""
+    box, w, h = geo["box"], geo["w"], geo["h"]
+    scale = min(box["width"] / w, box["height"] / h)
+    sx = box["left"] + (box["width"] - w * scale) / 2 + vx * scale
+    sy = box["top"] + (box["height"] - h * scale) / 2 + vy * scale
+    return sx, sy
+
+
+def dial_marks_geometry(browser: Browser) -> dict:
+    """Reads back, straight from the rendered SVG, every mark `hoverable()` fed into the
+    dial's `marks[]` array (console.html:1060-1063) EXCEPT leaves — callers disable
+    "точки-листья" first (`click_checkbox_with_label(browser, "точки-листья")`) so the only
+    marks left are idea nodes (rank 1, `svg > g:nth-of-type(4) circle.ideanode` — `gIdeas` is
+    the 4th `<g>` `svg.append(gRings, gPts, gEdges, gIdeas, gHits, gLab)` appends, console.html:1214),
+    hits (rank 2, r=8 fixed regardless of the dot's own drawn radius — `hoverable(x, y, 8, 2,
+    ...)`, console.html:1188 — `gHits` is the 5th `<g>`), and the hypothesis centre (rank 3,
+    r=6, the `r="5"` circle appended to `gLab`, the 6th `<g>`). `marks[]` itself lives in a
+    closure with no window handle, so this is the only way a test can reconstruct it without
+    editing console.html to expose one."""
+    return browser.evaluate("""
+      (() => {
+        const ideas = [...document.querySelectorAll('svg > g:nth-of-type(4) circle.ideanode')]
+          .map((c) => ({ cx: +c.getAttribute('cx'), cy: +c.getAttribute('cy'),
+                         r: +c.getAttribute('r') }));
+        const hits = [...document.querySelectorAll('svg > g:nth-of-type(5) circle')]
+          .map((c) => ({ cx: +c.getAttribute('cx'), cy: +c.getAttribute('cy') }));
+        const centerCircle = [...document.querySelectorAll('svg > g:nth-of-type(6) circle')]
+          .find((c) => c.getAttribute('r') === '5');
+        return { ideas, hits,
+                 center: centerCircle
+                   ? { cx: +centerCircle.getAttribute('cx'), cy: +centerCircle.getAttribute('cy') }
+                   : null };
+      })()
+    """)
+
+
+def _nearest_mark_score(marks, x, y):
+    """Python-side copy of `nearestMark()` (console.html:845-852) — same formula
+    (`hypot(dx, dy) - r - rank * 3`), so a probe point's score can be computed and checked
+    BEFORE ever touching the browser, rather than hunted for empirically on screen (which
+    `verify_five.py`-style scripts in this project's own history warned reads as "almost any
+    point is within both radii on 3 040 dense leaves" — the leaf layer is disabled by every
+    caller here for exactly that reason)."""
+    best, best_score = None, float("inf")
+    for m in marks:
+        s = math.hypot(m[0] - x, m[1] - y) - m[2] - m[3] * 3
+        if s < best_score:
+            best_score, best = s, m
+    return best, best_score
+
+
+def find_radius_probe_point(browser: Browser):
+    """A VIEW-space point, constructed rather than searched for by luck, that sits strictly
+    BETWEEN the two search radii §2.3 specifies (9 px mouse, 18 px touch): exactly
+    `idea.r + 15` from some idea node's own centre, along whichever of 24 angles first lands
+    with that SAME idea as the nearest mark and a `nearestMark` score of `15 - 1*3 = 12`
+    (`9 < 12 < 18`) once EVERY other visible mark (every other idea, every hit, the
+    hypothesis centre) is checked too — not assumed clear. Requires "точки-листья" already
+    unchecked (dense leaves would put a closer, lower-rank mark within the gap and make no
+    such point exist at all — see `dial_marks_geometry`'s docstring). Returns
+    `(screen_x, screen_y, idea)` for the caller to hover and then tap at the exact same spot.
+    Raises if the current draw genuinely has no such point (extremely unlikely with dozens
+    of idea nodes, but a raise here is the honest outcome, not a silent skip)."""
+    geo = dial_marks_geometry(browser)
+    marks = ([(i["cx"], i["cy"], i["r"], 1) for i in geo["ideas"]]
+             + [(h["cx"], h["cy"], 8, 2) for h in geo["hits"]]
+             + ([(geo["center"]["cx"], geo["center"]["cy"], 6, 3)] if geo["center"] else []))
+    for idea in geo["ideas"]:
+        target = (idea["cx"], idea["cy"], idea["r"], 1)
+        for deg in range(0, 360, 15):
+            theta = math.radians(deg)
+            vx = idea["cx"] + (idea["r"] + 15) * math.cos(theta)
+            vy = idea["cy"] + (idea["r"] + 15) * math.sin(theta)
+            best, score = _nearest_mark_score(marks, vx, vy)
+            if best == target and 9 < score < 18:
+                sx, sy = view_to_screen(dial_svg_view_box(browser), vx, vy)
+                return sx, sy, idea
+    raise AssertionError(
+        "no VIEW-space point found with a nearestMark score strictly between the mouse (9px) "
+        "and touch (18px) search radii — cannot prove the two radii differ on this draw")
+
+
+def _draw_dial_for_touch_tests(browser: Browser, base_url: str, hypothesis: str, leaves=False):
+    """Shared setup for every test below: a fresh `#dial` load, a hypothesis, "Разложить",
+    and (by default) "точки-листья" unchecked — see `dial_marks_geometry`'s docstring for
+    why the touch/radius tests need the leaf layer off. Idea nodes only exist once
+    `withGraph` (checked by default) has actually resolved, hence the wait on
+    `circle.ideanode`, not just on the SVG's existence."""
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", hypothesis)
+    if not leaves:
+        click_checkbox_with_label(browser, "точки-листья")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
+
+
+def _card_hidden(browser: Browser) -> bool:
+    return browser.evaluate(
+        "document.querySelector('.hovercard')?.classList.contains('hide') ?? true")
+
+
+def _card_text(browser: Browser) -> str:
+    return browser.evaluate("document.querySelector('.hovercard')?.textContent ?? ''")
+
+
+@test("mouse_hover_shows_card_and_leave_hides_it")
+def test_mouse_hover_shows_card_and_leave_hides_it(browser: Browser, base_url: str):
+    """§2.3's mouse half, never actually exercised by an automated test before this one
+    (`click_idea_node_opens_it_on_first_load` proves the CLICK path, not hover) — a real
+    `pointermove` (`hover_point`, no press) over an idea node must show the `.hovercard` with
+    that idea's own text, and moving the mouse back off the SVG entirely must hide it again.
+    Checks `event.pointerType` was actually `"mouse"` for the hover itself (installed on the
+    page before hovering) so a pass here cannot be an accident of some OTHER input type being
+    let through by a broken guard.
+
+    Catches the exact regression `console.html:1282` guards against reverting: swapping the
+    listener back from `pointermove` to `mousemove` leaves the real `MouseEvent` with no
+    `.pointerType` property at all (`undefined !== "mouse"` in the handler's own guard is
+    `true`), so the card never shows — proven by mutation, see this task's write-up."""
+    _draw_dial_for_touch_tests(browser, base_url, "e2e mouse hover probe")
+    sx, sy, idea = find_radius_probe_point(browser)
+    # Actually hover the mark's own centre (inside its radius, score deeply negative — well
+    # within 9px), not the constructed probe point above (that one is deliberately just
+    # OUTSIDE the mouse radius, see the dedicated radius test below).
+    sx_center, sy_center = view_to_screen(dial_svg_view_box(browser), idea["cx"], idea["cy"])
+
+    browser.evaluate("""
+      window.__e2e_pointer_types = [];
+      document.querySelector('.graphwrap svg').addEventListener('pointermove',
+        (e) => window.__e2e_pointer_types.push(e.pointerType));
+    """)
+    browser.hover_point(sx_center, sy_center)
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+    assert "идея" in _card_text(browser), (
+        f".hovercard is visible but does not read as an idea mark: {_card_text(browser)!r}")
+    seen_types = browser.evaluate("window.__e2e_pointer_types")
+    assert seen_types and all(t == "mouse" for t in seen_types), (
+        f"hover_point's pointermove events were not all pointerType 'mouse': {seen_types!r}")
+
+    browser.hover_point(5, 5)   # top-left corner of the whole page, well outside the svg
+    browser.wait_for("document.querySelector('.hovercard')?.classList.contains('hide') === true",
+                      timeout=5)
+
+
+@test("touch_tap_shows_card_via_real_pointer_events")
+def test_touch_tap_shows_card_via_real_pointer_events(browser: Browser, base_url: str):
+    """§2.3's headline requirement: a real finger tap (not a mouse click wearing a touch
+    costume) must show the hovercard, with NO hover involved at all. `Browser.tap()` drives
+    `Input.dispatchTouchEvent` directly — confirmed BEFORE writing this test (not assumed) by
+    reading `event.pointerType` straight off the page during a real `tap()`, both with and
+    without `set_device(touch=True)` active: both read back `"touch"` on `pointerdown` (see
+    this task's write-up) — so this asserts the same thing the task demanded proven, on the
+    page, every run, not just once by hand.
+
+    Catches: `pointermove`/`pointerdown` reverted to `mousemove`/`mousedown` (a tap never
+    fires either — no card, this test times out on the `wait_for` below with a plain,
+    readable message, not a silent pass)."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e touch tap probe")
+
+    browser.evaluate("""
+      window.__e2e_pointer_types = [];
+      document.querySelector('.graphwrap svg').addEventListener('pointerdown',
+        (e) => window.__e2e_pointer_types.push(e.pointerType));
+    """)
+    pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    assert pt, "no idea node is reachable by a real tap at all"
+    browser.tap(pt["x"], pt["y"])
+
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+    text = _card_text(browser)
+    assert "идея" in text, (
+        f"a tap on an idea node did not show the idea's own hovercard text: {text!r}")
+    # "идея" + "клик" alone is true of the PRE-§2.3 text too ("...клик — открыть", see
+    # 90cdbe3:lake/api/console.html:879) — a straight revert to single-click-opens keeps
+    # both substrings and this assertion never notices. Assert the half of the wording that
+    # is true on a phone and ABSENT from that old text instead: the old text never mentions
+    # a touch screen or a second tap at all, because under it one tap already opened the
+    # idea. (If this wording changes again, keep asserting "the head names the touch flow's
+    # own two-tap requirement", not this exact string — a check tied to one literal phrase
+    # is the same trap this replaces, just with new bait.)
+    assert "тач-экране" in text and "второй тап" in text, (
+        f"a tap on an idea node's hovercard does not name the touch screen's own two-tap "
+        f"requirement: {text!r} — indistinguishable from the pre-§2.3 'клик — открыть' text, "
+        f"which also contains 'идея' and 'клик' but describes a single click, not a phone")
+    seen_types = browser.evaluate("window.__e2e_pointer_types")
+    assert seen_types == ["touch"], (
+        f"the tap's own pointerdown was not genuinely pointerType 'touch': {seen_types!r} — "
+        f"a test that drives a mouse click and calls it a finger is worse than no test")
+
+
+@test("touch_second_tap_opens_idea")
+def test_touch_second_tap_opens_idea(browser: Browser, base_url: str):
+    """§2.3: "тап по метке — показать карточку; тап по той же метке второй раз — открыть
+    идею". Two real taps at the SAME screen point on an idea node: the first shows the card
+    (checked, so a false pass cannot come from the second tap alone happening to open
+    something by coincidence), the second opens the idea via the normal `openIdea()` path —
+    reuses `_assert_idea_link_worked` (hash, active tab, rendered heading), the same
+    three-part proof every other "does this actually open the idea" test in this file uses.
+
+    Catches: the `best === lastTapMark && best.openId` branch's `openIdea(best.openId)` call
+    (console.html:1305) removed or short-circuited — two taps land on the same mark, the card
+    keeps showing, `location.hash` never changes, and `_assert_idea_link_worked`'s own
+    `wait_for` times out with a readable reason instead of a bare truthiness check."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e touch second-tap probe")
+
+    pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    assert pt, "no idea node is reachable by a real tap at all"
+    browser.tap(pt["x"], pt["y"])
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+    assert "идея" in _card_text(browser), "first tap did not show the idea's hovercard"
+
+    browser.tap(pt["x"], pt["y"])
+    problems = []
+    _assert_idea_link_worked(browser, "dial node, second tap", problems)
+    assert not problems, "; ".join(problems)
+
+
+@test("touch_tap_elsewhere_hides_card")
+def test_touch_tap_elsewhere_hides_card(browser: Browser, base_url: str):
+    """§2.3: "тап мимо — скрыть". A tap on an idea node shows its card; a second tap far from
+    every mark (the SVG's own bottom-left corner, well outside the disc's `R + 42`-ish drawn
+    radius, checked via `elementFromPoint` landing on the `<svg>` itself and not on some
+    decorative element so the tap is known to have actually landed inside the graph) must
+    hide it — the same guarantee the mouse side already gets from `pointerleave`, but reached
+    here with no `:hover`, no `leave` event at all, just two taps. The BOTTOM edge, not the
+    top: at 390px width `header.bar` overlaps the top of the drawn disc (§0.3's own,
+    separate, already-known bug — this test does not re-litigate it, just avoids landing a
+    tap on the header by accident and mistaking that for proof of anything).
+
+    Catches: `showMark`'s `if (!best || bestScore > radius) { hideCard(); return null; }`
+    (console.html:1238) with the `hideCard()` call dropped — the card would stay on screen
+    showing the FIRST mark's text after a tap that hit nothing, and this test's own
+    `wait_for` on the 'hide' class times out rather than passing on a stale screenshot.
+
+    Also catches the miss branch's OTHER effect, `lastTapMark = null` (console.html:1303),
+    dropped on its own: nothing about a stale card would look wrong on screen for that one —
+    `hideCard()` alone still runs — so a third tap back on the SAME idea node is required to
+    tell. Without the reset, that mark object is still sitting in `lastTapMark` from the
+    first tap, so `best === lastTapMark` reads true immediately and the idea opens on this
+    ONE tap with no card shown first — exactly the "read the card, then confirm" flow §2.3
+    asks for, collapsed back into a single tap. Checked here as "still just a card, hash
+    unmoved", the same `_assert_idea_link_worked`-style proof used everywhere else in this
+    file that an idea did NOT quietly open."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e touch tap-elsewhere probe")
+
+    pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    assert pt, "no idea node is reachable by a real tap at all"
+    hash_before = browser.evaluate("location.hash")
+    browser.tap(pt["x"], pt["y"])
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+
+    corner = browser.evaluate("""
+      (() => {
+        const svg = document.querySelector('.graphwrap svg');
+        svg.scrollIntoView({block: 'center', inline: 'center'});
+        const box = svg.getBoundingClientRect();
+        const x = box.left + 15, y = box.bottom - 15;
+        return document.elementFromPoint(x, y) === svg ? { x, y } : null;
+      })()
+    """)
+    assert corner, "the svg's own top-left corner is not hittable — cannot prove 'tap elsewhere'"
+    browser.tap(corner["x"], corner["y"])
+    browser.wait_for("document.querySelector('.hovercard')?.classList.contains('hide') === true",
+                      timeout=5)
+
+    # Re-resolved, not the original `pt`: the corner probe's own `scrollIntoView` just moved
+    # the page, so `pt`'s absolute viewport coordinates no longer land on the same idea node
+    # — same selector, same (unredrawn) DOM node, freshly re-centred.
+    pt2 = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    assert pt2, "the idea node stopped being tappable after the miss-tap's own scroll"
+    browser.tap(pt2["x"], pt2["y"])
+    # Waits for EITHER outcome, not just the expected one: if `lastTapMark` survived the
+    # miss, this tap opens the idea directly (`hideCard()` inside that branch flips the card
+    # back to 'hide' just as fast as a normal show would flip it to visible) — a `wait_for`
+    # that only polls for the card becoming visible would then sit until its own timeout and
+    # fail with a generic "never became truthy", burying the actual, named assertion below
+    # under an unrelated message. Waiting for "card shown OR hash moved" lets whichever one
+    # actually happened resolve this quickly, so the hash assertion below is the thing that
+    # runs and fails, not a `wait_for` that never gets there.
+    browser.wait_for(
+        "!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true) || "
+        "location.hash !== " + json.dumps(hash_before), timeout=5)
+    assert browser.evaluate("location.hash") == hash_before, (
+        "a tap on the same idea node, right after a miss, opened the idea on ONE tap — "
+        "the miss did not reset lastTapMark, so the mark from before the miss was still "
+        "'confirmed' by this tap instead of just showing its card again")
+
+
+@test("touch_search_radius_is_wider_than_mouse_radius")
+def test_touch_search_radius_is_wider_than_mouse(browser: Browser, base_url: str):
+    """§2.3: "радиус поиска ближайшей метки: 9 px мышью, 18 px пальцем" — the one claim in
+    the spec that is a NUMBER, not a behaviour, and so is the one most easily reverted to a
+    single shared constant without anything on screen visibly breaking. Proven with a point,
+    constructed (not searched for by hand) to have a `nearestMark` score of exactly 12 —
+    strictly between the two radii (`find_radius_probe_point`'s docstring has the geometry):
+    a real mouse hover there must NOT show a card (12 > 9), a real tap at such a point must
+    show one (12 < 18).
+
+    NOT the same physical point for both halves, on purpose: `set_device(touch=True)` also
+    flips `Emulation.setEmitTouchEventsForMouse`, which on this Chromium turns every
+    `hover_point()`'s `dispatchMouseEvent` into a synthetic touch sequence instead — the page
+    never receives a `pointerType: "mouse"` `pointermove` at all, so `_card_hidden()` would be
+    true no matter what the mouse radius actually is (confirmed live: hovering the idea
+    node's own centre under that device left the card hidden and the page's own pointermove
+    listener recorded nothing). So the mouse half runs on a plain, non-touch viewport, and
+    the touch half runs on the real phone viewport, each with its own freshly-drawn probe
+    point — two independent constructions of the same "score strictly between 9 and 18"
+    geometry, one proven not to show a card on a genuine mouse-only device, the other proven
+    to show one on a genuine touch device.
+
+    Catches: the touch handler's own `showMark(vx, vy, 18)` (console.html:1302) reverted to
+    `showMark(vx, vy, 9)` — the tap half of this test would then also miss, and the assertion
+    names the exact score and both radii rather than just failing blind. Also catches the
+    OTHER half of the same guarantee: the `pointermove` listener's own
+    `if (event.pointerType !== "mouse") return` (console.html:1292) dropped. A stationary
+    `tap()` alone can never reach that — confirmed live: a motionless touch fires
+    `pointerdown`/`pointerup` only, no `pointermove` at all — so the tap is followed by one
+    real `touchMove` of a couple of px (`tap_and_drag`), the only way to get an actual
+    `pointerType: "touch"` `pointermove` onto the page. With the guard in place that event is
+    ignored; with it dropped, it falls into the mouse branch and calls `showMark(vx, vy, 9)`
+    at a point whose score sits strictly between 9 and 18 — that call finds nothing within
+    9px and hides the very card `pointerdown` just showed."""
+    browser.set_device(1440, 900, mobile=False, touch=False)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e touch radius probe (mouse)")
+    sx, sy, idea = find_radius_probe_point(browser)
+    browser.hover_point(sx, sy)
+    assert _card_hidden(browser), (
+        f"a mouse hover at a point with nearestMark score in (9, 18) (idea {idea!r}) showed "
+        f"a card — the mouse radius is no longer 9px")
+
+    browser.set_device(390, 844, mobile=True, touch=True)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e touch radius probe (touch)")
+    sx, sy, idea = find_radius_probe_point(browser)
+    browser.tap_and_drag(sx, sy, dx=1, dy=1)
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+    assert "идея" in _card_text(browser), (
+        f"a tap (with a 1px touchmove) at a point with nearestMark score in (9, 18) "
+        f"(idea {idea!r}) did not show that idea's own card — either the touch radius is no "
+        f"longer wider than the mouse's, or the touch pointermove's own mouse-only guard is "
+        f"gone and a nearby mouse-radius(9) miss hid the card `pointerdown` just showed")
+
+
+@test("hovercard_pinned_to_bottom_below_620px")
+def test_hovercard_pinned_to_bottom_below_620px(browser: Browser, base_url: str):
+    """§2.3: "при max-width:620 карточка… прижимается к низу экрана на всю ширину". Checked
+    both ways — at 390px (phone) the card's rendered geometry must be a fixed, full-width
+    strip pinned to the viewport's bottom edge regardless of where the tap landed, and at
+    1440px (desktop) the SAME code path (mouse hover, not touch — the desktop case) must
+    still place the card NEAR the hovered mark, not pinned — proving the pin is genuinely
+    gated on viewport width and not just always-on. `getComputedStyle` is read, not the
+    inline `style.left/top` JS still sets (console.html:1276-1277) — the point is that CSS's
+    `!important` (console.html:183-187) is what actually wins on screen.
+
+    Catches: the `@media (max-width:620px){ .hovercard{ position:fixed!important; ... } }`
+    block deleted — at 390px the card would fall back to `position:absolute` and track the
+    tap point instead of pinning to the bottom, and this test's `computed.position` /
+    `rect.bottom` assertions name exactly which of those two facts stopped holding."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e hovercard pin probe")
+    pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    assert pt, "no idea node is reachable by a real tap at all"
+    browser.tap(pt["x"], pt["y"])
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+
+    geo = browser.evaluate("""
+      (() => {
+        const card = document.querySelector('.hovercard');
+        const cs = getComputedStyle(card);
+        const r = card.getBoundingClientRect();
+        return { position: cs.position, left: r.left, right: r.right, bottom: r.bottom,
+                 width: r.width, innerWidth: window.innerWidth, innerHeight: window.innerHeight };
+      })()
+    """)
+    assert geo["position"] == "fixed", (
+        f"at 390px width, .hovercard's computed position is {geo['position']!r}, want 'fixed'")
+    assert abs(geo["left"]) < 1 and abs(geo["width"] - geo["innerWidth"]) < 1, (
+        f".hovercard at 390px is not full-width: left={geo['left']}, width={geo['width']}, "
+        f"innerWidth={geo['innerWidth']}")
+    assert abs(geo["bottom"] - geo["innerHeight"]) < 1, (
+        f".hovercard at 390px is not pinned to the bottom edge: bottom={geo['bottom']}, "
+        f"innerHeight={geo['innerHeight']}")
+
+    browser.clear_device()
+    browser.set_device(1440, 900, mobile=False, touch=False)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e hovercard pin probe wide")
+    idea = dial_marks_geometry(browser)["ideas"][0]
+    sx_center, sy_center = view_to_screen(dial_svg_view_box(browser), idea["cx"], idea["cy"])
+    browser.hover_point(sx_center, sy_center)
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+    wide_geo = browser.evaluate("""
+      (() => { const card = document.querySelector('.hovercard');
+                const cs = getComputedStyle(card);
+                const r = card.getBoundingClientRect();
+                return { position: cs.position, bottom: r.bottom, width: r.width,
+                         innerHeight: window.innerHeight }; })()
+    """)
+    assert wide_geo["position"] != "fixed", (
+        f"at 1440px width, .hovercard's computed position is {wide_geo['position']!r} — the "
+        f"phone-only pin is leaking into desktop")
+    assert wide_geo["width"] < 400, (
+        f".hovercard at 1440px is {wide_geo['width']}px wide — looks like the full-width "
+        f"phone strip, not the small card next to the pointer")
+
+
+@test("touch_screens_never_match_hover_hover")
+def test_touch_screens_never_match_hover_hover(browser: Browser, base_url: str):
+    """§2.3: "`@media (hover:hover)` — снять `:hover`-эффекты, которые на тач-экране
+    залипают (`table.tbl tr:hover`, `circle.ideanode:hover`)". `window.matchMedia` is the
+    same signal those two CSS rules (console.html:101, :170) are gated on, read directly from
+    the page instead of re-deriving it from screenshots — a touch/mobile-emulated viewport
+    must report `hover: none` / `pointer: coarse`, and a real desktop viewport must report
+    `hover: hover`, so the CSS actually stops applying on one and keeps applying on the
+    other rather than being gated on something that never differs in this environment.
+
+    Not a mutation-guarded test (the CSS gate itself is Chrome's own media-feature
+    evaluation, not application logic this suite can break with an edit) — it exists to
+    catch the two `@media (hover:hover)` blocks being removed entirely, at which point
+    `table.tbl tr:hover td` / `circle.ideanode:hover` apply unconditionally again and this
+    test's own read of the STYLESHEET (not just the media feature) below would stop finding
+    them scoped."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    browser.goto(f"{base_url}/ui#theses")
+    browser.wait_for("document.querySelector('#main table.tbl') !== null", timeout=10)
+    touch_hover = browser.evaluate("window.matchMedia('(hover: hover)').matches")
+    assert touch_hover is False, (
+        f"matchMedia('(hover: hover)') is {touch_hover!r} on a touch/mobile-emulated "
+        f"viewport, want False — table/idea-node hover CSS would apply unconditionally")
+
+    browser.clear_device()
+    browser.goto(f"{base_url}/ui#theses")
+    browser.wait_for("document.querySelector('#main table.tbl') !== null", timeout=10)
+    mouse_hover = browser.evaluate("window.matchMedia('(hover: hover)').matches")
+    assert mouse_hover is True, (
+        f"matchMedia('(hover: hover)') is {mouse_hover!r} on a plain desktop viewport, want "
+        f"True — this environment cannot tell hover-gated CSS apart from unconditional CSS "
+        f"if this ever goes False here too")
+
+    gated = browser.evaluate("""
+      (() => {
+        let sawTr = false, sawIdeanode = false;
+        for (const sheet of document.styleSheets) {
+          for (const rule of sheet.cssRules) {
+            if (rule instanceof CSSMediaRule && /hover\\s*:\\s*hover/.test(rule.conditionText || rule.media.mediaText)) {
+              const text = [...rule.cssRules].map((r) => r.selectorText).join(' ');
+              if (text.includes('tr:hover')) sawTr = true;
+              if (text.includes('ideanode:hover')) sawIdeanode = true;
+            }
+          }
+        }
+        return { sawTr, sawIdeanode };
+      })()
+    """)
+    assert gated["sawTr"], (
+        "no @media(hover:hover) block contains a 'tr:hover' rule — table.tbl tr:hover is not "
+        "gated, and would stick on a touch tap with no pointer left to leave")
+    assert gated["sawIdeanode"], (
+        "no @media(hover:hover) block contains an 'ideanode:hover' rule — "
+        "circle.ideanode:hover is not gated, and would stick on a touch tap with no pointer "
+        "left to leave")
+
+
+@test("mouse_miss_inside_svg_hides_card")
+def test_mouse_miss_inside_svg_hides_card(browser: Browser, base_url: str):
+    """§2.3's mouse-miss branch, proven with the pointer still INSIDE the svg's own bounding
+    box — `mouse_hover_shows_card_and_leave_hides_it`, above, only ever leaves the card by
+    moving the mouse to (5, 5), well outside the svg entirely, which hides the card through
+    the completely separate `pointerleave` listener and never touches `showMark`'s own
+    `if (!best || bestScore > radius) { hideCard(); ... }` branch at all. This hovers the
+    svg's own bottom-left corner instead — `elementFromPoint` confirmed to land on the
+    `<svg>` itself, the exact corner `touch_tap_elsewhere_hides_card` already trusts for the
+    touch side of the same claim — reached via `pointermove`, with no `pointerleave` in
+    between, so a card left over from an earlier hover can only have gone away through
+    `showMark`'s own miss branch.
+
+    Catches: `hideCard()` inside `showMark`'s miss branch gated to only the touch/pen
+    `pointerdown` caller (e.g. behind `radius === 18`) — the mouse's own miss (radius 9)
+    would then leave the previous mark's card on screen, reading as if the pointer still
+    sat over that mark while it visibly does not."""
+    browser.set_device(1440, 900, mobile=False, touch=False)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e mouse miss-inside-svg probe")
+    geo = dial_marks_geometry(browser)
+    # A hit that lands "on its own idea" is drawn at that idea's EXACT (cx, cy) — same
+    # point, but rank 2 (hit) beats rank 1 (idea) in `nearestMark`'s score, so hovering
+    # `ideas[0]` (the highest-cosine idea, i.e. the one most likely to also be a top hit)
+    # would show the HIT's card instead and this assertion would never even get to run.
+    # Picking any idea whose position no hit shares sidesteps that entirely — which mark
+    # this shows is not what this test is about, only that hovering IT shows a card.
+    hit_positions = {(round(h["cx"], 1), round(h["cy"], 1)) for h in geo["hits"]}
+    idea = next((i for i in geo["ideas"]
+                 if (round(i["cx"], 1), round(i["cy"], 1)) not in hit_positions), None)
+    assert idea, "every visible idea node coincides with a hit mark — cannot isolate a plain hover"
+    sx, sy = view_to_screen(dial_svg_view_box(browser), idea["cx"], idea["cy"])
+    browser.hover_point(sx, sy)
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+
+    corner = browser.evaluate("""
+      (() => {
+        const svg = document.querySelector('.graphwrap svg');
+        svg.scrollIntoView({block: 'center', inline: 'center'});
+        const box = svg.getBoundingClientRect();
+        const x = box.left + 15, y = box.bottom - 15;
+        return document.elementFromPoint(x, y) === svg ? { x, y } : null;
+      })()
+    """)
+    assert corner, "the svg's own bottom-left corner is not hittable — cannot prove 'miss inside svg'"
+    browser.hover_point(corner["x"], corner["y"])
+    browser.wait_for("document.querySelector('.hovercard')?.classList.contains('hide') === true",
+                      timeout=5)
+
+
+@test("hit_mark_second_tap_does_not_open_idea")
+def test_hit_mark_second_tap_does_not_open_idea(browser: Browser, base_url: str):
+    """`openId` is set ONLY for idea nodes (console.html's own comment on `hoverable`, right
+    above where `marks` is built) — a hit mark (the numbered dots on the spokes to the
+    centre) is handed none, so two real taps on the SAME hit mark must just keep showing its
+    card, never move `location.hash`. Proven against the hit marks' own geometry
+    (`svg > g:nth-of-type(5) circle`, the same selector `dial_marks_geometry`'s `hits` reads
+    — `gHits` is the 5th `<g>` `drawDial` appends), not an idea node, so a guard that only
+    checks 'is this the idea `<circle>`'s own click listener' rather than 'does this
+    PARTICULAR mark carry an `openId`' cannot pass by accident.
+
+    Catches: the hit marks' own `hoverable(x, y, 8, 2, head, hit.text)` call (console.html,
+    inside `data.hits.forEach`) handed a fifth argument it was never meant to carry (e.g.
+    `hit.idea_id`) — a second tap on the mark would then satisfy
+    `best === lastTapMark && best.openId` same as an idea node, and `location.hash` would
+    move to `#ideas/...` for a mark nothing on screen ever named as an idea."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e hit mark second-tap probe")
+
+    pt = find_hittable_point(browser, "svg > g:nth-of-type(5) circle")
+    assert pt, "no hit mark is reachable by a real tap at all"
+    hash_before = browser.evaluate("location.hash")
+
+    browser.tap(pt["x"], pt["y"])
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+    assert "cos" in _card_text(browser), "first tap on a hit mark did not show its own hovercard"
+
+    browser.tap(pt["x"], pt["y"])
+    assert browser.evaluate("location.hash") == hash_before, (
+        "a second tap on a HIT mark (not an idea node) moved location.hash — hit marks carry "
+        "no openId, and a second tap on one must never call openIdea()")
+    assert not _card_hidden(browser), (
+        "a second tap on a hit mark hid its card instead of just showing it again — a mark "
+        "with no openId should behave exactly like the first tap, every time")
+
+
+@test("pen_second_tap_opens_idea")
+def test_pen_second_tap_opens_idea(browser: Browser, base_url: str):
+    """§2.3's two-tap flow gates on `hasHover` (console.html) being false, not on
+    `pointerType === "touch"` specifically — a real stylus tap reports `pointerType: "pen"`
+    on both its `pointerdown` and its own synthetic `click` (Chromium; confirmed below by
+    reading `event.pointerType` back off the page, not assumed), which is exactly why the
+    click guard used to read `if (event.pointerType === "touch") return;` and a pen's click
+    (`!== "touch"`) sailed straight through the two-tap flow that guard was meant to gate.
+    Drives a REAL pen via `Browser.pen_tap` (`Input.dispatchMouseEvent` with
+    `pointerType: "pen"`), not a mouse click wearing a pen label.
+
+    Catches: `hasHover`'s single `=== "mouse"` comparison reverted back to a per-listener
+    `!== "touch"` (or `=== "touch"`) pair — a pen's click passes THAT condition, so the idea
+    opens on the FIRST tap with no card shown first, and `location.hash` moves before this
+    test's own first assertion ever runs."""
+    _draw_dial_for_touch_tests(browser, base_url, "e2e pen second-tap probe")
+
+    pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    assert pt, "no idea node is reachable by a real tap at all"
+    hash_before = browser.evaluate("location.hash")
+
+    browser.evaluate("""
+      window.__e2e_pen_types = [];
+      document.querySelector('.graphwrap svg').addEventListener('pointerdown',
+        (e) => window.__e2e_pen_types.push(e.pointerType));
+    """)
+    browser.pen_tap(pt["x"], pt["y"])
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+    assert "идея" in _card_text(browser), "first pen tap did not show the idea's own hovercard"
+    assert browser.evaluate("location.hash") == hash_before, (
+        "a SINGLE pen tap on an idea node already moved location.hash — the pen's synthetic "
+        "click is bypassing the two-tap flow (hasHover must treat 'pen' the same as 'touch')")
+    seen_types = browser.evaluate("window.__e2e_pen_types")
+    assert seen_types == ["pen"], (
+        f"pen_tap's own pointerdown was not genuinely pointerType 'pen': {seen_types!r} — "
+        f"a test that drives a mouse and calls it a pen is worse than no test")
+
+    browser.pen_tap(pt["x"], pt["y"])
+    problems = []
+    _assert_idea_link_worked(browser, "dial node, second pen tap", problems)
+    assert not problems, "; ".join(problems)
+
+
+@test("pen_tap_after_other_hide_does_not_open")
+def test_pen_tap_after_other_hide_does_not_open(browser: Browser, base_url: str):
+    """The other half of the same guard: once the card has been hidden by a COMPLETELY
+    different pointer path than the miss-tap `touch_tap_elsewhere_hides_card` already covers
+    — here, a genuine mouse hovering away, which hides the card through the `pointerleave`
+    listener, an input type the pen tap that armed the mark never touches — a further SINGLE
+    pen tap on the SAME idea node must only show its card again, not open it. Proves
+    `lastTapMark` is disarmed by `hideCard()` ITSELF, for every caller that can hide the
+    card, not merely the one path (`showMark`'s own miss branch) the existing touch test
+    happens to exercise.
+
+    Catches: `lastTapMark = null` living only inside the specific branch that used to call
+    it (e.g. reverted to sit solely in `showMark`'s miss case, or in the `pointerdown` open
+    branch, rather than inside `hideCard()` itself, which every hide path already calls) —
+    with the reset scoped that narrowly, a mark armed by a pen tap and then hidden by an
+    unrelated mouse `pointerleave` would still be sitting in `lastTapMark`, so this second
+    pen tap would open the idea on ONE tap instead of just showing its card."""
+    browser.set_device(1440, 900, mobile=False, touch=False)
+    _draw_dial_for_touch_tests(browser, base_url, "e2e pen cross-input disarm probe")
+
+    pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    assert pt, "no idea node is reachable by a real tap at all"
+    hash_before = browser.evaluate("location.hash")
+
+    browser.pen_tap(pt["x"], pt["y"])
+    browser.wait_for("!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true)",
+                      timeout=5)
+    assert "идея" in _card_text(browser), "the arming pen tap did not show the idea's card"
+
+    browser.hover_point(5, 5)   # a real mouse, well outside the svg — pointerleave, not a miss-tap
+    browser.wait_for("document.querySelector('.hovercard')?.classList.contains('hide') === true",
+                      timeout=5)
+
+    browser.pen_tap(pt["x"], pt["y"])
+    browser.wait_for(
+        "!(document.querySelector('.hovercard')?.classList.contains('hide') ?? true) || "
+        "location.hash !== " + json.dumps(hash_before), timeout=5)
+    assert browser.evaluate("location.hash") == hash_before, (
+        "a pen tap on an idea node, right after the card was hidden by an UNRELATED mouse "
+        "pointerleave, opened the idea on ONE tap — lastTapMark survived a hide it was not "
+        "reset by, so a stale mark from before that hide was still 'confirmed' by this tap")
 
 
 # ================================================================================ main

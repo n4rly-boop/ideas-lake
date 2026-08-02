@@ -96,7 +96,9 @@ table.tbl th{text-align:left;font-size:11px;letter-spacing:.07em;text-transform:
   position:sticky;top:0;background:var(--surface)}
 table.tbl td{padding:9px 10px;border-bottom:1px solid var(--hair);color:var(--ink-2);
   vertical-align:top}
-table.tbl tr:hover td{background:var(--surface-2)}
+/* §2.3: gated on hover:hover, not applied unconditionally — a touch tap leaves the row
+   "stuck" hovered on hover:none screens otherwise, since there is no pointer to leave. */
+@media (hover:hover){table.tbl tr:hover td{background:var(--surface-2)}}
 table.tbl td.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
 .scroller{overflow:auto;max-height:60vh;border:1px solid var(--hair);border-radius:10px}
 .pager{display:flex;gap:10px;align-items:center;margin-top:10px;font-size:12.5px;color:var(--muted)}
@@ -165,7 +167,7 @@ svg.graph text.ringlab,svg.graph text.hitlab{pointer-events:none;paint-order:str
 svg.graph text.ringlab{fill:var(--ink-2);font-size:10px;font-variant-numeric:tabular-nums}
 svg.graph text.hitlab{fill:var(--ink);font-size:11.5px}
 svg.graph circle.ideanode{cursor:pointer}
-svg.graph circle.ideanode:hover{stroke:var(--s2);stroke-width:2.5}
+@media (hover:hover){svg.graph circle.ideanode:hover{stroke:var(--s2);stroke-width:2.5}}
 svg.graph text.hitrank{fill:#fff;font-size:9.5px;font-weight:600;pointer-events:none}
 svg.graph circle.hoverring{pointer-events:none}
 .hovercard{position:absolute;z-index:5;max-width:340px;pointer-events:none;
@@ -174,6 +176,15 @@ svg.graph circle.hoverring{pointer-events:none}
 .hovercard .hc-head{color:var(--muted);font-size:11px;margin-bottom:4px;
   font-variant-numeric:tabular-nums}
 .hovercard .hc-body{color:var(--ink);white-space:pre-wrap}
+/* §2.3: a finger covers whatever is under it, so the card cannot follow the touch point
+   the way it follows the mouse — pinned to the bottom edge instead, full width. JS still
+   sets .style.left/top for pointer-type "touch" (harmless elsewhere); !important here wins
+   over that inline style at this breakpoint only. */
+@media (max-width:620px){
+  .hovercard{position:fixed!important;left:0!important;right:0!important;bottom:0!important;
+    top:auto!important;max-width:none!important;width:100%!important;
+    border-radius:12px 12px 0 0;box-sizing:border-box}
+}
 .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--ink-2);
   align-items:center}
 .sw{width:11px;height:11px;border-radius:3px;background:var(--muted);display:inline-block}
@@ -1004,6 +1015,13 @@ view("dial", "Гипотеза", (host, ctx) => {
       return node;
     };
     const tip = (parent, txt) => { const t = mk("title"); t.textContent = txt; parent.append(t); };
+    // §2.3, one rule, one place: mouse is the only pointer type with a hover concept — pen
+    // and touch are both "no hover" and go through the same tap flow below. Every listener
+    // in this function that branches on pointer type calls this instead of repeating the
+    // comparison, so the rule cannot drift into two different conditions again (it did:
+    // the click guard below used to check `=== "touch"`, letting a pen's synthetic click
+    // straight through the two-tap flow it was meant to be gated by).
+    const hasHover = (event) => event.pointerType === "mouse";
     const svg = mk("svg", { class: "graph", viewBox: `0 0 ${w} ${h}` });
     const gRings = mk("g"), gPts = mk("g"), gEdges = mk("g"), gIdeas = mk("g"),
           gHits = mk("g"), gLab = mk("g");
@@ -1047,8 +1065,9 @@ view("dial", "Гипотеза", (host, ctx) => {
     // rather than by :hover on the element: a leaf is 1.5 px across, and a target that
     // small is one nobody can point at.
     const marks = [];
-    const hoverable = (x, y, r, rank, head, body, leaf = null) =>
-      marks.push({ x, y, r, rank, head, body, leaf });
+    // `openId` is only set for idea nodes — the one mark type a second tap opens.
+    const hoverable = (x, y, r, rank, head, body, leaf = null, openId = null) =>
+      marks.push({ x, y, r, rank, head, body, leaf, openId });
     let onIdeaCount = 0, offIdeaCount = 0;
     const hitIds = new Set(data.hits.map((hit) => hit.thesis_id));
     if (withLeaves.checked) {
@@ -1134,11 +1153,34 @@ view("dial", "Гипотеза", (host, ctx) => {
         const dot = mk("circle", { cx: x, cy: y, r: 3.6 + 1.5 * Math.sqrt(leaves),
           fill: shade(node.cosine), stroke: parents.has(node.id) ? "var(--s2)" : "var(--surface)",
           "stroke-width": parents.has(node.id) ? 2 : 1, class: "ideanode" });
-        dot.addEventListener("click", () => openIdea(node.id));
+        // §2.3: Chromium tags a tap's synthetic `click` with the tapping pointer's own
+        // `pointerType` (`"touch"` or `"pen"`, never `"mouse"`) — `hasHover` skips both here
+        // so a first tap or pen-tap does not open the idea before the two-tap flow below (the
+        // `pointerdown` listener near the bottom of this function) gets a look. A confirmed
+        // second tap on the same mark still ends up at this exact `openIdea` call, just
+        // invoked directly rather than through this listener — one path to open, not two.
+        // (`preventDefault` on the touch `pointerdown` does NOT reliably suppress this
+        // synthetic click — confirmed against CDP's `Input.dispatchTouchEvent`, the same
+        // primitive `tools/e2e_console.py`'s `tap()` uses — so the guard lives here instead
+        // of relying on that.)
+        // Cost of the dependency: `hasHover` compares against `"mouse"`, so anything that is
+        // NOT `"mouse"` — `"touch"`, `"pen"`, even an engine that synthesizes a plain
+        // `MouseEvent` with an empty-string or missing `pointerType` — is caught by this
+        // guard, same as before. The only way this silently breaks is an engine reporting
+        // `"mouse"` for a touch or pen's own synthetic click; the two-tap flow below still
+        // runs its own state machine on `pointerdown` regardless, so nothing crashes — "read
+        // the card first" would just quietly revert to "tap opens immediately", and nothing
+        // here would tell you.
+        dot.addEventListener("click", (event) => {
+          if (!hasHover(event)) return;
+          openIdea(node.id);
+        });
         gIdeas.append(dot);
         hoverable(x, y, 3.6 + 1.5 * Math.sqrt(leaves), 1,
-          `идея · cos лучшего листа ${node.cosine.toFixed(3)} · листьев ${leaves} · клик — открыть`,
-          (node.body ? node.body.text : "(тело идеи не прочитано)") + `\n${node.id}`);
+          `идея · cos лучшего листа ${node.cosine.toFixed(3)} · листьев ${leaves} · `
+            + `открыть: клик мышью, на тач-экране — второй тап по метке`,
+          (node.body ? node.body.text : "(тело идеи не прочитано)") + `\n${node.id}`,
+          null, node.id);
       }
     }
     // The hits are drawn last and joined to the centre: on a plot where the angle means
@@ -1200,14 +1242,26 @@ view("dial", "Гипотеза", (host, ctx) => {
       return [(event.clientX - box.left - (box.width - w * scale) / 2) / scale,
               (event.clientY - box.top - (box.height - h * scale) / 2) / scale, box, scale];
     };
-    svg.addEventListener("mousemove", (event) => {
-      const [vx, vy, box, scale] = toView(event);
+    // Armed by a tap that showed a mark's card (pointerdown below), so a second tap on the
+    // SAME mark knows to open instead of just re-showing. Declared here, next to `hideCard`,
+    // because `hideCard` is the one place that disarms it: every path that can hide the card
+    // — a tap that misses (inside `showMark`), a mouse leaving the svg, or the open branch
+    // below — must also forget which mark was armed, or a stale mark can open on a plain tap
+    // that only ever showed a card (see the pointerdown listener below for the failure mode
+    // this closes).
+    let lastTapMark = null;
+    const hideCard = () => {
+      card.classList.add("hide");
+      ring.classList.add("hide");
+      lastTapMark = null;
+    };
+    // Shared by the mouse-hover branch and the finger-tap branch below: finds the nearest
+    // mark within `radius` view units and fills the card/ring for it, or hides both and
+    // returns null. Positioning is left to the caller — the mouse path places the card next
+    // to the pointer, the touch path pins it to the bottom (§2.3, CSS media block above).
+    const showMark = (vx, vy, radius) => {
       const { mark: best, score: bestScore } = nearestMark(marks, vx, vy);
-      if (!best || bestScore > 9) {
-        card.classList.add("hide");
-        ring.classList.add("hide");
-        return;
-      }
+      if (!best || bestScore > radius) { hideCard(); return null; }
       ring.setAttribute("cx", best.x);
       ring.setAttribute("cy", best.y);
       ring.setAttribute("r", best.r + 5);
@@ -1234,18 +1288,62 @@ view("dial", "Гипотеза", (host, ctx) => {
           if (shown && shown.textContent === which) shown.textContent = text;
         }, 140);
       }
-      // Placed relative to the wrapper and kept inside it: a card that runs off the panel
-      // is a card whose last words are the ones nobody reads.
+      return best;
+    };
+    // Placed relative to the wrapper and kept inside it: a card that runs off the panel
+    // is a card whose last words are the ones nobody reads. (At max-width:620 the CSS
+    // media block above overrides this with `!important` and pins the card to the bottom
+    // instead — a finger over the mark would otherwise cover the card that follows it.)
+    const positionCard = (box, scale, best) => {
       const px = box.left + (box.width - w * scale) / 2 + best.x * scale;
       const py = box.top + (box.height - h * scale) / 2 + best.y * scale;
       const host = wrap.getBoundingClientRect();
       const cw = card.offsetWidth || 320, ch = card.offsetHeight || 90;
       card.style.left = `${Math.max(8, Math.min(host.width - cw - 8, px - host.left + 14))}px`;
       card.style.top = `${Math.max(8, Math.min(host.height - ch - 8, py - host.top + 14))}px`;
+    };
+    // §2.3: mousemove/mouseleave replaced by pointermove/pointerdown, branching on
+    // pointerType — touch never fires mousemove/mouseleave at all, which is exactly why the
+    // card was invisible on a phone before this change.
+    svg.addEventListener("pointermove", (event) => {
+      if (!hasHover(event)) return;   // no hover concept for touch/pen
+      const [vx, vy, box, scale] = toView(event);
+      const best = showMark(vx, vy, 9);
+      if (best) positionCard(box, scale, best);
     });
-    svg.addEventListener("mouseleave", () => {
-      card.classList.add("hide");
-      ring.classList.add("hide");
+    svg.addEventListener("pointerleave", (event) => {
+      if (!hasHover(event)) return;
+      hideCard();
+    });
+    // One tap shows the card; a second tap on the SAME mark opens its idea (marks without
+    // an `openId` — leaves, hits, the hypothesis centre — just stay shown); a tap that hits
+    // no mark hides the card (and disarms `lastTapMark` — see `hideCard`, above). The idea
+    // node's own `click` listener, above, is what actually guards against the tap's
+    // synthetic click opening on the first tap — `preventDefault` here does not reliably
+    // suppress it (see that listener's comment).
+    svg.addEventListener("pointerdown", (event) => {
+      if (hasHover(event)) return;   // real mouse clicks open via `click`, above
+      // Measured on 390×844 with a real touchStart/touchMove/touchEnd sequence centred on the
+      // dial (`tools/e2e_console.py`): scrollY moved 914 → 1079, i.e. this does NOT stop
+      // Chromium from panning the page, and it should not — the operator has to be able to
+      // scroll a 390 px-wide page whose middle is one big svg. `touch-action` is not set
+      // anywhere in this file, so panning was always going to survive a `preventDefault` on
+      // `pointerdown` alone. What the call still buys:
+      // it is the only guard in this file against the touch-callout/selection affordances a
+      // long or dragged press on the svg would otherwise trigger (no `user-select` or
+      // `touch-action` CSS backs it up), so it stays for that, not for scroll and not for
+      // suppressing the synthetic click (that guard lives on the `click` listener above).
+      event.preventDefault();
+      const [vx, vy, box, scale] = toView(event);
+      const best = showMark(vx, vy, 18);
+      if (!best) return;   // showMark already called hideCard, which disarmed lastTapMark
+      if (best === lastTapMark && best.openId) {
+        openIdea(best.openId);
+        hideCard();
+        return;
+      }
+      lastTapMark = best;
+      positionCard(box, scale, best);
     });
     wrap.replaceChildren(svg, card);
     return { ideas: shownIdeas, inside, outside, onIdea: onIdeaCount, offIdea: offIdeaCount };
