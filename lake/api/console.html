@@ -31,7 +31,14 @@ button,input,select,textarea{font:inherit;color:inherit}
 .hide{display:none !important}
 
 /* ---------- chrome ---------- */
-header.bar{position:sticky;top:0;z-index:20;background:var(--surface);
+/* §2.3: header and tab strip used to be two INDEPENDENT sticky elements, the second
+   pinned to a hardcoded `top:53px` — exactly the single-line header's height, so a
+   header that wraps to two or three lines on a narrow screen (flex-wrap below) buried
+   the tab strip under itself instead of sitting past it. One sticky wrapper around
+   both means the offset never needs computing at all: the strip is simply the next
+   sibling in normal flow, wherever the header's real (wrapped or not) height ends. */
+.chrome{position:sticky;top:0;z-index:20}
+header.bar{background:var(--surface);
   border-bottom:1px solid var(--hair);padding:10px 18px;display:flex;gap:16px;
   align-items:center;flex-wrap:wrap}
 .brand{font-weight:650;letter-spacing:-.01em}
@@ -45,12 +52,32 @@ header.bar{position:sticky;top:0;z-index:20;background:var(--surface);
 .chip.ok .dot{background:var(--good)} .chip.warn .dot{background:var(--warning)}
 .chip.bad .dot{background:var(--critical)}
 nav.tabs{display:flex;gap:2px;padding:0 18px;background:var(--surface);
-  border-bottom:1px solid var(--hair);position:sticky;top:53px;z-index:19;overflow-x:auto}
+  border-bottom:1px solid var(--hair);overflow-x:auto}
 nav.tabs button{background:none;border:0;border-bottom:2px solid transparent;padding:11px 14px;
   color:var(--muted);cursor:pointer;white-space:nowrap}
 nav.tabs button:hover{color:var(--ink-2)}
 nav.tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--s1)}
 main{padding:20px 18px 80px;max-width:1560px;margin:0 auto}
+/* 900: tablet / narrow desktop — the header's own children stop wrapping to several
+   lines (the bug above); the chip strip instead becomes its own horizontal scroll row,
+   same reasoning nav.tabs used to lean on (below). `overflow-x:auto` on a flex child
+   also switches its automatic minimum size to 0 (flexbox spec), which is what actually
+   lets it shrink below its chips' combined width instead of forcing the header wider
+   than the viewport. */
+@media (max-width:900px){
+  header.bar{flex-wrap:nowrap}
+  .stat-strip{flex-wrap:nowrap;overflow-x:auto;min-width:0}
+  /* nav.tabs itself: nine labels do not fit one row under ~800px even on a normal
+     desktop window (measured: 785px of buttons in a 390px strip on a phone) — a
+     SIDEWAYS-scrolling tab strip hid that from `documentElement.scrollWidth` (the whole
+     reason the phone check also measures `nav.tabs` directly, not just the page), but a
+     tab a reader cannot even see exists is not "accessible via scroll", it is missing.
+     Wrapping to two or three rows instead costs vertical space, not a hidden tab — and
+     costs nothing else, since nav.tabs lives inside the SAME sticky `.chrome` as the
+     header now (above): there is no second element with a fixed offset for a taller
+     strip to collide with. */
+  nav.tabs{flex-wrap:wrap}
+}
 
 /* ---------- controls ---------- */
 .panel{background:var(--surface);border:1px solid var(--hair);border-radius:12px;
@@ -102,6 +129,58 @@ table.tbl td{padding:9px 10px;border-bottom:1px solid var(--hair);color:var(--in
 table.tbl td.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
 .scroller{overflow:auto;max-height:60vh;border:1px solid var(--hair);border-radius:10px}
 .pager{display:flex;gap:10px;align-items:center;margin-top:10px;font-size:12.5px;color:var(--muted)}
+
+/* 620: phone (portrait or landscape) — controls stack instead of wrapping mid-row, and
+   every button gets a 44×44 touch target (WCAG 2.5.5); `.ghost.sm` was the one that
+   actually measured smaller (pager arrows, the per-row "открыть"/"тезисы" buttons). */
+@media (max-width:620px){
+  .row{flex-direction:column;align-items:stretch}
+  /* `flex:1 1 340px` is a MAIN-axis basis — in a row that's width (the desktop case),
+     but `.row` above is now column, so the same rule would ask for 340px of HEIGHT
+     instead. Reset to natural height; `align-items:stretch` already gives it full
+     width, which is what "grow" meant on the desktop row in the first place. */
+  label.f.grow{flex:0 0 auto}
+  .panel{padding:12px 12px}
+  button.act,button.ghost{min-height:44px}
+  button.ghost.sm{min-height:44px;min-width:44px}
+}
+
+/* 430: phone. The four content tables (dial hits, "Идеи", "Тезисы", "Источники") reflow
+   row-by-row into cards — `table.tbl.cardable` only, set in JS on exactly those four;
+   the job queue, staging list and arbiter queue keep scrolling sideways instead (§2.3:
+   "туда с телефона не смотрят"), same as the "рёбра из идеи" table nested in an idea's
+   own card. `thead` is not `display:none`: that would drop it from the accessibility
+   tree along with the screen; visually hidden instead so a screen reader still gets a
+   real table structure to announce. Each `td`'s own label comes from `data-label`
+   (`labelCells()` above), not a second copy of the header text baked into this rule —
+   the two cannot drift apart because there is only one copy. */
+@media (max-width:430px){
+  table.tbl.cardable,table.tbl.cardable tbody,table.tbl.cardable tr,table.tbl.cardable td
+    {display:block;width:100%}
+  table.tbl.cardable thead{position:absolute;width:1px;height:1px;overflow:hidden;
+    clip:rect(0,0,0,0);white-space:nowrap}
+  table.tbl.cardable tbody{display:flex;flex-direction:column;gap:10px}
+  table.tbl.cardable tr{border:1px solid var(--hair);border-radius:10px;
+    padding:10px 12px;background:var(--surface)}
+  table.tbl.cardable td{border-bottom:0;padding:5px 0;display:flex;gap:10px;
+    align-items:baseline;text-align:left;white-space:normal}
+  table.tbl.cardable td::before{content:attr(data-label);flex:0 0 38%;color:var(--muted);
+    font-size:10.5px;letter-spacing:.05em;text-transform:uppercase}
+  table.tbl.cardable td:not([data-label])::before{content:none;flex-basis:0}
+  /* Everything that stays a real <table> at this width — the job queue, staging list,
+     arbiter queue, and the "рёбра из идеи" table nested in an idea's own card — still
+     has to FIT: a plain auto-layout table sizes its columns off unbreakable content (a
+     mono id, a bare JSON dump with no spaces) wider than the viewport, and `.scroller`'s
+     own `overflow:auto` swallows that without the page ever reporting it (the other half
+     of the XFAIL this pass closes, alongside `nav.tabs`). Scoped to 430, not the wider
+     620/900 breakpoints: a fixed, evenly-split layout is fine for a handful of short
+     columns at 390 px but starved a 110-character free-text column into a many-line
+     wall of text at ~750 px, the e2e suite's own default window size, and broke
+     `scrollIntoView`-then-click on a link further down the same row (confirmed live —
+     table-layout:fixed was briefly tried at 900 and reverted for exactly this). */
+  table.tbl{table-layout:fixed}
+  table.tbl td,table.tbl th{overflow-wrap:anywhere}
+}
 
 /* ---------- badges ---------- */
 .badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:3px 9px;
@@ -204,14 +283,15 @@ svg.graph circle.hoverring{pointer-events:none}
 </head>
 <body>
 
-<header class="bar">
-  <div class="brand">Ideas Lake<small>блок A · консоль</small></div>
-  <div class="stat-strip" id="strip"><span class="chip"><span class="dot"></span>подключаюсь…</span></div>
-  <button class="pill" id="theme-btn" title="Светлая / тёмная">◐ тема</button>
-  <button class="pill" id="key-btn" title="Сменить ключ">🔑 ключ</button>
-</header>
-
-<nav class="tabs" id="tabs"></nav>
+<div class="chrome">
+  <header class="bar">
+    <div class="brand">Ideas Lake<small>блок A · консоль</small></div>
+    <div class="stat-strip" id="strip"><span class="chip"><span class="dot"></span>подключаюсь…</span></div>
+    <button class="pill" id="theme-btn" title="Светлая / тёмная">◐ тема</button>
+    <button class="pill" id="key-btn" title="Сменить ключ">🔑 ключ</button>
+  </header>
+  <nav class="tabs" id="tabs"></nav>
+</div>
 <main id="main"></main>
 
 <div class="gate hide" id="gate">
@@ -262,6 +342,23 @@ const el = (tag, attrs = {}, ...kids) => {
 };
 const fmt = (n) => typeof n === "number" ? n.toLocaleString("ru-RU") : n;
 const cut = (s, n) => (s || "").length > n ? s.slice(0, n - 1) + "…" : (s || "");
+
+// §2.3: the four content tables (dial hits, "Идеи", "Тезисы", "Источники") reflow into
+// cards at max-width:430 — CSS alone does the reflow (`table.tbl.cardable` below), but a
+// card still needs to PRINT each row's column label somewhere, and that label has to be
+// the real <th> text, not a second copy of it hand-written into a CSS rule that silently
+// drifts the day a column is renamed or reordered. Called once, right after a table is
+// built (still detached from the document — querySelectorAll works on a subtree either
+// way), never re-run per cell. A column past the last <th>, or an empty header (the
+// trailing "открыть"/"тезисы" action column in two of these tables), leaves that td's
+// `data-label` unset on purpose — the ::before rule below already treats a missing
+// attribute the same as an empty one, so no label prefix prints in front of a button.
+function labelCells(table) {
+  const heads = [...table.querySelectorAll("thead th")].map((th) => th.textContent);
+  for (const tr of table.querySelectorAll("tbody tr"))
+    [...tr.children].forEach((td, i) => { if (heads[i]) td.dataset.label = heads[i]; });
+  return table;
+}
 
 /* ---------------------------------------------------------------- transport */
 
@@ -865,23 +962,49 @@ view("dial", "Гипотеза", (host, ctx) => {
   // as an empty box. Set as the DOM property instead, which is what actually works.
   q.value = p.q || "";
   const k = el("input", { type: "number", min: 1, max: 50, value: Number(p.k) || 12 });
+  // Defect 1 (§2.2): one default, one place. Width-dependent defaults used to be spelled
+  // out twice — once at the mount-read sites below, once (as a bare desktop constant) in
+  // `syncParams` — and the two spellings only agreed by coincidence at desktop widths.
+  // Both sides now call these instead of re-deriving the number/bit themselves.
+  const isNarrow = () => window.innerWidth < 430;
   // 30 by default because the top ideas all sit in a thin band of cosine — their radii
-  // are nearly equal, and that ring only fits so many circles before they overlap.
-  const top = el("input", { type: "number", min: 5, max: 300, value: Number(p.top) || 30 });
+  // are nearly equal, and that ring only fits so many circles before they overlap. §2.3:
+  // at 390 px the ring itself is a third the size (the square-by-width fix below), so
+  // even 30 does not fit — 15 is the narrow default instead, `p.top` still wins outright.
+  const topDefault = () => isNarrow() ? 15 : 30;
+  const top = el("input", { type: "number", min: 5, max: 300,
+    value: Number(p.top) || topDefault() });
   const withGraph = el("input", { type: "checkbox", checked: p.graph === "0" ? null : true });
-  const withLeaves = el("input", { type: "checkbox", checked: p.leaves === "0" ? null : true });
+  // §2.3: 3 040 leaves in a ring a third the desktop's size is the "каша" the spec names —
+  // off by default under 430 px, unless `p.leaves` says otherwise explicitly (`run=1` links
+  // that were built assuming leaves-on still show them). Never forced: checking the box
+  // still draws them on a phone, this only changes what a bare open starts with.
+  const withLeaves = el("input", { type: "checkbox",
+    checked: (p.leaves === "0" || (p.leaves === undefined && isNarrow())) ? null : true });
 
   // §2.2: the address mirrors the form so the view is a link, not just a screen. Called
   // on every field change AND at the top of `fire()` (a button click "тоже обновляет
   // адрес" even if no field's own listener already caught the value) — `replaceState`
   // only, so this never remounts the view out from under the SVG it is about to draw.
+  //
+  // Defect 1 fix: on a narrow screen `top`/`leaves` are now written EVERY call, never left
+  // to an omitted key. An omitted key would have to mean "whatever this browser's width
+  // says right now", and the width at share time (390, box just ticked) is not a promise
+  // about the width at open time (same link, opened later on a 1440 desktop) — two
+  // different widths reading one missing key can only agree by luck. Writing both keys
+  // outright removes the luck: a narrow-built link always carries its own settings, at
+  // any width it later reopens on. Wide screens keep the old omit-if-default form — `30`/
+  // checked-true there is a fixed desktop constant, not a moving target, so it already
+  // round-trips without help.
   function syncParams() {
+    const narrow = isNarrow();
     setParams({
       q: q.value.trim() || undefined,
       k: (Number(k.value) || 12) !== 12 ? k.value : undefined,
-      top: (Number(top.value) || 30) !== 30 ? top.value : undefined,
+      top: narrow ? top.value : ((Number(top.value) || 30) !== 30 ? top.value : undefined),
       graph: withGraph.checked ? undefined : "0",
-      leaves: withLeaves.checked ? undefined : "0",
+      leaves: narrow ? (withLeaves.checked ? "1" : "0")
+                     : (withLeaves.checked ? undefined : "0"),
     });
   }
   for (const [field, evt] of [[q, "input"], [k, "input"], [top, "input"],
@@ -901,6 +1024,16 @@ view("dial", "Гипотеза", (host, ctx) => {
              + "картинка неполная, числам ниже верить нельзя"
            : `${fmt(data.total)} листьев расставлены: ближайший ${data.cosine.max.toFixed(3)}, `
              + `медиана озера ${data.cosine.median.toFixed(3)}`);
+    // §2.3: the checkbox can be off either by the narrow-screen default above or by a
+    // deliberate uncheck — this line says so in words either way, because a picture with
+    // no leaf dots on it looks exactly like "the lake has nothing near this hypothesis"
+    // otherwise. `data.total` in the line above is unchanged either way — it is the
+    // server's count of leaves IN THE RESPONSE, not a claim about what got drawn.
+    if (!withLeaves.checked) {
+      statusHost.append(el("div", { class: "status warn" },
+        `точки-листья скрыты: экран ${window.innerWidth} px — ${fmt(data.total)} листьев `
+        + "выше это ответ сервера, не то, что нарисовано"));
+    }
 
     let drawn = null;
     try {
@@ -997,7 +1130,12 @@ view("dial", "Гипотеза", (host, ctx) => {
   }
 
   function drawDial(data, graph) {
-    const w = wrap.clientWidth || 1100, h = Math.min(680, Math.round(window.innerHeight * 0.72));
+    const w = wrap.clientWidth || 1100;
+    // §2.3: square BY WIDTH. `h` used to come from `window.innerHeight` alone, with no
+    // regard for `w` — on a phone that drew the desktop's tall aspect ratio into a
+    // narrow box, letterboxed down to a small, off-centre circle (see `toView` below for
+    // why a viewBox/CSS-box mismatch letterboxes rather than overflows).
+    const h = Math.min(w, Math.round(window.innerHeight * 0.7));
     const cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 42, R0 = R * 0.13;
     const cos = data.points.map((p) => p.cosine);
     const hi = Math.max(...cos), lo = Math.min(...cos);
@@ -1008,6 +1146,20 @@ view("dial", "Гипотеза", (host, ctx) => {
     const radius = (c) => R0 + (hi - c) / span * (R - R0);
     const shade = (c) => DIAL_RAMP[Math.max(0, Math.min(8,
       Math.round((c - lo) / span * 8)))];
+    // §2.3: mark radii and the ring's separation gap scale off the SVG's OWN width —
+    // 390 px on a phone, 900+ px on desktop — linearly between the two, clamped outside
+    // that range. `wScale(narrow, desktop)` reads as "this value at 390 px, that one at
+    // 900 px and up": idea nodes and hit dots get BIGGER on a phone (touch targets, and
+    // §2.3's own default of 15 ideas instead of 30 leaves each one more ring room), while
+    // `gapPx` shrinks with the ring itself, since a smaller `R` has less circumference to
+    // spread separation across.
+    const wScale = (narrow, desktop) => {
+      const t = Math.max(0, Math.min(1, (w - 390) / (900 - 390)));
+      return narrow + (desktop - narrow) * t;
+    };
+    const nodeBaseR = wScale(5, 3.6);
+    const hitDotR = { top: wScale(5, 6.5), rest: wScale(5, 4) };
+    const gapPx = wScale(12, 19);
 
     const mk = (tag, attrs = {}) => {
       const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
@@ -1022,7 +1174,15 @@ view("dial", "Гипотеза", (host, ctx) => {
     // the click guard below used to check `=== "touch"`, letting a pen's synthetic click
     // straight through the two-tap flow it was meant to be gated by).
     const hasHover = (event) => event.pointerType === "mouse";
-    const svg = mk("svg", { class: "graph", viewBox: `0 0 ${w} ${h}` });
+    // Defect 2 (§2.3): `viewBox` alone only tells the SVG how to SCALE its content — the
+    // element's own rendered box still came from the CSS class (`height:min(70vh,720px)`),
+    // which knows nothing about `w` and so disagreed with the square-by-width `h` above on
+    // any screen narrow enough for `w` to be the binding constraint. An inline style wins
+    // over the class rule (same specificity fight `style=` always wins) and, unlike the
+    // class, is computed from the same `h` the viewBox uses — so the box IS the viewBox,
+    // not just labelled as if it were. The graph-explorer view's own `svg.graph` (elsewhere
+    // in this file) needs no such override: its `h` already equals the CSS formula exactly.
+    const svg = mk("svg", { class: "graph", viewBox: `0 0 ${w} ${h}`, style: `height:${h}px` });
     const gRings = mk("g"), gPts = mk("g"), gEdges = mk("g"), gIdeas = mk("g"),
           gHits = mk("g"), gLab = mk("g");
 
@@ -1126,7 +1286,7 @@ view("dial", "Гипотеза", (host, ctx) => {
       }
       inside = links.length;
       shownIdeas = nodes.length;
-      ringLayout(nodes, links);
+      ringLayout(nodes, links, 400, gapPx);
       const pos = new Map(nodes.map((n) => [n.id, n]));
       const at = (n) => [cx + Math.cos(n.angle) * n.r, cy + Math.sin(n.angle) * n.r];
       for (const link of links) {
@@ -1150,7 +1310,7 @@ view("dial", "Гипотеза", (host, ctx) => {
         const [x, y] = at(node);
         ideaAt.set(node.id, [x, y]);
         const leaves = node.body ? (node.body.theses || []).length : 0;
-        const dot = mk("circle", { cx: x, cy: y, r: 3.6 + 1.5 * Math.sqrt(leaves),
+        const dot = mk("circle", { cx: x, cy: y, r: nodeBaseR + 1.5 * Math.sqrt(leaves),
           fill: shade(node.cosine), stroke: parents.has(node.id) ? "var(--s2)" : "var(--surface)",
           "stroke-width": parents.has(node.id) ? 2 : 1, class: "ideanode" });
         // §2.3: Chromium tags a tap's synthetic `click` with the tapping pointer's own
@@ -1176,7 +1336,7 @@ view("dial", "Гипотеза", (host, ctx) => {
           openIdea(node.id);
         });
         gIdeas.append(dot);
-        hoverable(x, y, 3.6 + 1.5 * Math.sqrt(leaves), 1,
+        hoverable(x, y, nodeBaseR + 1.5 * Math.sqrt(leaves), 1,
           `идея · cos лучшего листа ${node.cosine.toFixed(3)} · листьев ${leaves} · `
             + `открыть: клик мышью, на тач-экране — второй тап по метке`,
           (node.body ? node.body.text : "(тело идеи не прочитано)") + `\n${node.id}`,
@@ -1199,7 +1359,7 @@ view("dial", "Гипотеза", (host, ctx) => {
       gHits.append(mk("line", { x1: cx, y1: cy, x2: x, y2: y, stroke: "var(--s2)",
                                 "stroke-width": 1, "stroke-opacity": .45 }));
       const top5 = i < 5;
-      const dot = mk("circle", { cx: x, cy: y, r: top5 ? 6.5 : 4, fill: "var(--s2)",
+      const dot = mk("circle", { cx: x, cy: y, r: top5 ? hitDotR.top : hitDotR.rest, fill: "var(--s2)",
                                  stroke: "var(--surface)", "stroke-width": 2 });
       gHits.append(dot);
       hoverable(x, y, 8, 2, `#${i + 1} · cos ${hit.cosine.toFixed(3)} · `
@@ -1355,7 +1515,7 @@ view("dial", "Гипотеза", (host, ctx) => {
         + `${(data.angle_variance * 100).toFixed(1)} % его дисперсии: это украшение, `
         + `расстояния в нём нет. Правда — радиус и таблица: косинус, тот же, что печатает `
         + `/retrieve. Список — то же, что вернул бы GET /search.`),
-      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+      el("div", { class: "scroller" }, labelCells(el("table", { class: "tbl cardable" },
         el("thead", {}, el("tr", {}, ...["#", "cos", "тезис", "идея", "RRF", "BM25", "vector"]
           .map((head) => el("th", {}, head)))),
         el("tbody", {}, ...data.hits.map((hit, i) => el("tr", {},
@@ -1366,7 +1526,7 @@ view("dial", "Гипотеза", (host, ctx) => {
             e.preventDefault(); openIdea(hit.idea_id); } }, hit.idea_id)),
           el("td", { class: "num mono" }, hit.score.toFixed(5)),
           el("td", { class: "num mono" }, hit.bm25_rank ?? "—"),
-          el("td", { class: "num mono" }, hit.vec_rank ?? "—")))))));
+          el("td", { class: "num mono" }, hit.vec_rank ?? "—"))))))));
   }
 
   function ideasIntro(ids, hitsLen) {
@@ -1629,7 +1789,7 @@ view("ideas", "Идеи", (host, ctx) => {
   function renderPage(page) {
     setStatus(statusHost, "ok", codeOf(page), `${page.items.length} строк на странице, total ${fmt(page.total)}`);
     out.replaceChildren(
-      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+      el("div", { class: "scroller" }, labelCells(el("table", { class: "tbl cardable" },
         el("thead", {}, el("tr", {}, ...["идея", "текст", "trust", "листьев", "origin", "обновлена", ""]
           .map((h) => el("th", {}, h)))),
         el("tbody", {}, ...page.items.map((idea) => el("tr", {},
@@ -1640,7 +1800,7 @@ view("ideas", "Идеи", (host, ctx) => {
           el("td", { class: "num" }, idea.theses.length),
           el("td", {}, idea.origin),
           el("td", { class: "mono dim" }, idea.updated_at || "«»"),
-          el("td", {}, el("button", { class: "ghost sm", onclick: () => openIdea(idea.id) }, "открыть"))))))),
+          el("td", {}, el("button", { class: "ghost sm", onclick: () => openIdea(idea.id) }, "открыть")))))))),
       pager(state, page.total, load));
   }
 
@@ -1841,7 +2001,7 @@ view("theses", "Тезисы", (host, ctx) => {
   function renderPage(page) {
     setStatus(statusHost, "ok", codeOf(page), `total ${fmt(page.total)} при этом фильтре`);
     out.replaceChildren(
-      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+      el("div", { class: "scroller" }, labelCells(el("table", { class: "tbl cardable" },
         el("thead", {}, el("tr", {}, ...["тезис", "текст", "эффект", "локатор", "источник", "идея"]
           .map((h) => el("th", {}, h)))),
         el("tbody", {}, ...page.items.map((leaf) => el("tr", {},
@@ -1853,7 +2013,7 @@ view("theses", "Тезисы", (host, ctx) => {
             cut(leaf.source_title, 60)),
             el("span", { class: "badge b-" + leaf.source_type, style: "margin-left:6px" }, leaf.source_type)),
           el("td", { class: "mono" }, el("a", { href: "#", onclick: (e) => {
-            e.preventDefault(); openIdea(leaf.idea_id); } }, leaf.idea_id))))))),
+            e.preventDefault(); openIdea(leaf.idea_id); } }, leaf.idea_id)))))))),
       pager(state, page.total, load));
   }
 
@@ -1908,7 +2068,7 @@ view("sources", "Источники", (host, ctx) => {
   function renderPage(page) {
     setStatus(statusHost, "ok", codeOf(page), `total ${fmt(page.total)}`);
     out.replaceChildren(
-      el("div", { class: "scroller" }, el("table", { class: "tbl" },
+      el("div", { class: "scroller" }, labelCells(el("table", { class: "tbl cardable" },
         el("thead", {}, el("tr", {}, ...["источник", "тип", "название", "версия", "получен", "прогон", ""]
           .map((h) => el("th", {}, h)))),
         el("tbody", {}, ...page.items.map((src) => el("tr", {},
@@ -1926,7 +2086,7 @@ view("sources", "Источники", (host, ctx) => {
             // `setTimeout`, no placeholder-text lookup, no guessing which button is "the"
             // act button under #main.
             location.hash = formatHash("theses", null, { source_id: src.id });
-          } }, "тезисы"))))))),
+          } }, "тезисы")))))))),
       pager(state, page.total, load));
   }
 

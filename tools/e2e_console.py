@@ -241,6 +241,9 @@ class Browser:
                                       `window.fetch` before `probe()` calls it).
     remove_init_script(id)            Undoes add_init_script — call in a `finally`.
     tap(x, y)                         Input.dispatchTouchEvent touchStart/touchEnd.
+    mouse_wheel(x, y, dx=, dy=)       Input.dispatchMouseEvent type "mouseWheel" — a real
+                                      scroll gesture, distinct from writing scrollLeft (see
+                                      its own docstring for why that distinction matters).
     click(selector)                   Real mouse: center of the element, dispatchMouseEvent.
     press(selector, key)              Real keyboard: dispatchKeyEvent (e.g. "Enter").
     fill(selector, text)              Sets .value, dispatches input+change.
@@ -433,6 +436,17 @@ class Browser:
             {"x": x + dx, "y": y + dy, "radiusX": 5, "radiusY": 5, "force": 1}]})
         time.sleep(0.05)
         self._call("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+    def mouse_wheel(self, x, y, delta_x=0, delta_y=0):
+        """A real, trusted wheel scroll (`Input.dispatchMouseEvent` type `"mouseWheel"`) at
+        a viewport point — needed to tell an `overflow-x:auto` row (a user CAN scroll it)
+        apart from `overflow-x:hidden` (content past the edge is gone for good). Setting
+        `element.scrollLeft` directly does NOT make that distinction: Chrome still honours a
+        script write to `scrollLeft` on an `overflow:hidden` container (only the user's own
+        scroll gesture is blocked), so a check built on it would pass on both — only a real
+        input event actually exercises the CSS property."""
+        self._call("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": x, "y": y,
+                                                  "deltaX": delta_x, "deltaY": delta_y})
 
     def pen_tap(self, x, y):
         """A tap driven by a real digital pen — `Input.dispatchMouseEvent` with
@@ -2655,6 +2669,55 @@ def test_url_reproduces_the_view(browser: Browser, base_url: str):
         f"got: {main_text[:400]!r}")
 
 
+@test("url_reproduces_the_view_on_a_narrow_phone")
+def test_url_reproduces_the_view_on_a_narrow_phone(browser: Browser, base_url: str):
+    """Blocker 1 (previous gate). `url_reproduces_the_view` (above) never sets a device at
+    all, so it runs at whatever width the harness starts on (desktop) — writer and reader
+    agree there only because desktop's `top`/`leaves` defaults (`30`/checked) never move.
+    This is deliberately a SEPARATE test, not folded into that one: it needs a 390px
+    device for BOTH the write (setting the fields) and the reopen (a fresh `goto()` of the
+    address just produced), and the test above does neither.
+
+    `top=30` and a CHECKED "точки-листья" are not arbitrary — they are exactly the
+    DESKTOP defaults (`30`/checked) that a regressed `syncParams` (Defect 1's original
+    shape: one bare `!== 30`/`checked` comparison, blind to width) would treat as "same as
+    default" and omit from the address on ANY width, narrow included. §2.3's own narrow
+    defaults are different (`15`/unchecked), so reopening an address that omitted both
+    keys would read back 15/unchecked at 390px — silently NOT what the operator set. The
+    current fix writes both keys unconditionally on a narrow screen (see `console.html`'s
+    own Defect-1 comments) precisely so this cannot happen; this guards it staying that
+    way."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+
+    checked = _checkbox_state(browser, "точки-листья")
+    assert checked is False, (
+        f"'точки-листья' defaults to checked={checked!r} at 390px — §2.3 says this should "
+        f"start unchecked; the rest of this test assumes that to set up the CHANGE this "
+        f"guard actually needs (unchecked -> checked)")
+    click_checkbox_with_label(browser, "точки-листья")
+    set_labeled_input(browser, "идей", "30")
+
+    href = browser.evaluate("location.href")
+    assert "top=30" in href, (
+        f"setting идей=30 at 390px did not land in the address at all: {href!r}")
+    assert "leaves=1" in href, (
+        f"checking 'точки-листья' at 390px did not land in the address at all: {href!r}")
+
+    browser.goto(href)   # brand new document, still 390px — this is `goto()`, a real load
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    top_now = read_labeled_number(browser, "идей")
+    leaves_now = _checkbox_state(browser, "точки-листья")
+    assert top_now == "30", (
+        f"reopening a 390px link carrying top=30 came back with идей={top_now!r} — an "
+        f"omitted key would default to the narrow default (15), not what was set")
+    assert leaves_now is True, (
+        f"reopening a 390px link carrying leaves=1 came back with 'точки-листья' checked="
+        f"{leaves_now!r} — an omitted key would default to the narrow default (off), not "
+        f"what was set")
+
+
 @test("typing_updates_the_address")
 def test_typing_updates_the_address(browser: Browser, base_url: str):
     """§8.3's M3: `url_reproduces_the_view` (above) only ever drives the URL -> fields
@@ -2999,17 +3062,17 @@ def test_single_request_on_double_click_retrieve(browser: Browser, base_url: str
         f"no guard against a second click before the first answer lands")
 
 
-@test("phone_no_horizontal_scroll", expected_fail=True)
+@test("phone_no_horizontal_scroll")
 def test_phone_no_horizontal_scroll(browser: Browser, base_url: str):
-    """§0.3: the page runs off the side of a phone screen today, and
+    """§0.3: the page used to run off the side of a phone screen, and
     `document.documentElement.scrollWidth` alone is blind to nearly all of it — see
-    `measure_overflow`'s docstring. Measured by hand at 390x844 before writing this:
-    nav.tabs clientWidth 390 / scrollWidth 785, #ideas .scroller 352 / 713, header.bar
-    bottom ~103px against the CSS-hardcoded `nav.tabs{top:53px}`, and there is no
-    `@media` rule under 620px or 430px anywhere in the file. Expected to fail until
-    §0.3/§2.3 land — see `test()` docstring for what XFAIL/XPASS mean here. Drop
-    `expected_fail=True` the SAME COMMIT that fixes the phone layout: an XFAIL that starts
-    passing and nobody notices is exactly the empty guarantee this suite exists to avoid."""
+    `measure_overflow`'s docstring. Measured by hand at 390x844 before this guard was
+    written: nav.tabs clientWidth 390 / scrollWidth 785, #ideas .scroller 352 / 713,
+    header.bar bottom ~103px against the CSS-hardcoded `nav.tabs{top:53px}`, and no
+    `@media` rule under 620px or 430px anywhere in the file. §0.3/§2.3 have since landed
+    (one sticky `.chrome` wrapping header+tabs, breakpoints at 900/620/430) and this guard
+    is a plain test now, not `expected_fail` — see `test()` docstring for what XFAIL/XPASS
+    meant while it still was one. If this ever fails again, that is a real regression."""
     browser.set_device(390, 844, mobile=True, touch=True)
     problems = []
     for tab_id in ("retrieve", "dial", "search", "ideas", "theses", "sources",
@@ -3029,6 +3092,583 @@ def test_phone_no_horizontal_scroll(browser: Browser, base_url: str):
                              f"is past nav.tabs' hardcoded top {overlap['navTop']:.0f}px — "
                              f"the tab strip is drawn under the header, not below it")
     assert not problems, "phone (390x844) overflows sideways: " + "; ".join(problems)
+
+
+@test("phone_header_and_tabs_share_one_sticky_container")
+def test_phone_header_and_tabs_share_one_sticky_container(browser: Browser, base_url: str):
+    """§0.3/§2.3: `nav.tabs{top:53px}` used to be a SECOND, independent sticky element,
+    pinned to exactly the single-line header's own height — the moment the header
+    wrapped to more than one line (narrow width), the tab strip pinned itself UNDER the
+    header instead of below it. The fix folds both into one `.chrome{position:sticky;
+    top:0}` wrapper, so there is no offset to compute or get wrong at all.
+
+    Checked structurally, not just "do they overlap on screen right now" (that overlap
+    check already lives in `phone_no_horizontal_scroll`, across all nine tabs): `.chrome`
+    really contains both elements, `.chrome` itself is the one carrying `position:sticky;
+    top:0`, and `nav.tabs` does NOT have its own `position:sticky` any more. That last
+    assertion is the one a `header_nav_overlap`-style pixel check alone cannot make: two
+    independent stickies that happen to line up at ONE measured width are still the old
+    bug's shape, just not tripped by that particular number."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    browser.goto(f"{base_url}/ui#raw")
+    browser.wait_for("document.querySelector('#main .panel') !== null", timeout=10)
+
+    geo = browser.evaluate("""
+      (() => {
+        const chrome = document.querySelector('.chrome');
+        const header = document.querySelector('header.bar');
+        const nav = document.querySelector('nav.tabs');
+        if (!chrome || !header || !nav) return null;
+        return {
+          containsBoth: chrome.contains(header) && chrome.contains(nav),
+          chromePosition: getComputedStyle(chrome).position,
+          chromeTop: getComputedStyle(chrome).top,
+          navPosition: getComputedStyle(nav).position,
+          headerBottom: header.getBoundingClientRect().bottom,
+          navTop: nav.getBoundingClientRect().top,
+        };
+      })()
+    """)
+    assert geo, "missing .chrome / header.bar / nav.tabs — cannot check the sticky wrapper at all"
+    assert geo["containsBoth"], (
+        ".chrome does not contain both header.bar and nav.tabs — they are independent "
+        "elements again, exactly the shape the top:53px bug had")
+    assert geo["chromePosition"] == "sticky" and geo["chromeTop"] == "0px", (
+        f".chrome is not the sticky wrapper: position={geo['chromePosition']!r} "
+        f"top={geo['chromeTop']!r}")
+    assert geo["navPosition"] != "sticky", (
+        f"nav.tabs has its own position:sticky ({geo['navPosition']!r}) again — that is "
+        "the old bug's exact shape even if it does not overlap on this one measurement")
+    assert geo["headerBottom"] <= geo["navTop"] + 1, (
+        f"header.bar bottom {geo['headerBottom']}px is past nav.tabs top {geo['navTop']}px "
+        "— the tab strip is drawn under the header, not below it")
+
+
+def cardable_table_check(browser: Browser) -> dict:
+    """Reads back, off whichever `table.tbl.cardable` is on screen, the two facts §2.3's
+    card reflow depends on: the row is really a CSS block (not a table row any more), and
+    the FIRST `<td>` — always a real, always-headed column on all four cardable tables,
+    unlike a trailing action column `labelCells()` deliberately leaves unset — actually
+    carries `data-label` and prints it through the `::before` pseudo-element, rather than
+    just sitting unused in the DOM. Pinned to `td:first-child` specifically (not "some
+    cell has a label", which a bug dropping only the FIRST column's label would still
+    satisfy via any later column) — reads the label straight off the live table instead of
+    asserting a specific Russian column name, so a column reorder cannot silently break
+    this alongside the feature it is checking."""
+    return browser.evaluate("""
+      (() => {
+        const table = document.querySelector('#main table.tbl.cardable');
+        if (!table) return { table: false };
+        const tr = table.querySelector('tbody tr');
+        if (!tr) return { table: true, row: false };
+        const td = tr.querySelector('td:first-child');
+        return {
+          table: true, row: true,
+          rowDisplay: getComputedStyle(tr).display,
+          label: td ? (td.dataset.label ?? null) : null,
+          beforeContent: td ? getComputedStyle(td, '::before').content : null,
+        };
+      })()
+    """)
+
+
+@test("phone_content_tables_become_cards")
+def test_phone_content_tables_become_cards(browser: Browser, base_url: str):
+    """§2.3: the four CONTENT tables — dial hits, "Идеи", "Тезисы", "Источники" — reflow
+    row-by-row into cards at <=430px, each `<td>` printing its own column's real `<th>`
+    text via `data-label`/`::before` (`labelCells()`), not a second hand-written label
+    that can drift from the header. Checked on all four, against the live stand's own
+    data (real ideas/theses/sources, not a fixture — see `LakeServer.start`'s docstring
+    for which routes `--mock` leaves untouched), via `cardable_table_check` so the same
+    two facts (block-mode row, label actually prints) are asserted identically on each."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", "e2e phone card-table probe")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelector('.graphwrap svg') !== null", timeout=20)
+    browser.wait_for("document.querySelector('#main table.tbl.cardable tbody tr') !== null", timeout=10)
+    checks = {"dial hits": cardable_table_check(browser)}
+
+    for tab_id, label in (("ideas", "Идеи"), ("theses", "Тезисы"), ("sources", "Источники")):
+        browser.goto(f"{base_url}/ui#{tab_id}")
+        browser.wait_for("document.querySelector('#main table.tbl.cardable tbody tr') !== null",
+                          timeout=15)
+        checks[label] = cardable_table_check(browser)
+
+    for name, c in checks.items():
+        assert c["table"], f"[{name}] no table.tbl.cardable found on screen at 390px"
+        assert c["row"], f"[{name}] table.tbl.cardable has no tbody tr to check at all"
+        assert c["rowDisplay"] == "block", (
+            f"[{name}] tbody tr computed display is {c['rowDisplay']!r} at 390px, want "
+            f"'block' (card mode)")
+        assert c["label"], (
+            f"[{name}] first cell has no data-label — the column's own name is gone, "
+            f"not just visually hidden")
+        assert c["beforeContent"] not in (None, "none", "normal", '""'), (
+            f"[{name}] td::before content is {c['beforeContent']!r} — data-label is set "
+            f"but never printed")
+
+
+@test("phone_service_tables_stay_scrollable_not_cards")
+def test_phone_service_tables_stay_scrollable_not_cards(browser: Browser, base_url: str):
+    """§2.3: "служебные (очередь заданий, отказы арбитра) — оставить скролл, туда с
+    телефона не смотрят" — the ingest tab's three tables (jobs, staging, pending-link)
+    must NOT get `cardable` at 390px: real `<tr>` rows inside `.scroller`, with the
+    general <430px `table-layout:fixed` rule (not the cardable reflow) keeping them from
+    overflowing sideways. Checked against the live queue (`--mock` still serves real
+    `/ingest/*` — see `LakeServer.start`'s docstring), so staging/pending-link may or may
+    not have a table at all on a given run (both render a plain "empty" status div when
+    there is nothing to show) — those two are checked only when a table is actually
+    present; `GET /ingest/jobs` always renders one (even with zero rows) and is required
+    to be checked, so an empty run can never make this test vacuous."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    browser.goto(f"{base_url}/ui#ingest")
+    jobs_panel = panel_js("GET /ingest/jobs")
+    browser.wait_for(f"(() => {{ const p = {jobs_panel}; return p && "
+                      "p.querySelector('table.tbl') !== null; })()", timeout=15)
+
+    geo = browser.evaluate("""
+      (() => {
+        const headings = ["GET /ingest/jobs", "GET /ingest/staging — точка приёмки",
+                           "GET /ingest/pending-link — отказы арбитра"];
+        const panels = [...document.querySelectorAll('#main .panel')];
+        return headings.map((heading) => {
+          const p = panels.find((x) => { const h = x.querySelector('h2');
+            return h && h.textContent.trim() === heading; });
+          if (!p) return { heading, panel: false, table: false };
+          const table = p.querySelector('table.tbl');
+          if (!table) return { heading, panel: true, table: false };
+          const scroller = p.querySelector('.scroller');
+          return {
+            heading, panel: true, table: true,
+            cardable: table.classList.contains('cardable'),
+            tableLayout: getComputedStyle(table).tableLayout,
+            overflowX: scroller ? scroller.scrollWidth > scroller.clientWidth + 1 : null,
+          };
+        });
+      })()
+    """)
+    assert geo, "no ingest service-table panels found at all"
+    for row in geo:
+        assert row["panel"], f"[{row['heading']}] panel not found on #ingest at all"
+        if not row["table"]:
+            continue   # empty-state status div instead of a table — nothing to check here
+        assert row["cardable"] is False, (
+            f"[{row['heading']}] table.tbl has 'cardable' at 390px — service tables must "
+            f"stay real tables, not reflow into cards")
+        assert row["tableLayout"] == "fixed", (
+            f"[{row['heading']}] table-layout is {row['tableLayout']!r} at 390px, want 'fixed'")
+        assert row["overflowX"] is False, (
+            f"[{row['heading']}] .scroller overflows sideways at 390px: {row}")
+
+    jobs_row = next(r for r in geo if r["heading"] == "GET /ingest/jobs")
+    assert jobs_row["table"], (
+        "GET /ingest/jobs rendered no table at all — cannot prove anything about service "
+        "tables staying scrollable on this run")
+
+
+@test("phone_buttons_meet_minimum_touch_target")
+def test_phone_buttons_meet_minimum_touch_target(browser: Browser, base_url: str):
+    """§2.3: at max-width:620, `button.act`/`button.ghost` get `min-height:44px`, and
+    `.ghost.sm` (measured smaller before this pass — the pager arrows, each row's own
+    "открыть") additionally gets `min-width:44px` (WCAG 2.5.5). Checked on real rendered
+    buttons a phone user would actually tap — the dial's "Разложить" (`button.act`), and
+    the ideas pager's arrows plus a row's own "открыть" (`button.ghost.sm`) — not a CSS
+    rule read out of the stylesheet, which would still pass even if the selector had
+    stopped matching the real markup."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    act_rect = browser.evaluate("""
+      (() => { const b = [...document.querySelectorAll('#main button.act')]
+                 .find((x) => x.textContent.trim() === 'Разложить');
+                if (!b) return null; const r = b.getBoundingClientRect();
+                return { width: r.width, height: r.height }; })()
+    """)
+    assert act_rect, "no 'Разложить' button.act found on #dial at 390px"
+    assert act_rect["width"] >= 44 and act_rect["height"] >= 44, (
+        f"'Разложить' (button.act) is {act_rect['width']}x{act_rect['height']} at 390px, "
+        f"want >=44x44")
+
+    browser.goto(f"{base_url}/ui#ideas")
+    browser.wait_for("document.querySelector('#main table.tbl.cardable tbody tr') !== null",
+                      timeout=15)
+    sm_rects = browser.evaluate("""
+      [...document.querySelectorAll('#main button.ghost.sm')].map((b) => {
+        const r = b.getBoundingClientRect();
+        return { text: b.textContent.trim(), width: r.width, height: r.height };
+      })
+    """)
+    assert sm_rects, "no button.ghost.sm found on #ideas at 390px (pager arrows / 'открыть')"
+    for r in sm_rects:
+        assert r["width"] >= 44 and r["height"] >= 44, (
+            f"button.ghost.sm {r['text']!r} is {r['width']}x{r['height']} at 390px, "
+            f"want >=44x44")
+
+
+@test("phone_dial_height_scales_with_width_not_just_window_height")
+def test_phone_dial_height_scales_with_width_not_just_window_height(browser: Browser, base_url: str):
+    """§2.3: `h = min(w, 0.7 * innerHeight)`, where `w` is the graph wrapper's OWN
+    `clientWidth` (`console.html:1115`: `const w = wrap.clientWidth || 1100`) — before
+    this pass `h` came from window height alone (§0.3, `console.html:736`), so any two
+    viewports that share `innerHeight` drew the SAME square regardless of width.
+
+    Proven with exactly that pair: 390x844 and 900x844 share `innerHeight`, so a
+    height-only bug draws an IDENTICAL side on both. The formula instead predicts
+    `min(wrapWidth_narrow, round(0.7*844)=591)` and `min(wrapWidth_wide, 591)` —
+    different, since `wrapWidth_narrow` is well under 591 and `wrapWidth_wide` is well
+    over it — and every number is read straight off the live DOM (`.graphwrap`'s own
+    `clientWidth`, `svg.viewBox.baseVal`), never hardcoded, so a slightly different
+    Chrome chrome/padding cannot make this assert on a number the page never actually
+    computed.
+
+    Blocker 2 (previous gate): this used to read ONLY the `viewBox` ATTRIBUTE, never the
+    rendered box — green whether the picture actually matched that coordinate system or
+    not. Mutation G8 (`svg.graph{height:min(70vh,720px)}` -> `height:auto`,
+    console.html:237) changes what is actually drawn and sailed straight through. It
+    still would on the DIAL's own svg alone: Defect 2's fix set an inline
+    `style="height:...px"` on that one element (console.html:1185), and an inline style
+    always outranks a class rule, so the dial's rendered box stays correct no matter what
+    the shared class says — proving nothing about whether the class rule itself still
+    holds. The graph-explorer view's OWN `svg.graph` (console.html:2731) has no such
+    override and trusts the class rule alone, which is exactly where a broken class
+    would show up as a mismatched box. Both are checked here: the dial's box against its
+    viewBox (guards the inline-style fix), and the graph-explorer's box against ITS
+    viewBox (guards the shared class rule the dial's override can no longer speak for)."""
+    def draw(w, h):
+        browser.set_device(w, h, mobile=True, touch=True)
+        browser.goto(f"{base_url}/ui#dial")
+        browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+        browser.fill("#main textarea", "e2e phone dial-square probe")
+        click_button_with_text(browser, "Разложить")
+        browser.wait_for("document.querySelector('.graphwrap svg') !== null", timeout=20)
+        return browser.evaluate("""
+          (() => {
+            const svg = document.querySelector('.graphwrap svg');
+            const vb = svg.viewBox.baseVal;
+            const box = svg.getBoundingClientRect();
+            const wrapWidth = document.querySelector('.graphwrap').clientWidth;
+            return { w: vb.width, h: vb.height, wrapWidth, innerHeight: window.innerHeight,
+                     boxW: box.width, boxH: box.height };
+          })()
+        """)
+
+    narrow = draw(390, 844)
+    wide = draw(900, 844)
+
+    for label, geo in (("390x844", narrow), ("900x844", wide)):
+        assert geo["w"] == geo["wrapWidth"], (
+            f"[{label}] viewBox width {geo['w']} != .graphwrap clientWidth {geo['wrapWidth']}")
+        want_h = min(geo["wrapWidth"], round(geo["innerHeight"] * 0.7))
+        assert geo["h"] == want_h, (
+            f"[{label}] viewBox height {geo['h']} != min(w={geo['wrapWidth']}, "
+            f"round(0.7*innerHeight)={round(geo['innerHeight'] * 0.7)}) = {want_h}")
+        # Blocker 2: the ATTRIBUTE alone says nothing about what is actually on screen —
+        # only the rendered box does.
+        assert abs(geo["boxW"] - geo["w"]) <= 1 and abs(geo["boxH"] - geo["h"]) <= 1, (
+            f"[{label}] dial svg's rendered box {geo['boxW']}x{geo['boxH']} != its own "
+            f"viewBox {geo['w']}x{geo['h']} — the picture on screen no longer matches "
+            f"the coordinate system it is drawn in")
+
+    assert narrow["h"] != wide["h"], (
+        f"390x844 and 900x844 share innerHeight but drew the SAME side ({narrow['h']}px) "
+        f"— the dial is still sized from window height alone, ignoring width")
+
+    # Blocker 2, continued: the dial's own box is immune to a broken shared class rule
+    # (its inline style always wins), so the class rule itself is only ever provable on
+    # the OTHER svg.graph, the graph-explorer's — same selector, different tab.
+    with urllib.request.urlopen(f"{base_url}/ideas?limit=1&offset=0", timeout=10) as r:
+        seed_idea_id = json.load(r)["items"][0]["id"]
+    browser.goto(f"{base_url}/ui#graph")
+    browser.wait_for("document.querySelector('#main input.grow') !== null", timeout=10)
+    browser.fill("#main input.grow", seed_idea_id)
+    click_button_with_text(browser, "Нарисовать")
+    browser.wait_for("document.querySelector('.graphwrap svg') !== null", timeout=20)
+    explorer = browser.evaluate("""
+      (() => {
+        const svg = document.querySelector('.graphwrap svg');
+        const vb = svg.viewBox.baseVal;
+        const box = svg.getBoundingClientRect();
+        return { w: vb.width, h: vb.height, boxW: box.width, boxH: box.height };
+      })()
+    """)
+    assert abs(explorer["boxW"] - explorer["w"]) <= 1 and abs(explorer["boxH"] - explorer["h"]) <= 1, (
+        f"graph-explorer svg's rendered box {explorer['boxW']}x{explorer['boxH']} != its "
+        f"own viewBox {explorer['w']}x{explorer['h']} — svg.graph's shared CSS height "
+        f"rule (console.html:237) no longer matches what drawGraph() computed")
+
+
+@test("phone_leaves_off_default_status_matches_dial_total")
+def test_phone_leaves_off_default_status_matches_dial_total(browser: Browser, base_url: str):
+    """§2.3: leaves default OFF under 430px width, and the status must say so IN WORDS,
+    naming the actual screen width — while the `total` it quotes stays the server's own
+    count, not the count of dots actually drawn (leaves hidden draws exactly zero of
+    them). Checked three separate ways, each a distinct way this could quietly lie:
+
+    1. the checkbox itself starts UNCHECKED at 390px, not just "happens to draw nothing"
+       for some unrelated reason;
+    2. zero leaf circles are actually appended to the SVG (`gPts`, the 2nd `<g>` in
+       z-order — `svg.append(gRings, gPts, gEdges, gIdeas, gHits, gLab)`, confirmed by
+       `dial_marks_geometry`'s own docstring);
+    3. the number quoted in BOTH the "leaves hidden" note and the main status line is
+       GET /dial's own `total`, fetched directly and independently of the page (same
+       pattern as `test_dial_answers`) — NOT `0` (drawn dots) and not anything else the
+       page might compute client-side."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    hypothesis = "e2e phone leaves-off probe"
+
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    checked = _checkbox_state(browser, "точки-листья")
+    assert checked is False, (
+        f"'точки-листья' defaults to checked={checked!r} at 390px width, want unchecked")
+
+    k = read_labeled_number(browser, "k")
+    browser.fill("#main textarea", hypothesis)
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelector('.graphwrap svg') !== null", timeout=20)
+    browser.wait_for("document.querySelector('#main .status.warn, #main .status.ok') !== null",
+                      timeout=20)
+
+    leaf_dots = browser.evaluate("document.querySelectorAll('svg > g:nth-of-type(2) circle').length")
+    assert leaf_dots == 0, (
+        f"'точки-листья' is unchecked but {leaf_dots} leaf circles were drawn anyway")
+
+    note = browser.evaluate(
+        "[...document.querySelectorAll('#main .status')].map((e) => e.textContent)"
+        ".find((t) => t.includes('скрыты')) ?? null")
+    assert note, "no status line says leaves are hidden, even though the checkbox is unchecked"
+    assert "390" in note, f"leaves-hidden note does not name the actual screen width (390): {note!r}"
+
+    q = urllib.parse.quote(hypothesis)
+    with urllib.request.urlopen(f"{base_url}/dial?q={q}&k={k}", timeout=15) as r:
+        data = json.loads(r.read())
+
+    note_total = extract_count_before(note, "листьев")
+    assert note_total == data["total"], (
+        f"leaves-hidden note claims {note_total} листьев, GET /dial says total="
+        f"{data['total']}: {note!r}")
+    assert note_total != leaf_dots, (
+        f"leaves-hidden note's count ({note_total}) equals the number of dots actually "
+        f"drawn ({leaf_dots}) — looks like it is quoting drawn dots, not the server's total")
+
+    main_status_total = extract_count_before(status_text_sans_code(browser), "листьев")
+    assert main_status_total == data["total"], (
+        f"main status claims {main_status_total} листьев, GET /dial says total="
+        f"{data['total']}: mismatch")
+
+
+@test("phone_top_default_is_narrow_not_desktop")
+def test_phone_top_default_is_narrow_not_desktop(browser: Browser, base_url: str):
+    """§2.3: "число идей по умолчанию на узком — 15, не 30" — the ring at 390px is a
+    third the desktop's size (the square-by-width fix above), and even 30 no longer
+    fits. Checked on a bare `#dial` open with NO `top=` in the address at all, so this is
+    the actual default, not an echoed URL param —
+    `url_reproduces_the_view_on_a_narrow_phone` already covers "an explicit value
+    survives"; this covers "no value at all still lands on the right number"."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    top_now = read_labeled_number(browser, "идей")
+    assert top_now == "15", f"'идей' defaults to {top_now!r} at 390px width, want '15' (§2.3)"
+
+
+@test("phone_dial_marks_scale_with_ring_width")
+def test_phone_dial_marks_scale_with_ring_width(browser: Browser, base_url: str):
+    """§2.3: idea-node radius scales off the SVG's OWN width (`wScale(narrow, desktop)`,
+    console.html) — 5px at 390px, not the desktop's 3.6px. The constant is not exposed
+    directly (it lives inside `drawDial`'s closure as `nodeBaseR`), so it is read back
+    the same way the page itself surfaces it: a tapped idea node's own hover ring
+    (`.hoverring`, `r = mark.r + 5`, `showMark()`) gives the exact mark radius
+    `hoverable()` was called with (`nodeBaseR + 1.5*sqrt(leaves)`), and the card's own
+    head text names `leaves` in words ("листьев N") — solving for the one unknown
+    (`nodeBaseR`) needs no assumption about which idea got tapped, real data or not."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    browser.fill("#main textarea", "e2e phone dial-scale probe")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0",
+                      timeout=20)
+
+    pt = find_hittable_point(browser, ".graphwrap svg circle.ideanode")
+    assert pt, "no idea node reachable by a real tap at 390px"
+    browser.tap(pt["x"], pt["y"])
+    browser.wait_for(
+        "(() => { const r = document.querySelector('.hoverring'); "
+        "return r && !r.classList.contains('hide'); })()", timeout=5)
+    ring_r = browser.evaluate("Number(document.querySelector('.hoverring').getAttribute('r'))")
+    head = browser.evaluate(
+        "document.querySelector('.hovercard .hc-head')?.textContent ?? ''")
+    m = re.search(r"листьев\s+(\d+)", head)
+    assert m, f"tapped idea node's card names no 'листьев N' at all: {head!r}"
+    leaves = int(m.group(1))
+    mark_r = ring_r - 5   # showMark(): ring.r = best.r + 5
+    implied_node_base_r = mark_r - 1.5 * math.sqrt(leaves)
+    assert abs(implied_node_base_r - 5) < 1.0, (
+        f"implied node base radius {implied_node_base_r:.2f} is not close to the narrow "
+        f"target (5px) — from tapped ring r={ring_r}, card's own leaves={leaves}")
+    assert abs(implied_node_base_r - 5) < abs(implied_node_base_r - 3.6), (
+        f"implied node base radius {implied_node_base_r:.2f} reads closer to the desktop "
+        f"constant (3.6) than the narrow one (5) — nodeBaseR looks unscaled at 390px")
+
+
+@test("phone_dial_ring_gap_scales_with_ring_width")
+def test_phone_dial_ring_gap_scales_with_ring_width(browser: Browser, base_url: str):
+    """§2.3: the ring's own separation gap (`gapPx`, console.html: `wScale(12, 19)`)
+    scales off the SVG's OWN width — 12px at 390px, not the desktop's 19px.
+
+    Not read off the CONVERGED layout: `ringLayout` only enforces `gapPx` as a floor
+    (pairs already spread wider are left alone), and on real dial data the outcome is
+    either "never binds at all" (few enough ideas that the golden-angle seed already
+    clears the floor everywhere — confirmed directly: reading the tightest rendered gap
+    at the narrow default's 15 ideas passed unchanged under a broken `gapPx`) or "so
+    overcrowded it collapses well past the floor everywhere" (pushed the idea count up
+    to force binding — confirmed directly: at 40 and even 300 ideas the tightest gap was
+    under 1px, nowhere near either 12 or 19, because co-citation edges pull specific
+    pairs together faster than 400 iterations of a half-deficit push can undo on a ring
+    this small). Neither regime lets a rendered gap stand in for `gapPx` itself.
+
+    Instead this captures the ARGUMENT `drawDial` actually calls `ringLayout` with,
+    exactly once, regardless of what the layout goes on to do with it: `ringLayout` is a
+    plain top-level `function` in this classic (non-module) `<script>`, so it is a real
+    `window` property, and monkey-patching it before "Разложить" is clicked — call
+    through to the original, just also record its own 4th argument — reads the exact
+    number the page computed, no convergence or real data involved at all."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    assert browser.evaluate("typeof window.ringLayout") == "function", (
+        "window.ringLayout is not a plain global function any more — this guard's "
+        "capture technique (monkey-patching it) no longer applies")
+    browser.evaluate("""
+      window.__e2e_gapPx = null;
+      const orig = window.ringLayout;
+      window.ringLayout = function(nodes, links, iters, gapPx) {
+        window.__e2e_gapPx = gapPx;
+        return orig.apply(this, arguments);
+      };
+    """)
+    browser.fill("#main textarea", "e2e phone dial-scale probe")
+    click_button_with_text(browser, "Разложить")
+    browser.wait_for("window.__e2e_gapPx !== null", timeout=20)
+    gap_px = browser.evaluate("window.__e2e_gapPx")
+    assert abs(gap_px - 12) < 0.5, (
+        f"drawDial called ringLayout with gapPx={gap_px} at 390px, want close to the "
+        f"narrow target (12px)")
+    assert abs(gap_px - 12) < abs(gap_px - 19), (
+        f"gapPx={gap_px} at 390px reads closer to the desktop constant (19) than the "
+        f"narrow one (12) — gapPx looks unscaled at this width")
+
+
+@test("phone_grow_field_resets_to_natural_height_not_desktop_flex_basis")
+def test_phone_grow_field_resets_to_natural_height_not_desktop_flex_basis(browser: Browser, base_url: str):
+    """§2.3: `.row{flex-direction:column}` under 620px turns `label.f.grow`'s desktop
+    `flex:1 1 340px` (a WIDTH basis in the desktop row) into a HEIGHT basis instead — the
+    same 340px, now stretching the hypothesis field itself to 340px tall. The fix resets
+    it to `flex:0 0 auto` under that same breakpoint. Checked on the actual rendered
+    field, not the stylesheet rule: the label wrapping the dial's own hypothesis textarea
+    must stay close to its natural (two-row) height, nowhere near 340px."""
+    browser.set_device(390, 844, mobile=True, touch=True)
+    browser.goto(f"{base_url}/ui#dial")
+    browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
+    height = browser.evaluate("""
+      (() => {
+        const ta = document.querySelector('#main textarea');
+        const label = ta.closest('label.f');
+        return label ? label.getBoundingClientRect().height : null;
+      })()
+    """)
+    assert height is not None, "no label.f wrapping the dial's own hypothesis textarea"
+    assert height < 150, (
+        f"hypothesis field (label.f.grow) is {height:.0f}px tall at 390px width — want "
+        f"well under the desktop flex-basis (340px); label.f.grow{{flex:0 0 auto}} under "
+        f"max-width:620px looks reverted")
+
+
+@test("phone_stat_strip_edge_chips_reachable_by_scroll")
+def test_phone_stat_strip_edge_chips_reachable_by_scroll(browser: Browser, base_url: str):
+    """Fail-open hole (previous gate): `phone_no_horizontal_scroll`'s only assertion
+    about the header's chip row is `scrollWidth > clientWidth` (`measure_overflow`) —
+    true whether the row is `overflow-x:auto` (reachable by scrolling) or
+    `overflow-x:hidden` (clipped and gone for good — exactly the "a number is either
+    right or explicitly absent" rule this project bans breaking). Measured live at
+    390px: the row is ~144px wide and holds ~821px of chips, four of six ("источники …",
+    "идеи …", "тезисы …", "рёбра …") entirely past the edge.
+
+    Scrolled with a REAL wheel event (`Browser.mouse_wheel`), not `element.scrollLeft =`
+    — Chrome still honours a script write to `scrollLeft` on an `overflow:hidden`
+    container (only the user's OWN scroll input is blocked there), so that alone cannot
+    tell the two apart. Checks that the scroll actually moved the row AND that the
+    "рёбра" chip, once scrolled to, is both unclipped and carries the server's own
+    number — a chip that scrolled into view empty or wrong would still fail this."""
+    browser.set_device(390, 844)
+    browser.goto(f"{base_url}/ui#dial")
+    # Not just "any chip" — `refreshStrip()` replaces the WHOLE row in one shot only once
+    # both `/healthz` and `/stats` resolve; a transient failure renders a single "bad" chip
+    # in the meantime (`stripTimer`'s next tick, 20s later, is the only retry), and that
+    # lone chip would satisfy a weaker wait_for without ever carrying "рёбра" at all.
+    browser.wait_for(
+        "[...document.querySelectorAll('.stat-strip .chip')].some((c) => "
+        "c.textContent.includes('рёбра'))", timeout=25)
+
+    with urllib.request.urlopen(f"{base_url}/stats", timeout=10) as r:
+        stats = json.load(r)
+
+    geo = browser.evaluate("""
+      (() => {
+        const strip = document.querySelector('.stat-strip');
+        if (!strip) return null;
+        const edges = [...strip.querySelectorAll('.chip')]
+          .find((c) => c.textContent.includes('рёбра'));
+        if (!edges) return null;
+        const r = strip.getBoundingClientRect();
+        return { x: r.x, y: r.y, width: r.width, height: r.height,
+                 scrollWidth: strip.scrollWidth, clientWidth: strip.clientWidth };
+      })()
+    """)
+    assert geo, "no .stat-strip / 'рёбра' chip found at 390px"
+    assert geo["scrollWidth"] > geo["clientWidth"] + 1, (
+        f".stat-strip does not overflow at 390px (scrollWidth={geo['scrollWidth']}, "
+        f"clientWidth={geo['clientWidth']}) — cannot prove anything about reachability "
+        f"on this run")
+
+    cx, cy = geo["x"] + geo["width"] / 2, geo["y"] + geo["height"] / 2
+    # One comfortably large real scroll, well past the measured ~821px of chips.
+    for _ in range(8):
+        browser.mouse_wheel(cx, cy, delta_x=200)
+        time.sleep(0.05)
+
+    after = browser.evaluate("""
+      (() => {
+        const strip = document.querySelector('.stat-strip');
+        const edges = [...strip.querySelectorAll('.chip')]
+          .find((c) => c.textContent.includes('рёбра'));
+        const stripRect = strip.getBoundingClientRect();
+        const chipRect = edges.getBoundingClientRect();
+        return { scrollLeft: strip.scrollLeft, text: edges.textContent,
+                 chipLeft: chipRect.left, chipRight: chipRect.right,
+                 stripLeft: stripRect.left, stripRight: stripRect.right };
+      })()
+    """)
+    assert after["scrollLeft"] > 0, (
+        "a real wheel scroll over .stat-strip did not move it at all — the row is not "
+        "actually scrollable (overflow-x is not 'auto')")
+    assert (after["chipLeft"] >= after["stripLeft"] - 1
+            and after["chipRight"] <= after["stripRight"] + 1), (
+        f"'рёбра' chip is still clipped after scrolling the strip as far as it goes: "
+        f"chip [{after['chipLeft']:.0f}, {after['chipRight']:.0f}] vs strip "
+        f"[{after['stripLeft']:.0f}, {after['stripRight']:.0f}]")
+
+    m = re.search(r"рёбра" + r"\s*([\d" + _THOUSANDS_SEP[1:-1] + r"]+)", after["text"])
+    assert m, f"'рёбра' chip has no number in it at all: {after['text']!r}"
+    shown_edges = int(re.sub(_THOUSANDS_SEP, "", m.group(1)))
+    assert shown_edges == stats["edges"], (
+        f"'рёбра' chip (reachable by scroll) shows {shown_edges}, GET /stats says "
+        f"edges={stats['edges']}")
 
 
 # ==================================================== §2.3: touch instead of hover
@@ -3145,16 +3785,38 @@ def find_radius_probe_point(browser: Browser):
         "and touch (18px) search radii — cannot prove the two radii differ on this draw")
 
 
+def _checkbox_state(browser: Browser, label_text: str, root: str = "#main"):
+    """`.checked` of the `<input>` inside the `label.cb` whose own text is exactly
+    `label_text`, or `None` if no such checkbox exists — the read-side twin of
+    `click_checkbox_with_label`, used so a caller can decide WHETHER to click instead of
+    always clicking blind."""
+    js = ("(() => { const labels = [...document.querySelectorAll(%s + ' label.cb')]; "
+          "const lab = labels.find((l) => l.textContent.trim() === %s); "
+          "const input = lab && lab.querySelector('input'); return input ? input.checked : null; })()"
+          % (json.dumps(root), json.dumps(label_text)))
+    return browser.evaluate(js)
+
+
 def _draw_dial_for_touch_tests(browser: Browser, base_url: str, hypothesis: str, leaves=False):
     """Shared setup for every test below: a fresh `#dial` load, a hypothesis, "Разложить",
-    and (by default) "точки-листья" unchecked — see `dial_marks_geometry`'s docstring for
-    why the touch/radius tests need the leaf layer off. Idea nodes only exist once
-    `withGraph` (checked by default) has actually resolved, hence the wait on
-    `circle.ideanode`, not just on the SVG's existence."""
+    and "точки-листья" left in whichever state the caller asked for (`leaves`). Idea nodes
+    only exist once `withGraph` (checked by default) has actually resolved, hence the wait
+    on `circle.ideanode`, not just on the SVG's existence.
+
+    §2.3 makes the checkbox's OWN default width-dependent (unchecked under 430px, checked
+    at or above it — see `test_phone_leaves_off_default_status_matches_dial_total`) — so
+    this reads `input.checked` first and clicks only when it disagrees with `leaves`,
+    rather than clicking unconditionally. A blind click assumed the pre-§2.3 desktop-only
+    default (always checked) and silently flipped leaves back ON on a 390px device, which
+    is exactly the state every caller here needs OFF (`dial_marks_geometry`'s docstring) —
+    confirmed live: that blind click is what made `touch_search_radius_is_wider_than_mouse`
+    fail the moment the narrow-width default landed."""
     browser.goto(f"{base_url}/ui#dial")
     browser.wait_for("document.querySelector('#main textarea') !== null", timeout=10)
     browser.fill("#main textarea", hypothesis)
-    if not leaves:
+    checked = _checkbox_state(browser, "точки-листья")
+    assert checked is not None, "no 'точки-листья' checkbox found on #dial"
+    if checked != leaves:
         click_checkbox_with_label(browser, "точки-листья")
     click_button_with_text(browser, "Разложить")
     browser.wait_for("document.querySelectorAll('.graphwrap svg circle.ideanode').length > 0", timeout=20)
