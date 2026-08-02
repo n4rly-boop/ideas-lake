@@ -1523,15 +1523,20 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
         try:
             one = {"CF-Connecting-IP": "203.0.113.7"}
             two = {"CF-Connecting-IP": "203.0.113.8"}
+            # `!= 429`, not `== 200`: the middleware runs before the route, so what the
+            # DIAL itself answers here is not the subject. On this mock instance with no
+            # warm index it is a 503, and asserting 200 would have made this check about
+            # the embedding model rather than about who gets counted (it did, once —
+            # green locally against a warm stand, red in the image).
             codes = [guarded.get("/dial?q=x", headers=one).status_code for _ in range(4)]
-            assert codes == [200, 200, 200, 429], codes
+            assert codes[:3] == [c for c in codes[:3] if c != 429] and codes[3] == 429, codes
             assert guarded.get("/dial?q=x", headers=one).headers.get("Retry-After")
             # A second visitor behind the same tunnel is a second bucket, not a victim.
-            assert guarded.get("/dial?q=x", headers=two).status_code == 200, "one bucket for all"
+            assert guarded.get("/dial?q=x", headers=two).status_code != 429, "one bucket for all"
             # And a key buys past it: this limiter is about strangers and CPU, not access.
             for _ in range(5):
                 assert guarded.get("/dial?q=x", headers={**one, "Authorization": f"Bearer {key}"}
-                                   ).status_code == 200, "a key holder got throttled"
+                                   ).status_code != 429, "a key holder got throttled"
             # Only the two routes that walk every thesis. A page out of the store is not
             # rationed, or the console's own reads would die on the fourth click.
             for _ in range(6):
