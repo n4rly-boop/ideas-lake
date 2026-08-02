@@ -1494,17 +1494,34 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
               "invariant check and the vault export agree on it")
 
     # ------------------------------------------------------------------- the key
-    # The only thing between this API and anyone who can reach the port: every route
-    # here writes to the graph or spends the school's GPUs, and there is no other
-    # authentication in block A.
+    # The only thing between this API and anyone who can reach the port. Reading the
+    # lake is open (a room full of people at a defence has no key and needs none);
+    # everything that writes the graph or spends the school's GPUs is not, and there
+    # is no other authentication in block A.
     key = "s3cret-" + "x" * 40
     with TestClient(create_app(mock=True, warmup=False, api_key=key, workers=False)) as guarded:
-        # One route per kind, because "the middleware covers everything" is exactly the
-        # claim that rots: a read, a write, the ops view, the ingest and a path that
-        # does not exist. The last one matters — routing happens AFTER the middleware,
-        # so an unknown path must not be able to say "no such route" to a stranger.
+        # The boundary is a pair (method, path), never a path: `GET /sources` is open
+        # and `POST /sources` is not, and a check that only ever asks about the path
+        # would call that pass. Both lists are written out HERE rather than imported
+        # from `app.OPEN_ENDPOINTS` — a check that reads the answer off the code it is
+        # checking proves nothing about either.
         for method, path, body in (("get", "/healthz", None), ("get", "/stats", None),
-                                   ("get", "/sources", None), ("get", "/search?q=x", None),
+                                   ("get", "/sources", None), ("get", "/ideas", None),
+                                   ("get", "/theses", None), ("get", "/edges", None),
+                                   ("get", "/search?q=x", None), ("get", "/dial?q=x", None),
+                                   ("head", "/healthz", None)):
+            answer = getattr(guarded, method)(path)
+            assert answer.status_code != 401, ("open route asked for a key", path,
+                                               answer.status_code, answer.text)
+        # ...and the closed half. One route per kind, because "the middleware covers
+        # everything" is exactly the claim that rots: the ingest machine room (a GET,
+        # and still shut), a write, the ops view, and a path that does not exist. The
+        # last one matters — routing happens AFTER the middleware, so an unknown path
+        # must not be able to say "no such route" to a stranger.
+        for method, path, body in (("get", "/ingest/jobs", None),
+                                   ("get", "/ingest/staging", None),
+                                   ("get", "/ingest/pending-link", None),
+                                   ("post", "/sources", {"url": "https://arxiv.org/abs/1"}),
                                    ("post", "/retrieve", {"query": "x"}),
                                    ("post", "/fetch", {"url": "https://arxiv.org/abs/2406.04824"}),
                                    ("post", "/ingest/phase2", {}),
@@ -1543,10 +1560,17 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
         assert doc["security"] == [{"bearerAuth": []}], doc.get("security")
         assert doc["components"]["securitySchemes"]["bearerAuth"]["scheme"] == "bearer"
         # A 401 the document does not mention is a branch C never writes, and it is the
-        # one it will hit first. Asserted over EVERY operation, not a sample.
+        # one it will hit first. Asserted over EVERY operation, not a sample — except
+        # the open ones, which cannot answer 401 and say so with `security: []`. An
+        # operation that documents neither is the schema lying in one direction or the
+        # other, so every operation must land in exactly one of the two cases.
         for path, item in doc["paths"].items():
             for method, operation in item.items():
-                assert "401" in operation.get("responses", {}), (path, method)
+                if operation.get("security") == []:
+                    assert "401" not in operation.get("responses", {}), \
+                        ("open operation still documents a 401", path, method)
+                else:
+                    assert "401" in operation.get("responses", {}), (path, method)
         assert "ErrorResponse" in doc["components"]["schemas"], "the 401 body is a $ref"
 
     # `--no-auth` is a choice somebody types; an EMPTY key is a server that thinks it
@@ -1560,8 +1584,11 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
     os.environ["LAKE_API_KEY"] = key
     try:
         with TestClient(create_app(mock=True, warmup=False, workers=False)) as from_env:
-            assert from_env.get("/healthz").status_code == 401
-            assert from_env.get("/healthz", headers={"Authorization": f"Bearer {key}"}
+            # A CLOSED route on purpose: `/healthz` is open now, so it would answer 200
+            # whether or not the key was ever read, and this check would pass on a
+            # server that ignores the environment entirely.
+            assert from_env.get("/ingest/jobs").status_code == 401
+            assert from_env.get("/ingest/jobs", headers={"Authorization": f"Bearer {key}"}
                                 ).status_code == 200
     finally:
         os.environ.pop("LAKE_API_KEY", None)
@@ -1572,9 +1599,12 @@ def _run(tmp: Path, idx: Path, real_payload_from_csv) -> None:
             raise AssertionError("a server started with no LAKE_API_KEY in the environment")
     except RuntimeError as exc:
         assert "LAKE_API_KEY is empty" in str(exc), exc
-    print("ok: the key — 401 on every route and on unknown paths, wrong key and wrong "
-          "scheme refused, 400 still 400, schema open and documents its 401, empty or "
-          "missing key refuses to start")
+    print("ok: the key — reading the lake is open, writing and spending are not, the "
+          "line is drawn per (method, path) so GET /sources opens without opening POST, "
+          "the ingest machine room stays shut even on GET, unknown paths still 401, "
+          "wrong key and wrong scheme refused, 400 still 400, the schema marks the open "
+          "operations and documents a 401 on every other one, empty or missing key "
+          "refuses to start")
 
     # ------------------------------------------------------------------ the console
     # `/ui` is the fifth open path, and it is open for the same reason `/docs` is: a

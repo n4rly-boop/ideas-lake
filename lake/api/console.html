@@ -314,9 +314,10 @@ svg.graph circle.hoverring{pointer-events:none}
 <div class="gate hide" id="gate">
   <div class="box">
     <h3>Ключ доступа</h3>
-    <p>Все ручки, кроме <span class="mono">/openapi.json</span>, <span class="mono">/docs</span> и
-      этой страницы, требуют <span class="mono">Authorization: Bearer $LAKE_API_KEY</span>. Ключ
-      живёт в <span class="mono">sessionStorage</span> этой вкладки: закрыл вкладку — ключа нет.
+    <p>Читать озеро — циферблат, идеи, тезисы, источники, поиск, граф — можно и без ключа.
+      Ключ нужен для записи (ингест, правка идей, источники) и для платных вызовов —
+      <span class="mono">/retrieve</span> тратит вызов 35B, это деньги, а не просто «нет доступа».
+      Ключ живёт в <span class="mono">sessionStorage</span> этой вкладки: закрыл вкладку — ключа нет.
       В URL он не попадает и на сервер, кроме этого же API, не уходит.</p>
     <label class="f grow" style="margin-bottom:14px">LAKE_API_KEY
       <input type="password" id="key-input" class="mono" autocomplete="off" spellcheck="false">
@@ -414,7 +415,8 @@ class ApiError extends Error {
 const HTTP_STATUS = Symbol("http status");
 const codeOf = (res) => (res && typeof res === "object" && HTTP_STATUS in res) ? res[HTTP_STATUS] : "—";
 
-async function api(path, { method = "GET", body = null, timeout = 120000, onStatus = null } = {}) {
+async function api(path, { method = "GET", body = null, timeout = 120000, onStatus = null,
+                            authProbe = false } = {}) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeout);
   let res;
@@ -443,7 +445,14 @@ async function api(path, { method = "GET", body = null, timeout = 120000, onStat
   const text = await res.text();
   let payload = null;
   try { payload = text ? JSON.parse(text) : null; } catch { payload = { error: text }; }
-  if (res.status === 401) { openGate("Ключ не принят: 401."); throw new ApiError(401, "ключ не принят", payload); }
+  // `authProbe` calls (the boot/key-save check against a route the border never opens,
+  // see AUTH_PROBE_PATH below) read this 401 as plain data — a public GET's own 401
+  // would still pop the modal over a page that has nothing to do with the key, which is
+  // the fail-open this whole state exists to avoid turning into a fail-loud-at-the-wrong-time.
+  if (res.status === 401) {
+    if (!authProbe) openGate("Ключ не принят: 401.");
+    throw new ApiError(401, "ключ не принят", payload);
+  }
   if (!res.ok) {
     const retry = res.headers.get("Retry-After");
     throw new ApiError(res.status, (payload && payload.error) || res.statusText,
@@ -560,6 +569,16 @@ const askConfirm = (msg) => new Promise((resolve) => setTimeout(() => resolve(co
 
 /* ----------------------------------------------------------------- key gate */
 
+// The border opens `/healthz` and `/stats` to everyone (see the border note at the top
+// of this file), so neither can tell "this server has no auth at all" apart from "auth
+// is on and I hold no key" any more — both now answer 200 to a bare fetch either way.
+// `/ingest/jobs` stays behind the key on both sides of that border (it always has), is a
+// GET (no side effect to worry about), and a `limit=1` keeps it cheap — which makes it
+// the one route that can still answer the actual question, for both the boot probe and
+// verifying a key someone just typed into the gate.
+const AUTH_PROBE_PATH = "/ingest/jobs?limit=1";
+const verifyKey = (timeout) => api(AUTH_PROBE_PATH, { timeout, authProbe: true });
+
 function openGate(message) {
   $("#gate").classList.remove("hide");
   // Only a caller with an actual explanation may overwrite whatever is already there —
@@ -575,7 +594,7 @@ $("#key-save").onclick = guard(async () => {
   API_KEY = value;
   $("#key-msg").textContent = "проверяю…";
   try {
-    await api("/healthz", { timeout: 15000 });
+    await verifyKey(15000);
   } catch (err) {
     API_KEY = "";
     $("#key-msg").textContent = err.status === 401 ? "401 — ключ не тот" : `${err.status || "—"}: ${err.message}`;
@@ -604,8 +623,10 @@ let LAST_STATS = null;
 
 async function refreshStrip() {
   const strip = $("#strip");
-  if (!API_KEY && !NO_AUTH) { strip.replaceChildren(el("span", { class: "chip warn" },
-    el("span", { class: "dot" }), "ключ не задан")); return; }
+  // No early bail on a missing key any more: `/healthz` and `/stats` are public reads
+  // under the border (see AUTH_PROBE_PATH above) — a keyless tab still gets real numbers
+  // here, same as the dial/idea/thesis/source views below do. `startStrip()` is the one
+  // gate on whether this runs at all (never called while AUTH is probing/broken/offline).
   let health, stats;
   try {
     [health, stats] = await Promise.all([api("/healthz", { timeout: 20000 }),
@@ -625,6 +646,7 @@ async function refreshStrip() {
   // Said out loud, because from the inside an open server looks exactly like a guarded
   // one: this port answers everything to anyone who can reach it.
   if (NO_AUTH) add("warn", "сервер ", el("b", {}, "--no-auth"), " — ручки открыты");
+  if (AUTH === "readonly") add("warn", el("b", {}, "только чтение"), " — ключ нужен для записи и /retrieve");
   add(stats.in_sync ? "ok" : "bad", "индекс/хранилище ",
       el("b", {}, `${fmt(stats.theses_indexed)}/${fmt(stats.theses)}`));
   add("", "источники ", el("b", {}, fmt(stats.sources)));
@@ -653,6 +675,20 @@ function startStrip() {
 
 const VIEWS = [];
 const view = (id, title, mount) => VIEWS.push({ id, title, mount });
+
+/* §"readonly": every write action a view can offer disables itself under this state
+   instead of drawing a button that will 401 the moment it is pressed — the honest
+   version of "not available" is a control that visibly cannot be clicked, plus words
+   naming what unlocks it, not a click that quietly fails. `canWrite()` reads global AUTH
+   fresh at mount time, which is all it needs: a state change re-renders the whole tab
+   (`render()`'s own `AUTH = "open"; render();` after a key check), so no view holds a
+   stale answer past its own next mount. */
+const canWrite = () => AUTH === "open";
+const KEY_HINT = "Ключ снимает замок по кнопке «🔑 ключ» вверху, без перезагрузки страницы.";
+function lockedNote(reason) {
+  return el("div", { class: "status warn", style: "margin-bottom:14px" },
+    el("span", { class: "code" }, "🔒"), `${reason} ${KEY_HINT}`);
+}
 
 /* --------------------------------------------------------------- 1. retrieve */
 
@@ -818,20 +854,29 @@ view("retrieve", "Retrieve", (host, ctx) => {
     });
   }
 
+  // Not "нет доступа" — the honest reason this one costs money: every /retrieve call
+  // spends a 35B rewrite/judge pass and writes a row to retrieve.jsonl, the A/B log.
+  const locked = !canWrite();
   host.replaceChildren(
     el("div", { class: "panel" },
       el("h2", {}, "POST /retrieve"),
       el("p", { class: "help" }, "Запрос эволюции → идеи с провенансом. Recall-first: отказа по низкому "
         + "скору нет, выдача дозаполняется до k — поэтому смотри via и cosine, а не score."),
       ignoredRunNote(ctx),
+      locked ? lockedNote("Вызов стоит денег (35B) и пишет строку в retrieve.jsonl — за ключом всегда, "
+        + "не только пока нет доступа.") : null,
       el("div", { class: "row" },
         el("label", { class: "f grow" }, "запрос", q),
         el("label", { class: "f" }, "k", k),
         el("label", { class: "f" }, "budget (ток.)", budget),
         el("label", { class: "f" }, "run_id", runId),
         el("label", { class: "cb" }, rewrite, "rewrite"),
-        el("button", { class: "act", onclick: guard(() => fire(false)) }, "Спросить озеро"),
-        el("button", { class: "ghost", onclick: guard(() => fire(true)) }, "Оба плеча рядом")),
+        el("button", { class: "act", disabled: locked ? "" : null,
+          title: locked ? "нужен ключ — вызов стоит денег" : null,
+          onclick: guard(() => fire(false)) }, "Спросить озеро"),
+        el("button", { class: "ghost", disabled: locked ? "" : null,
+          title: locked ? "нужен ключ — вызов стоит денег" : null,
+          onclick: guard(() => fire(true)) }, "Оба плеча рядом")),
       statusHost),
     out);
   q.focus();
@@ -1912,18 +1957,21 @@ view("ideas", "Идеи", (host, ctx) => {
                       "effect_claimed", "effect_observed"];
     const inputs = {};
     const patchStatus = el("div");
+    const patchLocked = !canWrite();
     const form = el("div", { class: "panel" },
       el("h2", {}, "PATCH /ideas/{id}"),
       el("p", { class: "help" }, "Правится только то, что ручка принимает. trust_score, dirty и origin "
         + "недоступны намеренно: счёт и флаг пишет судья одной транзакцией, а origin — факт "
         + "происхождения. Меняешь text — сервер сам пересчитает вектор."),
+      patchLocked ? lockedNote("Правка идеи — запись, а не чтение.") : null,
       ...editable.map((field) => {
         const input = el("input", { class: "grow", value: idea[field] ?? "" });
         inputs[field] = input;
         return el("label", { class: "f grow", style: "margin-bottom:8px" }, field, input);
       }),
       el("div", { class: "row" },
-        el("button", { class: "act", onclick: guard(async () => {
+        el("button", { class: "act", disabled: patchLocked ? "" : null,
+          title: patchLocked ? "нужен ключ для записи" : null, onclick: guard(async () => {
           const body = {};
           for (const field of editable) {
             const now = inputs[field].value;
@@ -2157,6 +2205,7 @@ view("sources", "Источники", (host, ctx) => {
     });
   }
 
+  const sourceLocked = !canWrite();
   const f = {
     url: el("input", { class: "grow", placeholder: "https://…" }),
     title: el("input", { class: "grow" }),
@@ -2180,6 +2229,7 @@ view("sources", "Источники", (host, ctx) => {
       el("p", { class: "help", style: "margin-top:12px" },
         "Единственная запись, кроме ингеста. title и type у существующего id заморожены: попытка "
         + "переписать их — 409, потому что это провенанс уже записанных листьев."),
+      sourceLocked ? lockedNote("Запись источника — запись, а не чтение.") : null,
       el("div", { class: "row" },
         el("label", { class: "f grow" }, "url", f.url),
         el("label", { class: "f grow" }, "title", f.title),
@@ -2187,7 +2237,8 @@ view("sources", "Источники", (host, ctx) => {
         el("label", { class: "f" }, "version", f.version),
         el("label", { class: "f" }, "run_success", f.success),
         el("label", { class: "f grow" }, "run_meta (JSON)", f.meta),
-        el("button", { class: "act", onclick: guard(async () => {
+        el("button", { class: "act", disabled: sourceLocked ? "" : null,
+          title: sourceLocked ? "нужен ключ для записи" : null, onclick: guard(async () => {
           const body = { url: f.url.value.trim(), title: f.title.value.trim(),
                          type: f.type.value, version: f.version.value.trim() || "v1" };
           if (f.success.value !== "—") body.run_success = f.success.value === "успех";
@@ -2219,6 +2270,20 @@ const JOB_KIND = { fetch: "статья", run: "прогон", phase1: "фаза
                    reindex: "индекс", "vault-export": "vault", trust: "суд" };
 
 view("ingest", "Ингест и ops", (host, ctx) => {
+  // The whole tab is machine room (§ border note at the top of this file): fetch/run,
+  // both ingest phases, reindex/trust/vault-export are writes, and even the three GETs
+  // here (jobs, staging, pending-link) stay behind the key — none of it is "reads open".
+  // Bailing before a single request means readonly never fires the three auto-loads at
+  // the bottom of this view (`loadJobs(false); loadStaging(); loadPending();`), which
+  // would otherwise 401 on mount, every time this tab is opened, key or no key.
+  if (!canWrite()) {
+    host.replaceChildren(el("div", { class: "panel" },
+      el("h2", {}, "Ингест и ops"),
+      el("p", { class: "help" }, "Задания, staging, суд, реиндекс, vault — всё это запись или "
+        + "машинное отделение блока A, и ни одна ручка здесь не открыта без ключа, включая GET."),
+      lockedNote("Вкладка закрыта без ключа.")));
+    return;
+  }
   const jobsHost = el("div"), jobStatus = el("div");
   const fetchStatus = el("div"), phaseStatus = el("div"), opsStatus = el("div");
   const stagingHost = el("div"), pendingHost = el("div");
@@ -2959,6 +3024,16 @@ let CURRENT_PARAMS = initialRoute.params;
 // What the boot probe found, not just "have a key or not": a dead upstream (503, or no
 // answer at all) is neither "open" nor "needs a key", and showing it as either is the
 // exact lie §4.1 names. `probing` is the state until the first probe resolves.
+//
+// Border update: `/healthz`, `/stats` and every plain GET read (dial, ideas, theses,
+// sources, search, edges) are public now — a stranger with no key gets real data from
+// all of them. `open` stays "everything works, including writes"; the new `readonly`
+// is "reads work, writes don't" — the state that did not exist before this border and,
+// left unhandled, is exactly the fail-open the operator flagged: a keyless probe against
+// a now-public route reading as `open` and drawing write buttons that 401 on the first
+// click. `need-key` is kept, unchanged, for the older and stricter case — a REAL 401 off
+// the health probe itself, meaning even the public paths are refusing; that one still
+// earns the full blocking gate, same as always.
 let AUTH = API_KEY ? "open" : "probing";
 
 // A bare tab switch (the nav strip's own buttons) carries no params of its own — reuse
@@ -3027,9 +3102,12 @@ let LAST_PROBE_ERR = null;
 
 function render() {
   const tabs = $("#tabs");
+  // The ingest tab is entirely write/machine-room (§ border note): every route under it
+  // stays behind the key even for GET. Marked right on the tab label in "readonly" so the
+  // lock is visible before a click, not just inside the panel that click lands on.
   tabs.replaceChildren(...VIEWS.map((v) => el("button", {
     role: "tab", "aria-selected": String(v.id === CURRENT), onclick: () => switchTo(v.id),
-  }, v.title)));
+  }, v.id === "ingest" && AUTH === "readonly" ? v.title + " 🔒" : v.title)));
   const main = $("#main");
   main.replaceChildren();
   $("#gate").classList.add("hide");
@@ -3110,12 +3188,25 @@ window.addEventListener("hashchange", () => {
   render();
 });
 
-// One probe, shared by boot and the "Повторить" button. A 200 means this server runs
-// --no-auth; a 401 means it wants a key and `api()` has already primed the gate's text;
-// a 503 is `app.py`'s "started without LAKE_API_KEY" (or any other broken-lake reason) —
-// never a key problem; no status at all (network/timeout) is `offline`, also never a key
-// problem. `api()`'s own 401 handler already calls `openGate` with real text, so this
-// function only has to choose the AUTH value and let render() do the drawing.
+// One probe, shared by boot and the "Повторить" button, run in two stages because one
+// route can no longer answer both questions it used to.
+//
+// Stage 1, `/healthz`: is the server even alive? A 503 is `app.py`'s "started without
+// LAKE_API_KEY" (or any other broken-lake reason); no status at all (network/timeout) is
+// `offline`; a REAL 401 here (a server stricter than the border, or one running an older
+// build that never opened it) is `need-key` — `api()`'s own 401 handler has already
+// primed the gate's text for that case, same as always. None of these three reach stage 2.
+//
+// Stage 2, AUTH_PROBE_PATH: `/healthz` alone used to double as "is this --no-auth", back
+// when it sat behind the same key as everything else — a 401 there meant a key was
+// needed, full stop. The border now opens `/healthz` (and `/stats`, and every plain GET
+// read) to everyone, so a 200 in stage 1 no longer tells `--no-auth` apart from "reads
+// are public, writes are not" — and reading it as `open` anyway is the exact fail-open
+// the operator flagged: a keyless tab drawing write buttons that all 401 on the first
+// click. AUTH_PROBE_PATH stays behind the key on both sides of that border, so a 200
+// there really does mean --no-auth, and a 401 really does mean `readonly` — run with
+// `authProbe: true` so that 401 answers the question quietly instead of also popping the
+// gate over a page that, in `readonly`, is working exactly as intended without one.
 async function probe() {
   if (API_KEY) { AUTH = "open"; render(); return; }
   AUTH = "probing";
@@ -3123,15 +3214,24 @@ async function probe() {
   render();
   try {
     await api("/healthz", { timeout: 10000 });
-    NO_AUTH = true;
-    AUTH = "open";
   } catch (err) {
     if (!(err instanceof ApiError)) throw err;
     LAST_PROBE_ERR = err;
     AUTH = err.status === 401 ? "need-key" : err.status === 0 ? "offline" : "broken";
+    render();
+    return;
+  }
+  try {
+    await verifyKey(10000);
+    NO_AUTH = true;
+    AUTH = "open";
+  } catch (err) {
+    if (!(err instanceof ApiError)) throw err;
+    if (err.status === 401) AUTH = "readonly";
+    else { LAST_PROBE_ERR = err; AUTH = err.status === 0 ? "offline" : "broken"; }
   }
   render();
-  if (AUTH === "open") startStrip();
+  if (AUTH === "open" || AUTH === "readonly") startStrip();
 }
 
 (async function boot() {

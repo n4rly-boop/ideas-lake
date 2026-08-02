@@ -28,11 +28,16 @@ half: they map `ops` refusals to statuses and nothing else.
    exception: frozen rows in the metrics log are contamination.
 3. **Validation answers 400**, not FastAPI's default 422 — C was integrated
    against 400 and the body stays `{"error": ...}` on every status.
-4. **Every route needs `Authorization: Bearer $LAKE_API_KEY`.** There is no other
-   authentication anywhere in block A, and every route either writes to the graph
-   or spends the school's GPUs, so the server refuses to START without a key
-   rather than serving an open one. `--no-auth` exists for a loopback-only port
-   and says so in the log. See `_require_key` and `OPEN_PATHS`.
+4. **Every WRITE route, and every route that spends the school's GPUs, needs
+   `Authorization: Bearer $LAKE_API_KEY`.** There is no other authentication anywhere
+   in block A, so the server refuses to START without a key rather than serving an
+   open one. A fixed, named set of READ-ONLY routes — the graph, the index, `/dial`,
+   `/healthz`, `/stats` — needs none: nothing in them writes or costs a token, so a
+   key would gate nothing but the reading itself (§ below `OPEN_ENDPOINTS`). The
+   ingest machine room (`/ingest/jobs`, `/ingest/staging`, `/ingest/pending-link`) is
+   GET too but stays behind the key on purpose — it is operational detail, not lake
+   data. `--no-auth` exists for a loopback-only port and says so in the log. See
+   `_require_key`, `OPEN_PATHS` and `OPEN_ENDPOINTS`.
 
 Routes are plain `def`, not `async def`: everything under them is blocking work
 (sqlite, numpy, LLM calls), so Starlette runs them in its threadpool and the
@@ -42,6 +47,7 @@ what keeps `trace.request` per-request (see trace.py).
 import argparse
 import hmac
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -63,10 +69,12 @@ from .routes import ROUTERS
 OPS_STATUS: tuple[tuple[type[ops.OpsError], int], ...] = (
     (ops.NotFound, 404), (ops.Conflict, 409), (ops.Broken, 503))
 
-# The only paths served without a key, and the list is deliberately short: the OpenAPI
-# document is the integration contract, it holds no lake data, and C reads it before it
-# has anything to authenticate with. Everything else — including /healthz, which counts
-# the leaves, and including paths that do not exist — needs the key.
+# The static, non-RESTful paths served without a key, and the list is deliberately short:
+# the OpenAPI document is the integration contract, it holds no lake data, and C reads it
+# before it has anything to authenticate with. `/healthz` and the rest of the lake's own
+# reads are open too, but by ROUTE, not by raw path — that boundary is `OPEN_ENDPOINTS`,
+# below. Everything not covered by either set — including paths that do not exist — still
+# needs the key.
 #
 # `/ui` is on the list for exactly the same reason `/docs` is, and on no weaker one: it
 # is a static asset that holds no lake data and reads nothing. A browser cannot put a
@@ -79,6 +87,59 @@ OPS_STATUS: tuple[tuple[type[ops.OpsError], int], ...] = (
 UI_PATH = "/ui"
 UI_FILE = Path(__file__).resolve().parent / "console.html"
 OPEN_PATHS = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc", UI_PATH})
+
+# The read-only lake data a caller may reach without a key, as (method, route template)
+# pairs — a template alone would open every verb the router answers on that path (a
+# future PATCH landing behind today's GET), so openness is decided on the PAIR, never
+# on the path string. Every template here is copied from the `@router.get(...)`
+# declaration in `routes.py`, and `_open_route_matchers` below refuses to start if one
+# of them was mistyped and matches no registered route — a hand-rolled prefix check
+# (`path.startswith("/ideas/")`) would instead have opened `PATCH /ideas/{id}` and
+# whatever gets added under `/ideas/` tomorrow.
+#
+# Left OUT on purpose, though every one is GET: `/ingest/jobs(/{id})`, `/ingest/staging`,
+# `/ingest/pending-link` are the ingest machine room (queue/staging state), not lake
+# data, and `/fetch`, `/run`, `/ingest/phase1|2`, `/retrieve`, `/research`,
+# `/admin/reindex`, `/admin/trust`, `/vault/export`, `POST /sources`, `PATCH
+# /ideas/{id}` all write the graph or spend the school's GPUs.
+OPEN_ENDPOINTS: frozenset[tuple[str, str]] = frozenset({
+    ("GET", "/healthz"), ("GET", "/stats"),
+    ("GET", "/sources"), ("GET", "/sources/{source_id}"),
+    ("GET", "/ideas"), ("GET", "/ideas/{idea_id}"),
+    ("GET", "/ideas/{idea_id}/theses"), ("GET", "/ideas/{idea_id}/neighbors"),
+    ("GET", "/edges"),
+    ("GET", "/theses"), ("GET", "/theses/{thesis_id}"),
+    ("GET", "/search"), ("GET", "/dial"),
+})
+
+
+def _open_route_matchers(app: FastAPI) -> tuple[re.Pattern[str], ...]:
+    """Turn `OPEN_ENDPOINTS` into the compiled matcher each route ALREADY dispatches
+    on, instead of re-deriving one by hand.
+
+    `route.path_format`/`route.path_regex` are what Starlette compiled from the exact
+    `@router.get("/ideas/{idea_id}")` string (`compile_path`, anchored both ends), so a
+    match here is a match on the router's own shape — `/ideas/x/y`, which no route
+    answers, cannot slip through, and neither can a path that merely starts with
+    `/ideas/`. Every entry is also handed `HEAD`: FastAPI's `APIRoute` (unlike
+    Starlette's own `Route`, which is what serves `/docs`) does not add it for a bare
+    `.get()`, and requirement 4 is that HEAD on an open route behaves like GET.
+    """
+    matchers: list[re.Pattern[str]] = []
+    found: set[str] = set()
+    for route in app.routes:
+        path_format = getattr(route, "path_format", None)
+        if path_format is None or "GET" not in getattr(route, "methods", ()):
+            continue
+        if ("GET", path_format) in OPEN_ENDPOINTS:
+            route.methods.add("HEAD")
+            matchers.append(route.path_regex)
+            found.add(path_format)
+    missing = {template for _, template in OPEN_ENDPOINTS} - found
+    # A typo here would silently CLOSE a route that should be open (fail closed, not
+    # open) — but it is still a bug worth crashing on rather than discovering by curl.
+    assert not missing, f"OPEN_ENDPOINTS names no registered route: {sorted(missing)}"
+    return tuple(matchers)
 
 DESCRIPTION = """\
 Долговременная память между прогонами эволюции (проект 28, блок A).
@@ -163,6 +224,10 @@ def create_app(mock: bool = False, warmup: bool = True, api_key=None,
     app.state.api_key = os.environ.get("LAKE_API_KEY", "") if api_key is None else api_key
     for router in ROUTERS:
         app.include_router(router)
+    # Computed once here, not per request: matching HTTP verbs is cheap, but a route's
+    # `path_regex` only exists once every router above is included, and building it on
+    # every request would rebuild the same dozen patterns for every read.
+    app.state.open_route_matchers = _open_route_matchers(app)
 
     @app.get(UI_PATH, include_in_schema=False)
     def console():
@@ -194,8 +259,21 @@ def create_app(mock: bool = False, warmup: bool = True, api_key=None,
         # document or a static asset, and matching on the path alone let any verb
         # through to the router — which then answered 405 and told a stranger the path
         # exists. Found by the self-check the moment `/ui` was added.
-        if expected is False or (request.url.path in OPEN_PATHS
-                                 and request.method in ("GET", "HEAD")):
+        is_read = request.method in ("GET", "HEAD")
+        is_open = is_read and (
+            request.url.path in OPEN_PATHS
+            # `OPEN_ENDPOINTS` pairs are checked against the compiled route regex, not
+            # the path string, so a path parameter only opens the SHAPE a route
+            # actually answers (see `_open_route_matchers`).
+            or any(matcher.match(request.url.path)
+                  for matcher in request.app.state.open_route_matchers))
+        # Checked BEFORE the "no key configured" branch below, on purpose: a read that
+        # needs no key does not become gated by a misconfigured one. In practice this
+        # never fires in production — `lifespan` refuses to start without a key unless
+        # `--no-auth` was typed — but it is what a server built directly (tests,
+        # self-check) without running `lifespan` sees, and "the key is missing" must
+        # not read as "the lake is unreachable" for a route that was never behind it.
+        if expected is False or is_open:
             return await call_next(request)
         if not expected:
             # Unreachable once `lifespan` has run, and 503 rather than "let it through"
@@ -282,25 +360,33 @@ def create_app(mock: bool = False, warmup: bool = True, api_key=None,
 
 
 def _drop_422(app: FastAPI) -> None:
-    """Fix the schema to what the server actually answers: no 422, and a 401 on every
-    operation when the key is on.
+    """Fix the schema to what the server actually answers: no 422, a 401 on every
+    operation that can actually produce one, and none on the ones in `OPEN_ENDPOINTS`
+    that cannot.
 
     The OpenAPI document is what C integrates against. A documented status the server
     cannot produce sends the other side writing a branch that never runs; an
     undocumented one it DOES produce — 401 on every call until the header is right —
-    sends it into a branch it never wrote.
+    sends it into a branch it never wrote. Since `OPEN_ENDPOINTS` opened a fixed set of
+    GET operations to no key at all, documenting 401 on THOSE would be the first kind
+    of lie: `security: []` on exactly those operations is what tells an OpenAPI-aware
+    client it may skip the header there and nowhere else.
     """
     def openapi():
         if app.openapi_schema:
             return app.openapi_schema
         schema = get_openapi(title=app.title, version=app.version, summary=app.summary,
                              description=app.description, routes=app.routes)
-        for path in schema.get("paths", {}).values():
-            for operation in path.values():
+        for path, operations in schema.get("paths", {}).items():
+            for method, operation in operations.items():
                 if not isinstance(operation, dict):
                     continue
                 operation.get("responses", {}).pop("422", None)
-                if app.state.api_key is not False:
+                if app.state.api_key is False:
+                    continue
+                if (method.upper(), path) in OPEN_ENDPOINTS:
+                    operation["security"] = []
+                else:
                     operation.setdefault("responses", {})["401"] = {
                         "description": "Нет заголовка `Authorization: Bearer "
                                        "<LAKE_API_KEY>` или ключ не тот.",
